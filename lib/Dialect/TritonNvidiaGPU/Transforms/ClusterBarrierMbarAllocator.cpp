@@ -1,4 +1,5 @@
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/ClusterBarrierMbarAllocator.h"
+#include "triton/Analysis/Allocation.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
@@ -45,6 +46,7 @@ void runClusterBarrierMbarAllocator(ModuleOp mod) {
   int64_t shared = sharedAttr ? sharedAttr.getInt() : 0;
   int64_t nextOffset = llvm::alignTo(shared, int64_t{8});
   DenseMap<Region *, IntegerAttr> regionOffsets;
+  SmallVector<SharedMemoryReservation> reservations;
   Builder builder(mod.getContext());
 
   kernel.walk([&](Operation *op) {
@@ -59,6 +61,13 @@ void runClusterBarrierMbarAllocator(ModuleOp mod) {
 
     auto [it, inserted] = regionOffsets.try_emplace(region);
     if (inserted) {
+      if (regionOffsets.size() == 1 && nextOffset > shared)
+        reservations.push_back({"alignment", static_cast<size_t>(shared),
+                                static_cast<size_t>(nextOffset - shared),
+                                kernel.getOperation()});
+      reservations.push_back(
+          {"cluster_barrier", static_cast<size_t>(nextOffset),
+           kClusterBarrierMbarAllocationSize, region->getParentOp()});
       it->second = builder.getI32IntegerAttr(nextOffset);
       nextOffset += kClusterBarrierMbarAllocationSize;
     }
@@ -71,6 +80,7 @@ void runClusterBarrierMbarAllocator(ModuleOp mod) {
     mod->setAttr(kWSClusterBarrierCountAttrName,
                  builder.getI32IntegerAttr(regionOffsets.size()));
     mod->setAttr("ttg.shared", builder.getI32IntegerAttr(nextOffset));
+    appendSharedMemoryReservations(mod, reservations);
   }
 }
 

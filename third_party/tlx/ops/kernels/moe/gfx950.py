@@ -13,7 +13,7 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 
-from triton.tlx.ops.kernels.mm.gfx950 import _register_matmul_core
+from triton.tlx.ops.kernels.mm.gfx950 import _register_a_load_layout, _register_matmul_core
 
 # Tuned on MI355X (gfx950) under HIP graph replay. Through ~3.5k tokens every tier streams expert weights
 # once, so B loads bypass L2 (.cg) to keep it for the gathered activations.
@@ -21,6 +21,7 @@ _SMALL_M = dict(BLOCK_M=16, BLOCK_N=64, BLOCK_K=128, GROUP_M=1, num_warps=4, num
                 CACHE_B_CG=True)
 _DECODE_N32 = dict(BLOCK_M=16, BLOCK_N=32, BLOCK_K=64, GROUP_M=1, num_warps=2, num_stages=2, CACHE_B_CG=True)
 _DECODE_N64 = dict(BLOCK_M=16, BLOCK_N=64, BLOCK_K=64, GROUP_M=1, num_warps=4, num_stages=2, CACHE_B_CG=True)
+_DECODE_N64_WIDE = dict(_DECODE_N64, num_warps=2, WIDE_A_OWNERSHIP=True)
 _LARGE_M = dict(BLOCK_M=64, BLOCK_N=128, BLOCK_K=64, GROUP_M=8, num_warps=8, num_stages=2, CACHE_B_CG=True)
 _LARGE_M_WIDE_N = dict(_LARGE_M, BLOCK_N=256)
 # BLOCK_N=256 here needs the whole 160 KiB LDS on some compiler versions; 128 with 4 warps matches its speed in half.
@@ -46,7 +47,7 @@ def pick_config(rows: int) -> tuple[dict, dict]:
     if rows <= 160:
         return _DECODE_N32, _DECODE_N32
     if rows <= 384:
-        return _DECODE_N64, _DECODE_N64
+        return _DECODE_N64_WIDE, _DECODE_N64_WIDE
     if rows <= 2048:
         return _DECODE_N32, _DECODE_N32
     if rows <= 12288:
@@ -95,6 +96,7 @@ def _moe_gemm_kernel(
     SPLIT_K: tl.constexpr,
     XCD_CHUNK: tl.constexpr = 0,
     CACHE_B_CG: tl.constexpr = False,
+    WIDE_A_OWNERSHIP: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     if XCD_CHUNK > 0:
@@ -134,6 +136,8 @@ def _moe_gemm_kernel(
     offs_bn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     b_base = b_ptr + off_expert * stride_be
     b2_base = b_base + N * stride_bn if FUSE_SILU_MUL else b_base
+    a_load_layout: tl.constexpr = (_register_a_load_layout(BLOCK_M, BLOCK_K, tlx.num_warps())
+                                   if WIDE_A_OWNERSHIP else None)
     # Gather coordinates are not contiguous: only the dense MM caller adds hints.
     acc, acc2 = _register_matmul_core(
         a_ptr,
@@ -154,6 +158,7 @@ def _moe_gemm_kernel(
         BLOCK_K,
         MASK_ROWS=True,
         DUAL_B=FUSE_SILU_MUL,
+        A_LOAD_LAYOUT=a_load_layout,
         CACHE_B_CG=CACHE_B_CG,
     )
 
@@ -209,6 +214,8 @@ def _launch_gemm(a, b, c, sorted_ids, expert_ids, num_post, N, K, num_valid, top
         SPLIT_K=split_k,
         XCD_CHUNK=cfg.get("XCD_CHUNK", 0),
         CACHE_B_CG=cfg.get("CACHE_B_CG", False),
+        WIDE_A_OWNERSHIP=(cfg.get("WIDE_A_OWNERSHIP", False) and a.stride(1) == 1 and a.stride(0) % 8 == 0
+                          and a.data_ptr() % 16 == 0),
         **opts,
     )
 

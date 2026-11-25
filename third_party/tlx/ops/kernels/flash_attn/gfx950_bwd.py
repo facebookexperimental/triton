@@ -6,10 +6,11 @@ aligned to 64, SQ no larger than 8,388,544, and SKV no larger than 16,777,152.
 Bottom-right causal D64 additionally requires SQ no larger than SKV. It also
 supports the two validated equal-head configurations in ``SUPPORTED_SHAPES``
 and the causal/non-causal HipKittens GQA contract: positive B/Hq/Hkv, Hkv dividing
-Hq, N a positive multiple of 256, and D=128. ``GQA_BENCHMARK_SHAPES`` records
-the published performance series; it is not an allow-list. Other
-configurations are not part of this submission's public contract yet. Focused
-tests live in ``python/test/unit/language/test_tlx_amd_fa_bwd_gfx950.py``.
+Hq, N a multiple of 256 from 256 to 16,777,216, and D=128.
+``GQA_BENCHMARK_SHAPES`` records the published performance series; it is not an
+allow-list. Other configurations are not part of this submission's public
+contract yet. Focused tests live in
+``python/test/unit/language/test_tlx_amd_fa_bwd_gfx950.py``.
 
 Each launch topology has one stable JIT entry.  Constexpr schedule kwargs pick
 the tuned split, persistent, staged, peeled, or hoisted implementation behind
@@ -60,8 +61,11 @@ GQA_BENCHMARK_SHAPES = {
     (16, 64, 8, 8192, 128),
     (15, 64, 8, 16384, 128),
 }
+# The D128 kernels launch cdiv(N, 256) programs along grid y, which HIP caps at
+# 65536. The cap also keeps every in-head element offset N * D within int32.
+_D128_MAX_SEQUENCE = 65536 * 256
 _GQA_SHAPE_CONSTRAINT = ("B >= 1, Hq >= 1, Hkv >= 1, Hq % Hkv == 0, "
-                         "N >= 256, N % 256 == 0, and D == 128")
+                         f"256 <= N <= {_D128_MAX_SEQUENCE}, N % 256 == 0, and D == 128")
 
 
 def _is_supported_gqa_shape(shape):
@@ -69,8 +73,8 @@ def _is_supported_gqa_shape(shape):
     if len(shape) != 5:
         return False
     batch, hq, hk, n_ctx, head_dim = shape
-    return (batch >= 1 and hq >= 1 and hk >= 1 and hq % hk == 0 and n_ctx >= 256 and n_ctx % 256 == 0
-            and head_dim == 128)
+    return (batch >= 1 and hq >= 1 and hk >= 1 and hq % hk == 0 and 256 <= n_ctx <= _D128_MAX_SEQUENCE
+            and n_ctx % 256 == 0 and head_dim == 128)
 
 
 # Gluon pins CDNA4's 16x16x32 MFMA for these BF16 tiles.  Leaving Triton to

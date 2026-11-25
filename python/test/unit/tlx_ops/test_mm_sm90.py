@@ -13,6 +13,14 @@ from mm_test_utils import REL_PRECISION, run_mm_case, run_mm_invariance_case
 
 pytestmark = pytest.mark.skipif(not is_hopper(), reason="Requires sm90")
 
+
+@pytest.fixture(autouse=True)
+def _pin_num_sms(monkeypatch):
+    # Heuristic picks and prune expectations below assume a full H100 (132
+    # SMs); CI workers may be MIG slices with fewer.
+    monkeypatch.setattr(sm90, "_get_num_sms", lambda: 132)
+
+
 ARCH = "sm90"
 COOPERATIVE_CONFIGS = (
     (128, 256, 3, 1),
@@ -543,14 +551,26 @@ def test_small_k_prune_splits_only_past_small_k():
         assert sm90._mn_tiles(7, 4096, kw["BM"], kw["BN"]) * kw["SPLIT_K"] <= num_sms or kw["SPLIT_K"] == 1
 
 
+@pytest.fixture
+def h100_sxm_sms(monkeypatch):
+    """The swap-AB cost model's decisions depend on the SM count; pin the 132 of
+    the H100 SXM it was fitted on, since CI can run on an H100 with fewer SMs."""
+    monkeypatch.setattr(sm90, "_get_num_sms", lambda: 132)
+    sm90._wide_swap_costs.cache_clear()
+    yield
+    sm90._wide_swap_costs.cache_clear()
+
+
+@pytest.mark.usefixtures("h100_sxm_sms")
 @pytest.mark.parametrize("M, N, K, candidates", [
     (7, 4992, 128, {"ws", "small_k"}),
     (7, 4096, 4096, {"ws", "small_k"}),
-    (706, 3536, 128, {"ws", "small_k"}),
+    # Row-major B past M = 64: the swapped kernel models within 5% of direct, so it is timed too.
+    (706, 3536, 128, {"ws", "small_k", "ws_swap"}),
     # One wave of 128x128 tiles (120 on 132 SMs): the small-K kernel competes.
-    (706, 2560, 2560, {"ws", "small_k"}),
-    # Past one wave with K > 1024: WS only.
-    (706, 6144, 2560, {"ws"}),
+    (706, 2560, 2560, {"ws", "small_k", "ws_swap"}),
+    # Past one wave with K > 1024: no small-K kernel.
+    (706, 6144, 2560, {"ws", "ws_swap"}),
 ])
 def test_full_space_selects_fastest_candidate(monkeypatch, M, N, K, candidates):
     from triton.tlx.ops import mm as tlx_mm
@@ -655,3 +675,110 @@ def test_npot_prune_rules():
         assert pieces[3] == 0 and min(p for p in pieces if p) >= 32
         assert sm90._fits_smem(128, bn, 2, 1)
     assert num_sms > 0
+
+
+@contextlib.contextmanager
+def _pinned_wide_swap_config(monkeypatch, block_n):
+    """Force the M > 64 swap-AB launcher onto one whole-K 128 x `block_n` config."""
+    config = next(c for c in sm90._wide_swap_configs() if c.kwargs["BN"] == block_n)
+    monkeypatch.setattr(sm90, "_wide_swap_configs", lambda: [config])
+    monkeypatch.setattr(sm90, "_prune_full_configs", lambda configs, nargs, **kwargs: configs)
+    monkeypatch.setattr(sm90, "_use_wide_swap", lambda *args: True)
+    monkeypatch.setattr(sm90, "_FORCE_PATH", "ws_swap")
+    sm90._tuned.cache_clear()
+    try:
+        yield
+    finally:
+        sm90._tuned.cache_clear()
+
+
+@pytest.mark.parametrize("block_n", [96, 128, 160, 192, 256])
+@pytest.mark.parametrize("M", [264, 600])
+@pytest.mark.parametrize("a_row_major, b_row_major", [(True, True), (True, False), (False, True)])
+def test_wide_swap_config(monkeypatch, block_n, M, a_row_major, b_row_major):
+    from triton.tlx.ops import mm as tlx_mm
+
+    if not a_row_major and not sm90._is_pow2(block_n):
+        pytest.skip("NPOT pieces need the swapped kernel's B (A^T) K-major, i.e. a row-major A")
+    torch.manual_seed(0)
+    # Ragged M (the swapped kernel's N) and N, with more tiles than SMs.
+    N, K = 2600, 64 * 7
+    a = _operand(M, K, a_row_major)
+    b = _operand(K, N, b_row_major)
+    with _pinned_wide_swap_config(monkeypatch, block_n):
+        actual = tlx_mm(a, b, space="full")
+        kw = sm90._tuned("full", None, True, dtype=a.dtype, wide_swap=True).best_config.kwargs
+        assert kw["SWAP_AB"] and kw["BN"] == block_n and kw["SPLIT_K"] == 1
+
+    _assert_close(actual, torch.matmul(a, b))
+
+
+@pytest.mark.parametrize("block_n", [96, 192])
+@pytest.mark.parametrize("bias_stride", [1, 0])
+def test_wide_swap_pieces_add_bias_along_c_rows(monkeypatch, block_n, bias_stride):
+    """Under swap-AB the (N,) bias runs along the kernel's rows for every N piece."""
+    torch.manual_seed(0)
+    M, N, K = 600, 1000, 64 * 7
+    a = _operand(M, K, True)
+    b = _operand(K, N, True)
+    bias = torch.randn(N if bias_stride else 1, device="cuda", dtype=torch.float16)
+    c = torch.empty((M, N), device="cuda", dtype=torch.float16)
+    with _pinned_wide_swap_config(monkeypatch, block_n):
+        sm90._run(a, b, c, M, N, K, "full", bias=bias, stride_bias=bias_stride)
+
+    _assert_close(c, torch.matmul(a, b) + bias.expand(N))
+
+
+def test_wide_swap_block_shapes():
+    """Swap-AB stores each N piece of C^T transposed, one box per piece."""
+
+    class Desc:
+        block_shape = base = None
+        shape = [1000, 600]
+        strides = [600, 1]
+
+    nargs = {
+        name: Desc()
+        for name in ("a_desc", "b_desc", "c_desc", "workspace_desc", "b_tail_desc", "b_tail2_desc", "c_tail_desc",
+                     "c_tail2_desc")
+    }
+    nargs.update(sm90._config(128, 224, 3, swap_ab=True).kwargs, B_ROW_MAJOR=False)
+    sm90.matmul_tma_set_block_size_hook(nargs)
+    assert nargs["c_desc"].block_shape == [128, 64]
+    assert nargs["c_tail_desc"].block_shape == [64, 64]
+    assert nargs["c_tail2_desc"].block_shape == [32, 64]
+    assert nargs["b_desc"].block_shape == [128, 64]
+    assert nargs["b_tail2_desc"].block_shape == [32, 64]
+
+
+@pytest.mark.usefixtures("h100_sxm_sms")
+def test_wide_swap_decision():
+    # Production shapes (A row-major, W^T) keep today's direct orientation.
+    for shape in SM90_FOCUS:
+        a_rm, b_rm = shape.a_strides[1] == 1, shape.b_strides[1] == 1
+        assert not sm90._use_wide_swap(shape.m, shape.n, shape.k, a_rm, b_rm), shape
+    # Skinny M stays on the skinny swap path.
+    assert sm90._wide_swap_costs(64, 4096, 4096, True, True) is None
+    # Row-major B: swapping puts the padding on M (264 rows: 5 tiles of 64 vs
+    # 3 waves of 128 x 256). Heuristic swaps stay power-of-two.
+    assert sm90._use_wide_swap(264, 6144, 4096, True, True)
+    kw = sm90._wide_swap_heuristic_config(264, 6144, 4096, False)[0].kwargs
+    assert sm90._is_pow2(kw["BN"]) and kw["SPLIT_K"] == 1 and kw["SWAP_AB"]
+    # A column-major A leaves the swapped kernel's B N-major: power-of-two tiles only.
+    assert sm90._wide_swap_heuristic_config(264, 6144, 4096, True)[0].kwargs["BN"] in (64, 128, 256)
+    # The paste shape ties at 128 x 128: direct in the heuristic space, timed in the full space.
+    assert not sm90._use_wide_swap(600, 2560, 20992, True, True)
+    assert sm90._use_wide_swap(600, 2560, 20992, True, True, sm90._WIDE_SWAP_COMPETITIVE)
+
+
+def test_wide_swap_not_used_under_fixed_schedule(monkeypatch):
+    calls = []
+    monkeypatch.setattr(sm90, "_launch_ws", lambda *args, **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(sm90, "_use_wide_swap", lambda *args: True)
+    a, b = _inputs(M=264, N=6144, K=4096)
+    c = torch.empty((264, 6144), device="cuda", dtype=a.dtype)
+    sm90._run(a, b, c, 264, 6144, 4096, "heuristic", invariance=BitwiseInvarianceSpec.dims("K"))
+    assert calls and not calls[0].get("wide_swap")
+    calls.clear()
+    sm90._run(a, b, c, 264, 6144, 4096, "heuristic")
+    assert calls[0].get("wide_swap")

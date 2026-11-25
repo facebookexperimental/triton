@@ -153,6 +153,15 @@ def prune_configs_by_hdim(configs, named_args, **kwargs):
 
 
 @triton.jit
+def _rescale_acc_slices(acc_tile, alpha_1, HEAD_DIM: tl.constexpr, NUM_SLICES: tl.constexpr):
+    # Scale each row of the O accumulator in TMEM by its alpha, one column slice at a time.
+    for slice_id in tl.static_range(0, NUM_SLICES):
+        subslice = tlx.subslice(acc_tile, HEAD_DIM * slice_id // NUM_SLICES, HEAD_DIM // NUM_SLICES)
+        acc = tlx.local_load(subslice)
+        tlx.local_store(subslice, _mul_f32x2(acc, alpha_1))
+
+
+@triton.jit
 def _get_unfused_loop_bounds(start_m, N_CTX, BLOCK_M, STAGE: tl.constexpr):
     if STAGE == 1:
         # First part of STAGE == 3 in _get_fused_loop_bounds
@@ -365,6 +374,7 @@ def _softmax_inner_loop(
     RESCALE_OPT: tl.constexpr,
     ALPHA_BAR_ID: tl.constexpr,
     USE_2CTA: tl.constexpr = False,
+    USE_WARP_BARRIER: tl.constexpr = False,
     EX2_EMU_FREQ: tl.constexpr = 0,
     EX2_EMU_START_FRG: tl.constexpr = 1,
 ):
@@ -455,12 +465,14 @@ def _softmax_inner_loop(
                     tlx.subslice(tlx.local_view(p_tiles, qk_buf * NUM_MMA_SLICES + 1), BLOCK_N // 4 * (k - 1),
                                  BLOCK_N // 4), p_i.to(out_dtype))
                 p_bar = tlx.local_view(p_fulls, qk_buf * 3 + k)
+            # As in FA4, each warp publishes its rows of P as soon as it has stored them, without waiting for the
+            # other softmax warps. A warp barrier already has every thread arrive.
             if USE_2CTA:
                 # The TMEM store completes before this readiness token; it does
                 # not publish ordinary SMEM to the peer CTA.
-                tlx.barrier_arrive(p_bar, 1, remote_cta_rank=0)
+                tlx.barrier_arrive(p_bar, 1, remote_cta_rank=0, per_warp=not USE_WARP_BARRIER)
             else:
-                tlx.barrier_arrive(p_bar)
+                tlx.barrier_arrive(p_bar, per_warp=not USE_WARP_BARRIER)
             p_slices = p_slices + (p_i, )
 
         # As in FA4, acquire the alpha buffer for the next iteration here, off the S -> P path,
@@ -895,9 +907,8 @@ def _attn_fwd_ws_hd256_kernel(sm_scale, M,  #
     # two phases behind, which a parity wait cannot tell apart.
     o_ready = tlx.alloc_barriers(num_barriers=1)
     p_fulls = tlx.alloc_barriers(num_barriers=NUM_S_BUFS * NUM_MMA_SLICES, arrive_count=NUM_CTAS)
-    # Two buffers: with RESCALE_OPT a step that needs no rescale skips the pv_done wait, so the correction group can
-    # arrive for step j + 1 before the MMA group has waited for step j. It cannot get further ahead, because QK(n),
-    # which step n's alpha depends on, is issued only after the MMA group has waited for step n - 2.
+    # Two buffers, one per step parity. One would also do: the correction group arrives for step j + 1 only after
+    # PV(j) completed, and the MMA group issues PV(j) only after waiting for step j.
     acc_fulls = tlx.alloc_barriers(num_barriers=2, arrive_count=NUM_CTAS)
     alpha_fulls = tlx.alloc_warp_barrier(num_barriers=NUM_S_BUFS, num_warps=4)
     alpha_empties = tlx.alloc_warp_barrier(num_barriers=NUM_S_BUFS, num_warps=4)
@@ -938,18 +949,23 @@ def _attn_fwd_ws_hd256_kernel(sm_scale, M,  #
                         do_rescale = (accum_cnt != tile_first_cnt) & tlx.warp_any(alpha_1 < 1.0)
                     else:
                         do_rescale = accum_cnt != tile_first_cnt
-                    # TODO: not all warps make the same decision on whether to enter this if-branch,
-                    # we need to guard this region as warp pred region and reject cta sync inside.
-                    # For now it's fine, since there is no cross thread race in tmem load/store here,
-                    # and no bar.sync would be inserted, but it's not robust
-                    if do_rescale:
-                        # QK(j) completing implies PV(j - 2) completed, so only PV(j - 1) can still be in
-                        # flight and this parity wait is unambiguous.
-                        tlx.barrier_wait(pv_done[0], (accum_cnt - 1) & 1)
-                        for slice_id in tl.static_range(0, O_SLICES):
-                            subslice = tlx.subslice(acc_tiles[0], HEAD_DIM * slice_id // O_SLICES, HEAD_DIM // O_SLICES)
-                            acc = tlx.local_load(subslice)
-                            tlx.local_store(subslice, _mul_f32x2(acc, alpha_1))
+                    # Every warp waits for PV(j - 1), even one that skips the rescale, and the warps then meet at a
+                    # CTA barrier. Membar puts a CTA barrier between an mbarrier wait and the next write that might
+                    # signal another partition, here the rescale's first TMEM store. If only the rescaling warps
+                    # waited, that barrier would sit on their path alone, which the other warps never reach. The
+                    # explicit barrier also keeps it out of the predicated region below, which rejects it. Measured
+                    # with ncu on the D256 shapes, this is 0.5-3.0% faster than making the warps agree on the rescale
+                    # again through a cross-warp reduction.
+                    # QK(j) completing implies PV(j - 2) completed, so only PV(j - 1) can still be in flight and this
+                    # parity wait is unambiguous. On a tile's first step the epilogue has already waited for the
+                    # previous tile's last PV through o_ready, and on the very first step parity 1 passes on the
+                    # fresh barrier.
+                    tlx.barrier_wait(pv_done[0], (accum_cnt - 1) & 1)
+                    tl.debug_barrier()
+                    # The warps may disagree on do_rescale, so the rescale runs in a per-warp predicated region,
+                    # where the compiler rejects any CTA barrier.
+                    tlx.warp_predicate(do_rescale, (), _rescale_acc_slices,
+                                       args=(acc_tiles[0], alpha_1, HEAD_DIM, O_SLICES), wave_uniform=True)
                     tlx.barrier_arrive(acc_fulls[accum_cnt & 1], 1, remote_cta_rank=0)
                     accum_cnt += 1
 
@@ -1308,7 +1324,7 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
     qk_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
     acc_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
 
-    # Cross-CTA barriers: must use mbarriers for 2-CTA (arrive_count=NUM_CTAS).
+    # Cross-CTA barriers: must use mbarriers for 2-CTA, whose counts scale with NUM_CTAS.
     # As in FA4, the softmax publishes P in chunks of 1/2, 1/4 and 1/4 of BLOCK_N. The first chunk shares acc_fulls with
     # the correction's "O rescaled" (FA4's P_full_O_rescaled); p_fulls[3 * g + 1] and p_fulls[3 * g + 2] signal the
     # other two.
@@ -1316,8 +1332,9 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
         p_fulls = tlx.alloc_warp_barrier(num_barriers=NUM_MMA_GROUPS * 3, num_warps=4)
         acc_fulls = tlx.alloc_warp_barrier(num_barriers=NUM_MMA_GROUPS, num_warps=8)
     else:
-        p_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * 3, arrive_count=NUM_CTAS)
-        acc_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS, arrive_count=2 * NUM_CTAS)
+        # The softmax's 4 warps arrive on P per warp; acc_fulls also takes the correction's leader arrive.
+        p_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * 3, arrive_count=4 * NUM_CTAS)
+        acc_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS, arrive_count=(4 + 1) * NUM_CTAS)
     # Intra-CTA barriers: always use fast warp barriers (no cross-CTA traffic).
     # The softmax statistics go through SMEM, as in FA4 (sScale). Each iteration the softmax stores alpha and arrives
     # on named barrier ALPHA_BAR_ID + cid, and the correction arrives on alpha_empties after reading it. At the end
@@ -1391,21 +1408,14 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                                     tlx.local_store(subslice, acc)
                             else:
                                 # option 2: branch per warp. Each warp only loads and stores its own O lanes, so the
-                                # branch needs no CTA barrier.
-                                if not RESCALE_OPT or (RESCALE_OPT and should_rescale):
-                                    # TODO: not all warps make the same decision on whether to enter this if-branch,
-                                    # we need to guard this region as warp pred region and reject cta sync inside.
-                                    # For now it's fine, since there is no cross thread race in tmem load/store here,
-                                    # and no bar.sync would be inserted, but it's not robust
-                                    for slice_id in tl.static_range(0, NUM_MMA_SLICES):
-                                        subslice = tlx.subslice(
-                                            acc_tiles[cid],
-                                            HEAD_DIM * slice_id // NUM_MMA_SLICES,
-                                            HEAD_DIM // NUM_MMA_SLICES,
-                                        )
-                                        acc = tlx.local_load(subslice)
-                                        acc = _mul_f32x2(acc, alpha_1)
-                                        tlx.local_store(subslice, acc)
+                                # branch needs no CTA barrier. The warps may disagree on should_rescale, so the
+                                # branch is a per-warp predicated region, where the compiler rejects any CTA barrier.
+                                if RESCALE_OPT:
+                                    tlx.warp_predicate(should_rescale, (), _rescale_acc_slices,
+                                                       args=(acc_tiles[cid], alpha_1, HEAD_DIM, NUM_MMA_SLICES),
+                                                       wave_uniform=True)
+                                else:
+                                    _rescale_acc_slices(acc_tiles[cid], alpha_1, HEAD_DIM, NUM_MMA_SLICES)
                         if USE_2CTA:
                             # This token reports completion of the TMEM update;
                             # it does not publish ordinary SMEM to the peer CTA.
@@ -1460,8 +1470,11 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                 clc_phase_consumer ^= 1
 
         # softmax groups
+        # nvptx_cmp_sink_workaround: TEMPORARY. Keeps the CLC arrive's `tid == 0` predicate before the softmax loop
+        # (NVPTX would sink it after the loop) and the P arrives' lane-0 test inside it (LICM would hoist it). ptxas
+        # schedules the softmax loop about 3% faster with both.
         with tlx.async_task(num_warps=4, registers=256 if (USE_2CTA and HEAD_DIM >= 256) else 184,
-                            replicate=NUM_GROUPS_PER_CTA):
+                            replicate=NUM_GROUPS_PER_CTA, nvptx_cmp_sink_workaround=True):
             accum_cnt_qk = 0
             tile_count = 0
             tile_id = start_pid
@@ -1523,6 +1536,7 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                         RESCALE_OPT=RESCALE_OPT,
                         ALPHA_BAR_ID=ALPHA_BAR_ID,
                         USE_2CTA=USE_2CTA,
+                        USE_WARP_BARRIER=USE_WARP_BARRIER,
                         EX2_EMU_FREQ=10,
                     )
                 if STAGE & 2:
@@ -1551,6 +1565,7 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                         RESCALE_OPT=RESCALE_OPT,
                         ALPHA_BAR_ID=ALPHA_BAR_ID,
                         USE_2CTA=USE_2CTA,
+                        USE_WARP_BARRIER=USE_WARP_BARRIER,
                     )
 
                 # prepare l_i for the epilog

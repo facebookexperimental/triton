@@ -3,6 +3,7 @@
 #include "Utility.h"
 #include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/Conversion/Passes.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -16,6 +17,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/NamedBarrier.h"
+#include "llvm/Support/Regex.h"
 
 namespace mlir::triton {
 #define GEN_PASS_DEF_CONVERTWARPSPECIALIZETOLLVM
@@ -76,7 +78,10 @@ public:
     if (numThreads == 32) {
       LLVM::NVIDIA::createSyncWarp(b.getLoc(), b);
     } else {
-      NVVM::BarrierOp::create(b, b.getLoc(), handle, b.i32_val(numThreads));
+      // Only this warp partition participates, so the barrier is not
+      // CTA-aligned.
+      NVVM::BarrierOp::create(b, b.getLoc(), handle, b.i32_val(numThreads),
+                              /*aligned=*/false);
     }
   }
 
@@ -245,8 +250,8 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
   WarpSpecializeCallbacks callbacks;
   callbacks.createAllBarrier = [](TritonLLVMIRRewriter &b, unsigned barIdx) {
     assert(barIdx <= nvidia_gpu::kLastNamedBarrierId && "not enough barriers");
-    LLVM::createLLVMIntrinsicCallOp(
-        b, b.getLoc(), "llvm.nvvm.barrier.cta.sync.all", {}, b.i32_val(barIdx));
+    NVVM::BarrierOp::create(b, b.getLoc(), b.i32_val(barIdx), Value{},
+                            /*aligned=*/false);
   };
 
   callbacks.reallocRegisters = [&](TritonLLVMIRRewriter &b, WarpSpecializeOp ws,
@@ -297,12 +302,75 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
 // Pass Definition
 //===----------------------------------------------------------------------===//
 
+// Whether `op`, in a lowered predicated region, synchronizes the CTA or the
+// cluster. Warps that skip the region would never reach it. Inline PTX is
+// matched by mnemonic, which cannot see PTX assembled at run time.
+static bool isCTABarrier(Operation *op) {
+  if (isa<NVVM::BarrierOp, NVVM::BarrierArriveOp, NVVM::BarrierReductionOp,
+          NVVM::ClusterArriveOp, NVVM::ClusterArriveRelaxedOp,
+          NVVM::ClusterWaitOp, mlir::gpu::BarrierOp>(op))
+    return true;
+  if (auto intrinsic = dyn_cast<LLVM::CallIntrinsicOp>(op))
+    return intrinsic.getIntrin().starts_with("llvm.nvvm.barrier");
+  if (auto inlineAsm = dyn_cast<LLVM::InlineAsmOp>(op)) {
+    // bar.sync, barrier.cta.arrive, barrier.cluster.wait, ... but not
+    // mbarrier.*, whose arrivals are per thread.
+    static const llvm::Regex barrierMnemonic(
+        "(^|[^A-Za-z0-9_.])(bar|barrier)\\.(sync|arrive|red|cta|cluster)");
+    return barrierMnemonic.match(inlineAsm.getAsmString());
+  }
+  return false;
+}
+
+// Lower each `ttg.warp_predicate`, whose body is already LLVM, to a branch
+// around the body. TritonGPUToLLVM admits only a scalar wave-uniform predicate
+// and no carried values on NVIDIA, so the region needs no merge values. It
+// rejects every other form before this pass runs, so leave those alone.
+static LogicalResult lowerWarpPredicates(ModuleOp mod) {
+  SmallVector<triton::gpu::WarpPredicateOp> ops;
+  mod.walk([&](triton::gpu::WarpPredicateOp op) {
+    if (op.getPredicate().getType().isInteger(1) && op.getInits().empty() &&
+        op.getWaveUniform().value_or(false))
+      ops.push_back(op);
+  });
+  for (triton::gpu::WarpPredicateOp op : ops) {
+    // Lowering can introduce synchronization that the TTGIR verifier never
+    // saw, for example in a layout conversion or inline asm. Warps that skip
+    // the body would never reach such a barrier.
+    WalkResult barrier = op.getRegion().walk([](Operation *nested) {
+      return isCTABarrier(nested) ? WalkResult::interrupt()
+                                  : WalkResult::advance();
+    });
+    if (barrier.wasInterrupted())
+      return op.emitError("lowered body may not contain CTA barriers");
+
+    IRRewriter rewriter(op);
+    Block *entry = op->getBlock();
+    Block *merge = rewriter.splitBlock(entry, op->getIterator());
+    // The verifier keeps the body a single block that ends in the yield, so
+    // the passes that converted it cannot have split it.
+    Block *body = &op.getRegion().front();
+    auto yield = cast<triton::gpu::PredicateYieldOp>(body->getTerminator());
+    rewriter.setInsertionPoint(yield);
+    rewriter.replaceOpWithNewOp<LLVM::BrOp>(yield, ValueRange{}, merge);
+    rewriter.inlineRegionBefore(op.getRegion(), merge);
+    rewriter.setInsertionPointToEnd(entry);
+    LLVM::CondBrOp::create(rewriter, op.getLoc(), op.getPredicate(), body,
+                           merge);
+    rewriter.eraseOp(op);
+  }
+  return success();
+}
+
 namespace {
 struct ConvertWarpSpecializeToLLVM
     : public mlir::triton::impl::ConvertWarpSpecializeToLLVMBase<
           ConvertWarpSpecializeToLLVM> {
   void runOnOperation() override {
     ModuleOp mod = getOperation();
+    if (failed(lowerWarpPredicates(mod)))
+      return signalPassFailure();
+
     // FIXME: Assume warp specialization only happens on Blackwell.
     NVIDIA::TargetInfo targetInfo(/*computeCapability=*/100, /*ptxVersion=*/87);
 

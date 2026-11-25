@@ -36,7 +36,7 @@ def ConvertTritonAMDGPUToLLVM
     : Pass<"convert-triton-amdgpu-to-llvm", "mlir::ModuleOp"> {
   let summary = "Convert TritonGPU to LLVM";
   let constructor =
-      "mlir::triton::createConvertTritonAMDGPUToLLVMPass(\"\", /*ftz=*/true)";
+      "mlir::triton::createConvertTritonAMDGPUToLLVMPass(\"\", /*ftz=*/true, /*enableTreeReduction=*/false)";
 
   let dependentDialects = ["mlir::arith::ArithDialect",
                            "mlir::math::MathDialect", "mlir::gpu::GPUDialect",
@@ -53,6 +53,9 @@ def ConvertTritonAMDGPUToLLVM
        Option<"enableTreeReduction", "enable-tree-reduction",
               "bool", /*default*/ "false",
               "use tree-shaped, vectorized in-thread reductions">,
+       Option<"cuMode", "cu-mode",
+              "bool", /*default*/ "false",
+              "the kernel runs in CU rather than WGP execution mode">,
   ];
 }
 

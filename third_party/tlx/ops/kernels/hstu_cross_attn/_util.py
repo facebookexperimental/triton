@@ -87,7 +87,7 @@ def _attn_bwd_preprocess(
     HEAD_DIM: tl.constexpr,
 ):
     off_h = tl.program_id(1)
-    offs_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_m = tl.program_id(0).to(tl.int64) * BLOCK_M + tl.arange(0, BLOCK_M)
     masks = offs_m < total_seq_len_q
     offs_n = tl.arange(0, HEAD_DIM)
     o = tl.load(

@@ -152,6 +152,16 @@ def _assume_strides(
 
 
 @triton.jit
+def _i64_strides(stride_z, stride_h, stride_n, stride_d):
+    return (
+        tl.cast(stride_z, tl.int64),
+        tl.cast(stride_h, tl.int64),
+        tl.cast(stride_n, tl.int64),
+        tl.cast(stride_d, tl.int64),
+    )
+
+
+@triton.jit
 def _split_cols(x):
     """Split a matrix into logical column halves without changing values.
 
@@ -2053,9 +2063,15 @@ def _attn_cluster_tile(
     IS_CAUSAL: tl.constexpr,
     STORE_LSE: tl.constexpr,
     ALLOW_PRESCALE_Q: tl.constexpr,
+    USE_I64_OFFSETS: tl.constexpr = False,
 ):
     CLUSTER_PIPELINE_STAGES: tl.constexpr = 4
     _LN_2: tl.constexpr = 0.6931471805599453
+    if USE_I64_OFFSETS:
+        stride_qz, stride_qh, stride_qm, stride_qk = _i64_strides(stride_qz, stride_qh, stride_qm, stride_qk)
+        stride_kz, stride_kh, stride_kn, stride_kk = _i64_strides(stride_kz, stride_kh, stride_kn, stride_kk)
+        stride_vz, stride_vh, stride_vn, stride_vk = _i64_strides(stride_vz, stride_vh, stride_vn, stride_vk)
+        stride_oz, stride_oh, stride_om, stride_ok = _i64_strides(stride_oz, stride_oh, stride_om, stride_ok)
     q_off = off_z * stride_qz + off_h * stride_qh
     k_off = off_z * stride_kz + off_h * stride_kh
     v_off = off_z * stride_vz + off_h * stride_vh
@@ -2825,6 +2841,7 @@ def _attn_fwd_cluster_pipeline(
     LSE=None,
     STORE_LSE: tl.constexpr = False,
     ALLOW_PRESCALE_Q: tl.constexpr = True,
+    USE_I64_OFFSETS: tl.constexpr = False,
 ):
     if STATIC_STRIDE_KN >= 0:
         tile_stride_kn = STATIC_STRIDE_KN
@@ -2925,7 +2942,8 @@ def _attn_fwd_cluster_pipeline(
         v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), V.dtype.element_ty, ALLOC_BUF_DEPTH)
     QK_SCALE: tl.constexpr = sm_scale * 1.44269504089
     if STORE_LSE:
-        lse_base = LSE + (off_z * H + off_h) * N_CTX
+        lse_row = off_z * H + off_h
+        lse_base = LSE + (lse_row.to(tl.int64) if USE_I64_OFFSETS else lse_row) * N_CTX
     else:
         lse_base = Out
     _attn_cluster_tile(
@@ -2966,6 +2984,7 @@ def _attn_fwd_cluster_pipeline(
         IS_CAUSAL,
         STORE_LSE,
         ALLOW_PRESCALE_Q,
+        USE_I64_OFFSETS,
     )
 
 
@@ -3005,6 +3024,7 @@ def _attn_fwd_cluster_short_causal_pipeline(
     LSE=None,
     STORE_LSE: tl.constexpr = False,
     ALLOW_PRESCALE_Q: tl.constexpr = True,
+    USE_I64_OFFSETS: tl.constexpr = False,
 ):
     tl.static_assert(IS_CAUSAL)
     tl.static_assert(HEAD_DIM == 128)
@@ -3036,7 +3056,8 @@ def _attn_fwd_cluster_short_causal_pipeline(
     query_class = tl.program_id(1)
     off_z = tl.program_id(2)
     if STORE_LSE:
-        lse_base = LSE + (off_z * H + off_h) * N_CTX
+        lse_row = off_z * H + off_h
+        lse_base = LSE + (lse_row.to(tl.int64) if USE_I64_OFFSETS else lse_row) * N_CTX
     else:
         lse_base = Out
     k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), K.dtype.element_ty, BUF_DEPTH)
@@ -3088,6 +3109,7 @@ def _attn_fwd_cluster_short_causal_pipeline(
                     IS_CAUSAL,
                     STORE_LSE,
                     ALLOW_PRESCALE_Q,
+                    USE_I64_OFFSETS,
                 )
     else:
         # Cloning eight N=1024 classes raises the unified register allocation
@@ -3132,6 +3154,7 @@ def _attn_fwd_cluster_short_causal_pipeline(
             IS_CAUSAL,
             STORE_LSE,
             ALLOW_PRESCALE_Q,
+            USE_I64_OFFSETS,
         )
 
 
@@ -3336,6 +3359,19 @@ def _validate_cluster_tiles(block_m, block_n):
         raise ValueError(f"cluster attention supports BLOCK_N 32 or 64, got {block_n}")
 
 
+def _needs_i64_offsets(shape, stride, block_rows):
+    """Whether a ``(B, H, N, D)`` tensor needs the cluster kernels' int64 offsets.
+
+    It does when an element offset the kernels form reaches 2**31, counting the masked rows of the last
+    ``block_rows``-row tile, or when one of its strides does not fit in int32.
+    """
+    batch, heads, seq, dim = shape
+    stride_b, stride_h, stride_n, stride_d = stride
+    rows = -(-seq // block_rows) * block_rows
+    max_offset = (batch - 1) * stride_b + (heads - 1) * stride_h + (rows - 1) * stride_n + (dim - 1) * stride_d
+    return max(stride) >= 1 << 31 or max_offset >= 1 << 31
+
+
 def flash_attn_cluster_pipeline(
     q,
     k,
@@ -3440,27 +3476,21 @@ def flash_attn_cluster_pipeline(
             "USE_DIRECT_LOAD": False if use_direct_load is None else use_direct_load,
             "num_warps": num_warps,
         })
+    shape = (B, H, N_CTX, D)
+    q_stride, k_stride, v_stride, o_stride = q.stride(), k.stride(), v.stride(), o.stride()
+    if (_needs_i64_offsets(shape, q_stride, block_m) or _needs_i64_offsets(shape, k_stride, block_n)
+            or _needs_i64_offsets(shape, v_stride, block_n) or _needs_i64_offsets(shape, o_stride, block_m)
+            or _return_lse and _needs_i64_offsets((B, H, N_CTX, 1), (H * N_CTX, N_CTX, 1, 0), block_m)):
+        launch_meta["USE_I64_OFFSETS"] = True
     kernel[grid](
         q,
         k,
         v,
         o,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        q.stride(3),
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        k.stride(3),
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
-        v.stride(3),
-        o.stride(0),
-        o.stride(1),
-        o.stride(2),
-        o.stride(3),
+        *q_stride,
+        *k_stride,
+        *v_stride,
+        *o_stride,
         B,
         H,
         N_CTX,

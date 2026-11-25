@@ -169,14 +169,13 @@ Value shuffleCommonImpl(Location loc, RewriterBase &rewriter,
     };
     bool usePermlaneSwap = isaFamily == ISAFamily::CDNA4 && (mask & 0x30);
 
-    if (triton::amdgpu::isRDNA(isaFamily) || isaFamily == ISAFamily::GFX1250) {
+    if (triton::amdgpu::isRDNA(isaFamily) || isaFamily == ISAFamily::CDNA5) {
       if (mask < 16)
         return emitDpp(loc, rewriter, val, val,
                        makeDppCtrl(DppCtrl::ROW_XMASK0, mask));
       else if (mask < 32)
         return emitPermlaneX16Xor(loc, rewriter, val, mask & 0xf);
-    } else if ((triton::amdgpu::isCDNA(isaFamily) ||
-                isaFamily == ISAFamily::GCN5_1) &&
+    } else if (triton::amdgpu::isCDNA(isaFamily) &&
                (mask < 16 || usePermlaneSwap)) {
       Value result = val;
       uint32_t highBitsDppBasis = 0;
@@ -681,13 +680,13 @@ static int32_t getCtrlBitsForCacheModifierOnRDNA3(triton::CacheModifier cm,
 // Load   | .ca |  CU   | RT |
 //        | .cg |  DEV  | RT |
 //        | .cs |  CU   | NT |
-//        | .cv |  SYS  | LU | on gfx1250, this combination bypasses all caches
+//        | .cv |  SYS  | LU | on CDNA5, this combination bypasses all caches
 // -------+-----+-------+----+-
 // Store  | .wb |  CU   | RT |
 //        | .cg |  DEV  | RT |
 //        | .cs |  CU   | NT |
 //        | .wt |  SYS  | RT | behavior for gfx12
-//        | .wt |  SYS  | WB | behavior for gfx1250, bypasses all caches
+//        | .wt |  SYS  | WB | behavior for CDNA5, bypasses all caches
 // -------+-----+-------+----+-
 static int32_t getCtrlBitsForCacheModifierOn_GFX12(triton::CacheModifier cm,
                                                    triton::EvictionPolicy evict,
@@ -764,7 +763,7 @@ int32_t getCtrlBitsForCacheModifierOnTarget(
   case ISAFamily::RDNA4:
     return getCtrlBitsForCacheModifierOn_GFX12(cm, evict, isLoad,
                                                /*$ bypass*/ false);
-  case ISAFamily::GFX1250:
+  case ISAFamily::CDNA5:
     return getCtrlBitsForCacheModifierOn_GFX12(cm, evict, isLoad,
                                                /*$ bypass*/ true);
   default:
@@ -877,9 +876,12 @@ Type scaleDotElemTypeToMLIRType(MLIRContext *ctx, triton::ScaleDotElemType t) {
   }
 }
 
-bool canCoalesceWriteIntoSharedMemory(MLIRContext *ctx,
-                                      const LinearLayout &srcToSharedLayout,
-                                      unsigned threadsPerWarp) {
+// Returns true if we can perform coalesced write from the source encoding to
+// the destination encoding.
+static bool
+canCoalesceWriteIntoSharedMemory(MLIRContext *ctx,
+                                 const LinearLayout &srcToSharedLayout,
+                                 unsigned threadsPerWarp) {
   auto kReg = StringAttr::get(ctx, "register");
   StringAttr kLane = StringAttr::get(ctx, "lane");
   auto kOffset = StringAttr::get(ctx, "offset");

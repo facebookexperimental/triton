@@ -590,7 +590,7 @@ struct DotOpMFMAConversionHelper {
             Value vals;
             if (type.isF32() && allowXF32) {
               vals = prepareOperands(rawElems, kBase, f32_ty, preserveBF16);
-            } else if (type.getIntOrFloatBitWidth() == 8) {
+            } else if (elemTy.getIntOrFloatBitWidth() == 8) {
               vals = prepareOperands(rawElems, kBase, i8_ty, preserveBF16,
                                      isConstantScale);
             } else if (type.isBF16()) {
@@ -670,6 +670,56 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
     return rewriter.create(loweredOp)->getResult(0);
   }
 
+  // Dense-pack 32 FP6 codes per lane into 24 bytes (code i at bits
+  // [6i, 6i+6), LSB first, matching host packing): vec<8xi32> -> vec<6xi32>.
+  Value packFp6Operand(Value codes) const {
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    Value bytes = b.bitcast(codes, vec_ty(i8_ty, 32));
+    SmallVector<Value> words(6, b.i32_val(0));
+    for (int i = 0; i < 32; ++i) {
+      Value code = LLVM::ZExtOp::create(
+          rewriter, loc, i32_ty, b.extract_element(i8_ty, bytes, b.i32_val(i)));
+      int bitPos = i * 6;
+      int word = bitPos / 32;
+      int shift = bitPos % 32;
+      Value shifted =
+          LLVM::ShlOp::create(rewriter, loc, code, b.i32_val(shift));
+      words[word] = LLVM::OrOp::create(rewriter, loc, words[word], shifted);
+      if (shift > 26) {
+        Value hi =
+            LLVM::LShrOp::create(rewriter, loc, code, b.i32_val(32 - shift));
+        words[word + 1] =
+            LLVM::OrOp::create(rewriter, loc, words[word + 1], hi);
+      }
+    }
+    auto wordTy = vec_ty(i32_ty, 6);
+    Value packed = b.undef(wordTy);
+    for (int w = 0; w < 6; ++w)
+      packed = b.insert_element(wordTy, packed, words[w], b.i32_val(w));
+    return packed;
+  }
+
+  // Consume a per-segment packed FP6 chunk directly instead of
+  // dense-packing codes. Byte contract for an `amdg.fp6_packed` operand:
+  // each lane chunk is 32 bytes, 24 packed bytes (32 codes, LSB first)
+  // followed by 8 padding bytes, so the padding is the last two i32 words.
+  Value dropFp6Padding(Value padded) const {
+    auto paddedTy = dyn_cast<VectorType>(padded.getType());
+    assert(paddedTy &&
+           paddedTy.getNumElements() * paddedTy.getElementTypeBitWidth() ==
+               256 &&
+           "amdg.fp6_packed chunk must be 32 bytes per lane");
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    Value words = b.bitcast(padded, vec_ty(i32_ty, 8));
+    auto packedTy = vec_ty(i32_ty, 6);
+    Value packed = b.undef(packedTy);
+    for (int i = 0; i < 6; ++i)
+      packed = b.insert_element(packedTy, packed,
+                                b.extract_element(i32_ty, words, b.i32_val(i)),
+                                b.i32_val(i));
+    return packed;
+  }
+
   static Value scaledAcc(triton::DotScaledOp op) { return op.getC(); }
   static Value scaledAcc(triton::amdgpu::ScheduledMfmaScaledOp op) {
     return op.getAcc();
@@ -704,6 +754,37 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
 
   template <typename Op, typename Adaptor>
   LogicalResult convertScaledDot(Op op, Adaptor adaptor) const {
+    // FP6 lowers natively only for K=64/128: one 16x16x128 step, or
+    // one/two 32x32x64 steps (96-byte packed K for 128 logical
+    // values). Wider dots (e.g. K=256) must decompose earlier - fail
+    // cleanly, never crash. This is the same supported set as the
+    // native gate in AccelerateAMDMatmul.cpp, stated in both places
+    // so neither pass can silently drift from the other.
+    if (isMXFP6ScaleType(scaledElemType(op, true)) ||
+        isMXFP6ScaleType(scaledElemType(op, false))) {
+      ArrayRef<unsigned> instr = mfmaLayout.getInstrShape();
+      // K is A's last dim and B's first dim; validate whichever
+      // operand(s) are FP6, not just A.
+      bool aNative =
+          !isMXFP6ScaleType(scaledElemType(op, true)) ||
+          cast<RankedTensorType>(op.getA().getType()).getShape().back() ==
+              128 ||
+          cast<RankedTensorType>(op.getA().getType()).getShape().back() == 64;
+      bool bNative =
+          !isMXFP6ScaleType(scaledElemType(op, false)) ||
+          cast<RankedTensorType>(op.getB().getType()).getShape().front() ==
+              128 ||
+          cast<RankedTensorType>(op.getB().getType()).getShape().front() == 64;
+      bool instrNative =
+          (instr[0] == 16 && instr[1] == 16 && instr[2] == 128) ||
+          (instr[0] == 32 && instr[1] == 32 && instr[2] == 64) ||
+          instr[2] == 64;
+      if (!instrNative || !aNative || !bNative)
+        return op.emitError(
+            "native ScaledMFMA for FP6 only supports K=64/128 as "
+            "16x16x128 or 32x32x64 steps yet; decompose the scaled "
+            "dot before LLVM lowering");
+    }
     // Check if this dot has come with priority set by setprio.
     auto setPrioOp = dyn_cast_or_null<ROCDL::SetPrioOp>(op->getPrevNode());
 
@@ -781,8 +862,16 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
     unsigned aKBase = *aKBaseOr;
     unsigned bKBase = *bKBaseOr;
 
-    int aKWidth = aKBase;
-    int bKWidth = bKBase;
+    // FP6 layout chunks hold 32 codes per lane; the x3/4 packed width
+    // (24 bytes) is produced by packFp6Operand after extraction. The
+    // mixed widths below are intentional: aKWidth/bKWidth count
+    // unpacked logical values (kBase, e.g. 128) so the layout/rep
+    // queries see the logical K, while aKBase/bKBase count packed
+    // bytes (kBase * 3/4, e.g. 96) for the instruction K size.
+    int aKWidth = isMXFP6ScaleType(aElemType) ? static_cast<int>(kBase)
+                                              : static_cast<int>(aKBase);
+    int bKWidth = isMXFP6ScaleType(bElemType) ? static_cast<int>(kBase)
+                                              : static_cast<int>(bKBase);
 
     const auto kDimInstrSize = mfmaLayout.getInstrShapeForOperand(aKBase, 0)[1];
 
@@ -819,6 +908,11 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
     int perMfma = zeroKTail ? 2 : 1;
 
     int numVecInKBase = numRepK * aKWidth / aKBase;
+    // For FP6 the truncating division above is exact per instruction
+    // rep: 128/96 and 64/48 both truncate to 1 packed vector per rep,
+    // so numVecInKBase counts one packed vector for each of the
+    // numRepK reps (one rep for 16x16x128, two for 32x32x64 at
+    // K=128). See the mixed packed/unpacked comment at aKWidth.
 
     // Scaled MFMA instructions expect scale operands as 32-bit values,
     // even though each individual scale is only 8 bits. To reduce register
@@ -848,13 +942,24 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
     std::optional<int> kTailFill =
         zeroKTail ? std::make_optional(0) : std::nullopt;
     auto operandA = getValuesFromDotOperandLayoutStruct(
-        loadedA, numRepB, numRepM, numRepK, aKWidth, aKBase, aTensorTy,
-        aTensorTy.getElementType(), allowXF32,
+        loadedA, numRepB, numRepM, numRepK, aKWidth,
+        isMXFP6ScaleType(aElemType) ? static_cast<int>(kBase)
+                                    : static_cast<int>(aKBase),
+        aTensorTy, aTensorTy.getElementType(), allowXF32,
         /*preserveBF16=*/false, /*isConstantScale=*/false, kTailFill);
     auto operandB = getValuesFromDotOperandLayoutStruct(
-        loadedB, numRepB, numRepN, numRepK, bKWidth, bKBase, bTensorTy,
-        bTensorTy.getElementType(), allowXF32,
+        loadedB, numRepB, numRepN, numRepK, bKWidth,
+        isMXFP6ScaleType(bElemType) ? static_cast<int>(kBase)
+                                    : static_cast<int>(bKBase),
+        bTensorTy, bTensorTy.getElementType(), allowXF32,
         /*preserveBF16=*/false, /*isConstantScale=*/false, kTailFill);
+    bool fp6Packed = op->hasAttr(triton::amdgpu::kFp6PackedAttrName);
+    if (isMXFP6ScaleType(aElemType))
+      for (auto &[key, val] : operandA)
+        val = fp6Packed ? dropFp6Padding(val) : packFp6Operand(val);
+    if (isMXFP6ScaleType(bElemType))
+      for (auto &[key, val] : operandB)
+        val = fp6Packed ? dropFp6Padding(val) : packFp6Operand(val);
 
     // Scales have the same replica distributions as their corresponding
     // operands.

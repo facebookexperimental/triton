@@ -1,6 +1,7 @@
 #include "Conversion/ProtonGPUToLLVM/Passes.h"
 #include "Dialect/ProtonGPU/IR/Dialect.h"
 #include "mlir/Pass/Pass.h"
+#include "triton/Analysis/Allocation.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "llvm/Support/MathExtras.h"
@@ -27,6 +28,7 @@ struct AllocateProtonSharedMemoryPass
 
     int totalSharedMemSize = 0;
     int count = 0;
+    SmallVector<triton::SharedMemoryReservation> reservations;
     func.walk([&](triton::gpu::LocalAllocOp alloc) {
       // We ignore the shared memory allocations that have been allocated by the
       // triton conversion pass.
@@ -43,6 +45,13 @@ struct AllocateProtonSharedMemoryPass
             memDescTy.getElementType().getIntOrFloatBitWidth() / 8;
 
         totalSharedMemSize = offset + bufferSizeInBytes;
+        // Keep the existing kernel report in sync with this late allocation.
+        if (offset > sharedMemUsed)
+          reservations.push_back(
+              {"alignment", static_cast<size_t>(sharedMemUsed),
+               static_cast<size_t>(offset - sharedMemUsed), alloc});
+        reservations.push_back({"profiling", static_cast<size_t>(offset),
+                                static_cast<size_t>(bufferSizeInBytes), alloc});
         count++;
       }
     });
@@ -54,6 +63,7 @@ struct AllocateProtonSharedMemoryPass
     mod->setAttr("ttg.shared",
                  mlir::IntegerAttr::get(mlir::IntegerType::get(ctx, 32),
                                         totalSharedMemSize));
+    triton::appendSharedMemoryReservations(mod, reservations);
   }
 };
 

@@ -75,15 +75,22 @@ static unsigned mfmaCountOf(Operation *op) {
   auto rt = dyn_cast<RankedTensorType>(op->getResult(0).getType());
   if (!rt || rt.getRank() != 2)
     return 1;
-  auto mma =
-      dyn_cast_or_null<triton::gpu::AMDMfmaEncodingAttr>(rt.getEncoding());
-  if (!mma)
+  SmallVector<unsigned> instr;
+  SmallVector<unsigned> warps;
+  if (auto mfma = dyn_cast_or_null<triton::gpu::AMDMfmaEncodingAttr>(
+          rt.getEncoding())) {
+    instr = llvm::to_vector(mfma.getInstrShape());
+    warps = llvm::to_vector(mfma.getWarpsPerCTA());
+  } else if (auto wmma = dyn_cast_or_null<triton::gpu::AMDWmmaEncodingAttr>(
+                 rt.getEncoding())) {
+    instr = llvm::to_vector(wmma.getInstrShape());
+    warps = triton::gpu::getWarpsPerCTA(rt);
+  } else {
     return 1;
+  }
   auto aT = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
   if (!aT || aT.getRank() < 2)
     return 1;
-  auto instr = mma.getInstrShape();
-  auto warps = mma.getWarpsPerCTA();
   if (instr.size() < 3 || warps.size() < 2)
     return 1;
   int64_t k = aT.getShape()[1];
@@ -151,7 +158,8 @@ static unsigned dsReadCountOf(Operation *op) {
     // backwards for the target BMM and under-counts every B local_load by 2x.
     if (auto dot = dyn_cast_or_null<triton::gpu::DotOperandEncodingAttr>(
             rt.getEncoding()))
-      if (dot.getOpIdx() == 1)
+      if (dot.getOpIdx() == 1 &&
+          isa<triton::gpu::AMDMfmaEncodingAttr>(dot.getParent()))
         accessBytes = 8;
   }
   return accessCount(ty, accessBytes);
@@ -382,11 +390,18 @@ intraWaveServiceCycles(Operation *op, int32_t mask, unsigned machineCount,
     auto resultTy = dyn_cast<RankedTensorType>(op->getResult(0).getType());
     if (!resultTy)
       return 0;
-    auto mma = dyn_cast_or_null<triton::gpu::AMDMfmaEncodingAttr>(
-        resultTy.getEncoding());
-    if (!mma || mma.getInstrShape().empty())
+    unsigned instrM = 0;
+    if (auto mfma = dyn_cast_or_null<triton::gpu::AMDMfmaEncodingAttr>(
+            resultTy.getEncoding())) {
+      if (!mfma.getInstrShape().empty())
+        instrM = mfma.getInstrShape()[0];
+    } else if (auto wmma = dyn_cast_or_null<triton::gpu::AMDWmmaEncodingAttr>(
+                   resultTy.getEncoding())) {
+      if (!wmma.getInstrShape().empty())
+        instrM = wmma.getInstrShape()[0];
+    }
+    if (!instrM)
       return 0;
-    unsigned instrM = mma.getInstrShape()[0];
     unsigned cycles = instrM == 32 ? 32 : instrM == 16 ? 16 : 0;
     return cycles * machineCount;
   }

@@ -42,11 +42,11 @@ inline bool isEpilogueStoreOp(Operation *op) {
 }
 
 // A TMAStoreTokenWaitOp that waits on an async_tma_reduce / descriptor_reduce.
-// Such a wait must live in the SAME partition as its reduce (the reduction
-// partition), not the epilogue-store partition: otherwise doCodePartition
-// clones the reduce into the store partition to satisfy the mis-placed wait,
-// reducing e.g. reduce_dq into global twice (double-count / stale-staging
-// garbage). See T279388065.
+// Such a wait must live in the SAME partition as its reduce (usually the
+// reduction partition), not the epilogue-store partition: otherwise
+// doCodePartition clones the reduce into the store partition to satisfy the
+// mis-placed wait, reducing e.g. reduce_dq into global twice (double-count /
+// stale-staging garbage). See T279388065.
 inline bool isReduceTokenWait(Operation *op) {
   if (!isa<ttng::TMAStoreTokenWaitOp>(op))
     return false;
@@ -450,18 +450,56 @@ public:
         mmas, [](Operation *op) { return isa<ttng::MMAv5OpInterface>(op); });
   }
 
+  /// True when the WS loop nest contains a register tt.dot (e.g. mma.sync at
+  /// BLOCK_M=32) and no MMA that `mmas` tracks (MMAv5 / WarpGroupDot).
+  bool hasUntrackedRegisterDot() const {
+    if (!mmas.empty())
+      return false;
+    // Copy the lightweight op handle: walk() is non-const but this method is.
+    LoopLikeOpInterface loop = mainLoop;
+    return loop->walk([](triton::DotOp) { return WalkResult::interrupt(); })
+        .wasInterrupted();
+  }
+
   /// True when the WS loop has no MMA but contains an in-register reduction
   /// (tt.reduce). This anchors the no-MMA reduction-kernel path (RMS norm,
   /// LayerNorm, softmax-only) where there is neither an MMA nor a TMA-atomic
   /// reduce to drive a compute partition. Any triton::ReduceOp
   /// (tl.sum/max/min/argmax/...) counts; the walk covers nested loops.
-  bool hasComputeAnchorNoMMA() const {
+  ///
+  /// A register tt.dot is an MMA that `mmas` does not track. When a separate
+  /// epilogue partition will be created (`createsEpiloguePartition`), the
+  /// reduction layout would put the dot in "reduction" but the K loop carrying
+  /// its accumulator in "epilogue", so the anchor is off and the kernel gets
+  /// the plain register-GEMM layout. Without an epilogue partition the
+  /// reduction partition holds the dot, its K loop and the epilogue together,
+  /// which is coherent, so the anchor stays on.
+  bool hasComputeAnchorNoMMA(bool createsEpiloguePartition) const {
     if (!mmas.empty())
+      return false;
+    if (createsEpiloguePartition && hasUntrackedRegisterDot())
       return false;
     // Copy the lightweight op handle: walk() is non-const but this method is.
     LoopLikeOpInterface loop = mainLoop;
     return loop->walk([](triton::ReduceOp) { return WalkResult::interrupt(); })
         .wasInterrupted();
+  }
+
+  /// True when a tmem_load after the main loop reads a TMEM value it produced.
+  bool hasPostLoopTMemRead() const {
+    // Copy the lightweight op handle: getOperation() is non-const.
+    LoopLikeOpInterface loop = mainLoop;
+    Operation *loopOp = loop.getOperation();
+    for (Operation *op = loopOp->getNextNode(); op; op = op->getNextNode()) {
+      WalkResult found = op->walk([&](ttng::TMEMLoadOp load) {
+        Value dep = load.getDep();
+        return dep && dep.getDefiningOp() == loopOp ? WalkResult::interrupt()
+                                                    : WalkResult::advance();
+      });
+      if (found.wasInterrupted())
+        return true;
+    }
+    return false;
   }
 
   /// Get the shared ops (ops appearing in multiple MMA backward slices).
@@ -995,6 +1033,25 @@ private:
   unsigned dataPartitionFactor = 1;
 };
 
+/// True when createPartitionLayout will create a separate (non-store)
+/// "epilogue" partition for this loop.
+static bool createsEpiloguePartition(const OpCategorizer &categorizer,
+                                     const SchedulingOptions &options) {
+  if (options.mergeEpilogue || options.mergeEpilogueToComputation)
+    return false;
+  bool hasEpilogue =
+      !categorizer.getOpsInCategory(OpCategory::EpilogueStore).empty();
+  // A post-loop TMEM read with nothing else to take it needs an epilogue
+  // partition; left unscheduled it lands in the gemm task. No compute-anchor
+  // check is needed: hasComputeAnchorNoMMA() is false whenever hasMMAv5().
+  bool hasPostLoopTMemEpilogue =
+      !hasEpilogue &&
+      categorizer.getOpsInCategory(OpCategory::Correction).empty() &&
+      categorizer.getOpsInCategory(OpCategory::TMAReduction).empty() &&
+      categorizer.hasMMAv5() && categorizer.hasPostLoopTMemRead();
+  return hasEpilogue || hasPostLoopTMemEpilogue;
+}
+
 /// Create partitions based on the categorizer results and scheduling options.
 /// This replaces the old template system (UnifiedFATemplate, GEMMTemplate,
 /// selectTemplate).
@@ -1016,7 +1073,8 @@ static PartitionLayout createPartitionLayout(PartitionSet &schedule,
   // no TMA-atomic reduce, but an in-register tt.reduce. These need a reduction
   // (default) partition to hold the tensor compute. Gated to the no-MMA case so
   // MMA kernels are unaffected.
-  bool hasComputeAnchor = categorizer.hasComputeAnchorNoMMA();
+  bool hasComputeAnchor = categorizer.hasComputeAnchorNoMMA(
+      createsEpiloguePartition(categorizer, options));
 
   LLVM_DEBUG(llvm::dbgs() << "[partition-layout] dpFactor=" << dpFactor
                           << ", hasCorrection=" << hasCorrection
@@ -1046,8 +1104,7 @@ static PartitionLayout createPartitionLayout(PartitionSet &schedule,
   }
 
   // Epilogue partition: for non-store epilogue ops when not merging.
-  if (hasEpilogue && !options.mergeEpilogue &&
-      !options.mergeEpilogueToComputation) {
+  if (createsEpiloguePartition(categorizer, options)) {
     layout.epiloguePartition = schedule.addPartition(0);
     layout.epiloguePartition->setType("epilogue");
   }
@@ -1252,7 +1309,8 @@ static Partition *scheduleUsers(LoopLikeOpInterface loop,
 
 // Schedule post-loop operations (operations outside and after the loop) into
 // the appropriate partition. Epilogue store ops and their transitive users
-// (e.g., TMAStoreTokenWaitOp) go to the epilogue partition. All other post-loop
+// (e.g., TMAStoreTokenWaitOp) go to the epilogue partition, except that a TMA
+// reduce's token wait goes to its reduce's partition. All other post-loop
 // ops (e.g., tmem_load for accumulator reads, arithmetic for normalization) go
 // to the default partition. This prevents TMEM ops from landing in the
 // epilogue, which would force it to use 4 warps (TMEM lane coverage
@@ -1356,7 +1414,13 @@ schedulePostLoopOps(LoopLikeOpInterface loop, PartitionSet &schedule,
 
     { // Schedule post-loop op (override earlier phase assignments)
       Partition *target = nullptr;
-      if (isEpilogueStoreOp(user)) {
+      if (isReduceTokenWait(user)) {
+        // Keep a reduce's token_wait with its reduce (see isReduceTokenWait);
+        // this walk has already scheduled the reduce.
+        auto ids = safeGetPartitionIds(user->getOperand(0).getDefiningOp());
+        target = ids.size() == 1 ? schedule.getPartition(ids[0])
+                                 : getEpilogueTarget(user);
+      } else if (isEpilogueStoreOp(user)) {
         target = getStoreTarget(user);
       } else {
         bool hasStoreInput = false;
@@ -1513,6 +1577,28 @@ getInitialSchedule(LoopLikeOpInterface mainLoop,
   SchedulingOptions localSchedOpts = schedOpts;
   if (useHopperDpSchedule)
     localSchedOpts.mergeEpilogueToComputation = true;
+
+  // A TMA reduce creates the reduction partition by itself (`hasReduction`),
+  // so with a register tt.dot and a separate epilogue partition the dot and
+  // its K loop land in "reduction" while the epilogue reading the accumulator
+  // lands in "epilogue", and code partitioning has no channel for that loop
+  // result. Leave such a loop unspecialized. Without an epilogue partition
+  // (merge_epilogue / merge_epilogue_to_computation, or a pointer tt.store
+  // epilogue) "reduction" holds all of it and the loop still specializes.
+  //
+  // Returning nullopt leaves the loop without partitions. That is only a clean
+  // bail-out while this is the function's only WS loop: the no-partition gate
+  // in WarpSpecialization.cpp (partition-scheduler bug #22) checks the whole
+  // function, so it does not fire when another WS loop in the same function
+  // did get partitions.
+  bool createsEpilogue = createsEpiloguePartition(categorizer, localSchedOpts);
+  if (!categorizer.getOpsInCategory(OpCategory::TMAReduction).empty() &&
+      createsEpilogue && categorizer.hasUntrackedRegisterDot()) {
+    LLVM_DEBUG(llvm::dbgs() << "[tritongpu-partition-scheduling] register "
+                               "tt.dot with a TMA reduce and an epilogue "
+                               "partition: not specializing\n");
+    return std::nullopt;
+  }
 
   //===--------------------------------------------------------------------===//
   // Phase 2: Create partition layout using tuning knobs
@@ -1776,7 +1862,8 @@ getInitialSchedule(LoopLikeOpInterface mainLoop,
   if (mmas.empty() && layout.epilogueStorePartition) {
     for (auto loop : loops) {
       getLoopBodyRegion(loop).walk([&](Operation *op) {
-        if (isEpilogueStoreOp(op))
+        // A reduce's token_wait stays with its reduce (isReduceTokenWait).
+        if (isEpilogueStoreOp(op) && !isReduceTokenWait(op))
           tryScheduleOp(layout.epilogueStorePartition, op);
       });
     }
@@ -2231,7 +2318,7 @@ getInitialSchedule(LoopLikeOpInterface mainLoop,
                         categorizer.getOpToDpIdMap(),
                         std::move(dpIdToPartition),
                         createComputePartitions,
-                        categorizer.hasComputeAnchorNoMMA()};
+                        categorizer.hasComputeAnchorNoMMA(createsEpilogue)};
 }
 
 namespace {
@@ -3076,11 +3163,10 @@ void PartitionSchedulingMeta::runOnOperation() {
         });
         if (storePartition) {
           // Atomics are left alone: a tile-claim atomic must keep the full
-          // partition union (or make autoWS bail out).
-          getLoopBodyRegion(loop).walk([&](StoreOp store) {
-            if (isa<RankedTensorType>(store.getPtr().getType()))
-              tryScheduleOp(storePartition, store);
-          });
+          // partition union (or make autoWS bail out). An unscheduled store,
+          // scalar or not, is dropped.
+          getLoopBodyRegion(loop).walk(
+              [&](StoreOp store) { tryScheduleOp(storePartition, store); });
         }
       }
 
@@ -3336,6 +3422,13 @@ void PartitionSchedulingMeta::runOnOperation() {
 
       if (estimatedTotal > kMaxWarps) {
         LDBG("Warp budget exceeded. Skipping warp specialization.");
+        loop->emitWarning()
+            << "skipping warp specialization: the partition schedule needs an "
+               "estimated "
+            << estimatedTotal << " warps (" << numPartitions
+            << " partitions, default partition " << defaultNumWarps
+            << " warps), above the limit of " << kMaxWarps
+            << "; the kernel is compiled without warp specialization";
         removeWarpSpecMetadata(funcOp);
         return;
       }

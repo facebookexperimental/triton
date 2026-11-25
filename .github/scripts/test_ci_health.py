@@ -389,6 +389,26 @@ def test_collect_rejects_exact_pr_with_wrong_verified_repository_or_ref(tmp_path
     assert stored.get("followup_status") is None and stored.get("pr") is None and stored["tested_sha"] is None
 
 
+@pytest.mark.parametrize("workflow,event", [
+    ("gpu-tests.yml", "push"),
+    ("gpu-tests.yml", "pull_request"),
+    ("gpu-tests.yml", "schedule"),
+    ("gpu-tests-nightly.yml", "schedule"),
+    ("nightly-tlx-ops-bench.yml", "workflow_run"),
+    ("fast-gpu-tests.yml", "workflow_dispatch"),
+])
+def test_collect_completed_gpu_jobs_before_the_workflow_finishes(tmp_path, workflow, event):
+    raw = gh_run(1, "2026-10-12T01:00:00Z", status="in_progress", conclusion=None, event=event, head_branch="main")
+    finished = gh_job(10, "h100 / h100-tlx-test") | {"status": "completed"}
+    waiting = gh_job(11, "b200 / b200-tlx-test",
+                     conclusion=None) | {"status": "queued", "started_at": None, "completed_at": None, "steps": []}
+    collect(tmp_path, {workflow: [raw]}, {1: [finished, waiting]})
+    stored = ch.load_runs(str(tmp_path))[1]
+    assert stored["status"] == "in_progress"
+    assert stored["jobs"][0]["conclusion"] == "success"
+    assert [job["status"] for job in stored["jobs"]] == ["completed", "queued"]
+
+
 def test_collect_hydrates_running_fast_parent_and_preserves_source_evidence(tmp_path):
     sha = 'ab' * 20
     raw = gh_run(1, '2026-10-12T01:00:00Z', status='in_progress', conclusion=None, pull_requests=[{'number': 4855}])
@@ -532,7 +552,7 @@ def test_collect_stores_completed_runs_with_jobs_and_keeps_cursor_at_running(tmp
         "gpu-tests.yml": [gh_run(1, "2026-10-12T01:00:00Z"),
                           gh_run(2, "2026-10-12T02:00:00Z", "in_progress", None)]
     }
-    state, _, _ = collect(tmp_path, runs)
+    state, _, _ = collect(tmp_path, runs, {**JOBS, 2: []})
     stored = ch.load_runs(str(tmp_path))
     job = stored[1]["jobs"][0]
     assert job["steps"] == [{
@@ -540,7 +560,7 @@ def test_collect_stores_completed_runs_with_jobs_and_keeps_cursor_at_running(tmp
         "2026-10-12T01:04:00Z"
     }]
     assert job["created_at"] == "2026-10-12T00:59:00Z" and "runner_name" not in job
-    assert stored[2]["jobs"] is None and state["cursor"] == "2026-10-12T02:00:00Z"
+    assert stored[2]["jobs"] == [] and state["cursor"] == "2026-10-12T02:00:00Z"
     assert json.loads((tmp_path / "state.json").read_text())["collected_at"] == NOW
     assert (tmp_path / "changed.txt").read_text().split() == [str(tmp_path / "runs-2026-10.jsonl.gz")]
 
@@ -748,7 +768,7 @@ def test_snapshot_line_reads_pin_pending_changes_issues_and_history():
         },
     ]
     line = ch.snapshot_line(get, "main", "triton_beta", releases, issues)
-    assert line["pinned"] == {"tag": "llvm-bbbbbbbb-1", "llvm_hash": B, "base": None}
+    assert line["pinned"] == {"tag": "llvm-bbbbbbbb-1", "llvm_hash": B}
     assert line["newest"]["tag"] == "llvm-cccccccc-1"
     assert line["pending"] == [{"sha": "d" * 40, "title": "[triton/beta] Backport VOPD fix", "pr": 18}]
     assert line["pr"]["number"] == 4282 and [i["number"] for i in line["issues"]] == [7]

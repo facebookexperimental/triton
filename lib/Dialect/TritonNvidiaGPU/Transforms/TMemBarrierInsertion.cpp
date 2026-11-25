@@ -4,6 +4,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/TensorMemoryUtils.h"
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/MBarrierUtilities.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -50,7 +51,7 @@ public:
   bool isSameThread(Operation *lhsOp, Operation *rhsOp,
                     Allocation *allocation) {
     // Function summaries and different WS regions may have different issuers.
-    if (lhsOp->getParentRegion() != rhsOp->getParentRegion() ||
+    if (getIssuerRegion(lhsOp) != getIssuerRegion(rhsOp) ||
         lhsOp->getParentOfType<FunctionOpInterface>() !=
             allocation->getOperation())
       return false;
@@ -87,6 +88,15 @@ public:
   }
 
 private:
+  // The region whose threads issue `op`. A predicated region's body runs on
+  // threads of the region that contains it, which access the same words there.
+  static Region *getIssuerRegion(Operation *op) {
+    Region *region = op->getParentRegion();
+    while (isa<gpu::WarpPredicateOp>(region->getParentOp()))
+      region = region->getParentOp()->getParentRegion();
+    return region;
+  }
+
   struct Info {
     // (row, word column) -> (lane, warp).
     LinearLayout threads;
@@ -191,12 +201,22 @@ static BlockInfo getTMemAccesses(Operation *op, BufferRegionAnalysis &regions) {
 // Publication: Wait + require a rendezvous between issuing warps if needed.
 enum class TMemBoundary { None, Wait, Publication };
 
-static TMemBoundary getTMemBoundary(Operation *op) {
+static TMemBoundary getTMemBoundary(Operation *op,
+                                    DivergentControlFlow &divergence) {
   // Assumptions do not publish pending TMEM accesses.
   if (isa<LLVM::AssumeOp>(op))
     return TMemBoundary::None;
   if (auto barrier = dyn_cast<gpu::MBarrierOpInterface>(op);
       barrier && barrier.isPerWarp())
+    return TMemBoundary::Wait;
+  // Every thread arrives for itself, and the barrier completes only after all
+  // of them do, so each thread only completes its own accesses. A named
+  // barrier that counts and is executed by every thread of the region is its
+  // own rendezvous.
+  if (arrivesFromEveryThread(op))
+    return TMemBoundary::Wait;
+  if (isa<NamedBarrierArriveOp, NamedBarrierWaitOp>(op) &&
+      countsEveryThread(op) && !divergence.isUnderDivergentBranch(op))
     return TMemBoundary::Wait;
   // An acquire does not publish earlier TMEM accesses. Keep them pending.
   if (isa<WaitBarrierOp>(op))
@@ -204,8 +224,10 @@ static TMemBoundary getTMemBoundary(Operation *op) {
   // Defer completion at CTA barriers until a hazard or boundary needs it.
   if (isa<gpu::BarrierOp>(op))
     return TMemBoundary::None;
-  // SCF has been lowered. Complete accesses before every CFG and WS edge.
-  if (isa<BranchOpInterface, gpu::WarpSpecializeOp,
+  // SCF has been lowered. Complete accesses before every CFG and WS edge,
+  // including entering or skipping a predicated region, which lowers to a
+  // conditional branch on NVIDIA. Its yield is ReturnLike.
+  if (isa<BranchOpInterface, gpu::WarpPredicateOp, gpu::WarpSpecializeOp,
           gpu::WarpSpecializePartitionsOp, gpu::WarpYieldOp, gpu::WarpReturnOp>(
           op) ||
       op->hasTrait<OpTrait::ReturnLike>())
@@ -343,6 +365,22 @@ private:
             !pending.syncWriteSlices.empty());
   }
 
+  // A divergent branch can skip what it guards in only some threads of the
+  // region, and a rendezvous that only some of them reach deadlocks. Publish
+  // pending accesses before the branch if a guarded operation publishes.
+  bool publishesUnderBranch(Operation *branch) {
+    if (!divergence.isDivergentBranch(branch))
+      return false;
+    auto it = branchPublishes.find(branch);
+    if (it != branchPublishes.end())
+      return it->second;
+    bool publishes = false;
+    divergence.walkSkippable(branch, [&](Operation *op) {
+      publishes |= getTMemBoundary(op, divergence) == TMemBoundary::Publication;
+    });
+    return branchPublishes[branch] = publishes;
+  }
+
   void update(Operation *op, MembarInfo *info, FuncMapT *funcMap,
               OpBuilder *builder) override {
     waitsBefore.erase(op);
@@ -381,8 +419,8 @@ private:
       rememberBarrier(op, *info);
     }
 
-    auto boundary = getTMemBoundary(op);
-    if (boundary == TMemBoundary::Publication)
+    auto boundary = getTMemBoundary(op, divergence);
+    if (boundary == TMemBoundary::Publication || publishesUnderBranch(op))
       effects.threadDemands.hasDemand = true;
 
     syncBefore(effects);
@@ -413,6 +451,8 @@ private:
 
   // Planed tmem_wait insertions
   DenseMap<Operation *, SmallVector<TMEMWaitKind, 2>> waitsBefore;
+  // Whether an operation that a divergent branch guards publishes.
+  DenseMap<Operation *, bool> branchPublishes;
   Operation *lastBarrier = nullptr;
   // Incomplete TMEM accesses before `lastBarrier`
   BlockInfo beforeBarrier;

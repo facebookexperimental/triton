@@ -54,6 +54,92 @@ def amd_scaled_downcast_fp8(value, scale: tl.constexpr, dtype: tl.constexpr = tl
     return tl.tensor(handle, result_ty)
 
 
+def _scaled_fp4_axis(name, axis, rank, _semantic):
+    """Checks the target; returns the normalized axis."""
+    options = _semantic.builder.options
+    if options.backend_name != "hip" or not (options.arch == "gfx950" or options.arch.startswith("gfx1250")):
+        raise NotImplementedError(f"tlx.{name} requires gfx950 or gfx1250")
+    axis = tl._unwrap_if_constexpr(axis)
+    if not isinstance(axis, int) or not -rank <= axis < rank:
+        raise ValueError(f"tlx.{name}: axis must be a compile-time int in [-{rank}, {rank})")
+    return axis % rank
+
+
+def _scaled_fp4_scale(name, scale, shape, axis, _semantic):
+    """Checks raw E8M0 scales against the unpacked ``shape``; returns the scale and values per scale along axis."""
+    scale = _semantic.to_tensor(scale)
+    if not scale.type.is_block() or scale.dtype not in (tl.uint8, tl.int8):
+        raise TypeError(f"tlx.{name}: scale must be a uint8 tensor of raw E8M0 bytes")
+    scale_shape = list(scale.type.shape)
+    if len(scale_shape) != len(shape) or any(s != v for d, (s, v) in enumerate(zip(scale_shape, shape)) if d != axis):
+        raise ValueError(f"tlx.{name}: scale shape {scale_shape} must match {shape} except along axis")
+    if shape[axis] % scale_shape[axis]:
+        raise ValueError(f"tlx.{name}: scale extent along axis must divide {shape[axis]}")
+    return scale, shape[axis] // scale_shape[axis]
+
+
+def _scaled_fp4_operands(x, scale, _semantic):
+    """The op derives its operand layouts from the result layout, so drop layouts set at the TLX level (e.g. by
+    ``local_load(layout=...)``): the verifier rejects a scale layout without an output layout."""
+    release = _semantic.builder.create_release_layout
+    return release(x.handle, relaxed=True), release(scale.handle, relaxed=True)
+
+
+@tl.builtin
+def amd_scaled_upcast_fp4(x, scale, dtype: tl.constexpr = tl.bfloat16, axis: tl.constexpr = -1, _semantic=None):
+    """Convert packed E2M1 (FP4) values times their E8M0 scales to BF16 or F16 on gfx950 or gfx1250.
+
+    ``x`` is a uint8 tensor holding two E2M1 values per byte along ``axis`` (the even element in the low nibble); the
+    result doubles that extent. ``scale`` holds raw E8M0 bytes (value ``2^(byte - 127)``) with the result's shape
+    except along ``axis``, where each scale covers a multiple of 8 consecutive values (32 for MXFP4). The
+    conversion is exact. It lowers to ``amdg.scaled_upcast_fp4``, which applies the scale in the conversion
+    instruction: ``v_cvt_scale_pk8_{bf16,f16}_fp4`` (eight values) on gfx1250, ``v_cvt_scalef32_pk_{bf16,f16}_fp4``
+    (two values) on gfx950.
+    """
+    name = "amd_scaled_upcast_fp4"
+    x = _semantic.to_tensor(x)
+    if not x.type.is_block() or x.dtype not in (tl.uint8, tl.int8):
+        raise TypeError(f"tlx.{name}: x must be a uint8 tensor of packed E2M1 pairs")
+    dtype = tl._unwrap_if_constexpr(dtype)
+    if dtype not in (tl.bfloat16, tl.float16):
+        raise TypeError(f"tlx.{name}: dtype must be tl.bfloat16 or tl.float16")
+    shape = list(x.type.shape)
+    axis = _scaled_fp4_axis(name, axis, len(shape), _semantic)
+    shape[axis] *= 2
+    scale, block = _scaled_fp4_scale(name, scale, shape, axis, _semantic)
+    if block % 8:
+        raise ValueError(f"tlx.{name}: each scale must cover a multiple of 8 values along axis")
+    x_handle, scale_handle = _scaled_fp4_operands(x, scale, _semantic)
+    handle = _semantic.builder.create_amd_scaled_upcast_fp4(x_handle, scale_handle, dtype.to_ir(_semantic.builder),
+                                                            axis)
+    return tl.tensor(handle, tl.block_type(dtype, shape))
+
+
+@tl.builtin
+def amd_scaled_downcast_fp4(x, scale, axis: tl.constexpr = -1, _semantic=None):
+    """Divide FP32, BF16 or F16 values by their E8M0 scales and pack them to E2M1 (FP4) on gfx950 or gfx1250.
+
+    Returns a uint8 tensor with two E2M1 values per byte along ``axis`` (the even element in the low nibble), halving
+    that extent. ``scale`` holds raw E8M0 bytes (value ``2^(byte - 127)``) with the input's shape except along
+    ``axis``, where each scale covers a multiple of 8 consecutive values (32 for MXFP4). E2M1 rounding is to nearest
+    even, saturating at 6. It lowers to ``amdg.scaled_downcast_fp4``: ``v_cvt_scalef32_pk8_fp4_*`` (eight values) on
+    gfx1250, ``v_cvt_scalef32_pk_fp4_*`` (two values) on gfx950.
+    """
+    name = "amd_scaled_downcast_fp4"
+    x = _semantic.to_tensor(x)
+    if not x.type.is_block() or x.dtype not in (tl.float32, tl.bfloat16, tl.float16):
+        raise TypeError(f"tlx.{name}: x must be an FP32, BF16 or F16 tensor")
+    shape = list(x.type.shape)
+    axis = _scaled_fp4_axis(name, axis, len(shape), _semantic)
+    scale, block = _scaled_fp4_scale(name, scale, shape, axis, _semantic)
+    if block % 8:
+        raise ValueError(f"tlx.{name}: each scale must cover a multiple of 8 values along axis")
+    x_handle, scale_handle = _scaled_fp4_operands(x, scale, _semantic)
+    handle = _semantic.builder.create_amd_scaled_downcast_fp4(x_handle, scale_handle, axis)
+    shape[axis] //= 2
+    return tl.tensor(handle, tl.block_type(tl.uint8, shape))
+
+
 def cuda_parse_arch(arch):
     pattern = r"^sm(\d+)$"
     match = re.fullmatch(pattern, arch)
@@ -107,13 +193,14 @@ def num_warps(_semantic=None):
 
 @tl.builtin
 def warp_predicate(predicate, inits, body, args=(), wave_uniform=False, _semantic=None, _generator=None):
-    """Execute ``body`` under an AMD per-lane execution predicate.
+    """Execute ``body`` under a per-lane execution predicate.
 
     A scalar predicate supplies the execution bit for the current physical
     lane. For a tensor predicate, elements owned by one lane are OR-reduced to
     that lane's execution bit. A wavefront skips ``body`` when none of its
     lanes are active. Active lanes receive the values returned by
-    ``body(*inits, *args)``; inactive lanes keep ``inits``. The body must be an
+    ``body(*inits, *args)``; inactive lanes keep ``inits``. With no ``inits``,
+    the body returns nothing and is run only for its effects. The body must be an
     ``@triton.jit`` function containing straight-line computation without
     cross-wave synchronization. Bodies containing reductions, dots, or layout
     shuffles must pass ``wave_uniform=True`` to declare that the predicate has
@@ -123,8 +210,12 @@ def warp_predicate(predicate, inits, body, args=(), wave_uniform=False, _semanti
     match each carried tensor or a common leading shape (for example, one row
     predicate for row-major matrices).
 
-    This operation has no cross-wave synchronization and is currently lowered
-    only by the AMD backend.
+    This operation has no cross-wave synchronization, so compilation fails if
+    the body needs a CTA barrier. NVIDIA so far supports only effects-only
+    bodies (no ``inits``) under a scalar ``wave_uniform=True`` predicate such as
+    ``tlx.warp_any(...)``, containing register math and tensor memory loads and
+    stores. Other operations, such as mbarrier arrives and waits, are not yet
+    supported in the body on NVIDIA.
     """
     if isinstance(inits, tl.tensor):
         inits = (inits, )
@@ -135,8 +226,6 @@ def warp_predicate(predicate, inits, body, args=(), wave_uniform=False, _semanti
 
     inits = builtins.list(inits)
     args = builtins.list(args)
-    if not inits:
-        raise ValueError("warp_predicate requires at least one carried value")
     if not all(isinstance(value, tl.tensor) for value in inits):
         raise TypeError("warp_predicate carried values must be tensors")
 
@@ -148,12 +237,19 @@ def warp_predicate(predicate, inits, body, args=(), wave_uniform=False, _semanti
         raise TypeError(f"warp_predicate wave_uniform must be a bool, got {type(wave_uniform).__name__}")
 
     builder = _semantic.builder
+    # Moving the insertion point into the detached body block and back resets
+    # the builder location, so restore the caller's location for the body call
+    # and for the op, whose diagnostics should point at this call.
+    loc = builder.get_loc()
     block = builder.new_block()
     insertion_point = builder.get_insertion_point()
     try:
         builder.set_insertion_point_to_start(block)
+        builder.set_loc(loc)
         body_result = _generator.call_JitFunction(body, inits + args, kwargs={})
-        if isinstance(body_result, tl.tensor):
+        if body_result is None or (isinstance(body_result, tl.constexpr) and body_result.value is None):
+            results = []
+        elif isinstance(body_result, tl.tensor):
             results = [body_result]
         elif isinstance(body_result, (builtins.tuple, builtins.list, tl.tuple)):
             results = builtins.list(body_result)
@@ -169,6 +265,7 @@ def warp_predicate(predicate, inits, body, args=(), wave_uniform=False, _semanti
         builder.create_predicate_yield_op([result.handle for result in results])
     finally:
         builder.restore_insertion_point(insertion_point)
+        builder.set_loc(loc)
 
     result_types = [result.type.to_ir(builder) for result in results]
     op = builder.create_warp_predicate_op(

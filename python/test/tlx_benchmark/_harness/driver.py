@@ -27,6 +27,9 @@ import argparse
 import contextlib
 import dataclasses
 import functools
+import json
+import math
+import weakref
 from typing import Any, Callable, Iterable, Optional
 
 from . import report as report_mod
@@ -147,37 +150,114 @@ def _fmt_config(config) -> str:
     return " ".join(parts + [f"w{config.num_warps}", f"s{config.num_stages}"])
 
 
-@contextlib.contextmanager
-def _record_configs(into: dict):
-    """Record the config every autotuned kernel launched in this block ran with.
+_AUTOTUNE_SOURCES = weakref.WeakKeyDictionary()
 
-    Wraps `Autotuner.run` rather than using `knobs.autotuning.listener`: the
-    listener only fires for a multi-config space, and a single-config one --
-    what an op with a `heuristic_config` uses by default -- is the case most
-    worth labelling. Doing it here rather than in a bench module is what makes
-    the column op-agnostic: an op that launches several autotuned kernels (a
-    flash_attn backward) contributes one entry per kernel, keyed by name.
+
+def _config_spec(config):
+    values = config.all_kwargs()
+    if "ir_override" in values:
+        values["ir_override"] = bool(values["ir_override"])
+    return json.loads(json.dumps(values, default=str))
+
+
+def _autotune_decision(autotuner, case_key, phase, prior_cache, event):
+    config = _config_spec(autotuner.best_config)
+    key = tuple(event["key"]) if event else getattr(autotuner, "_last_key", None)
+    if event:
+        selection = "cached" if event["cache_hit"] else "tuned"
+    elif len(autotuner.configs) == 1:
+        key, selection = None, "fixed"
+    else:
+        selection = "cached" if key in prior_cache else "unobserved"
+    sources = _AUTOTUNE_SOURCES.setdefault(autotuner, {})
+    if selection == "tuned":
+        sources[key] = (case_key, config)
+    elif key not in prior_cache or sources.get(key, (None, None))[1] != config:
+        sources.pop(key, None)
+    candidates = []
+    if selection == "tuned":
+        for candidate, times in (event["configs_timings"] or {}).items():
+            times = times if isinstance(times, (list, tuple)) else [times]
+            candidates.append({
+                "config": _config_spec(candidate),
+                "timings_ms": [float(t) if math.isfinite(t) else None for t in times],
+            })
+    return {
+        "kernel": f"{autotuner.base_fn.__module__}.{autotuner.base_fn.__qualname__}",
+        "phase": phase,
+        "key": [str(value) for value in key] if key is not None else None,
+        "config": config,
+        "selection": selection,
+        "selected_by_case": sources.get(key, (None, None))[0],
+        "candidates": candidates,
+    }
+
+
+@contextlib.contextmanager
+def _record_configs(into: dict, *, case_key=None, decisions=None, phase="warmup"):
+    """Record warmup choices without attaching observers to measured calls.
+
+    The runtime listener supplies fresh candidate times. Cached launches retain
+    the observed tuning case for that choice, or null for an unknown origin.
+    Single-config kernels still use the existing Autotuner.run wrapper.
     """
     try:
+        from triton import knobs
         from triton.runtime.autotuner import Autotuner
-    except ImportError:  # nothing to record; not a reason to fail a measurement
+    except ImportError:
         yield
         return
 
     original = Autotuner.run
+    previous_listener = knobs.autotuning.listener
+    active = []
+
+    def listener(**event):
+        if active:
+            active[-1]["event"] = event
+        if previous_listener is not None:
+            previous_listener(**event)
 
     def run(self, *args, **kwargs):
-        out = original(self, *args, **kwargs)
+        frame = {"prior_cache": dict(self.cache), "event": None} if decisions is not None else None
+        active.append(frame)
+        try:
+            out = original(self, *args, **kwargs)
+        finally:
+            active.pop()
         config = getattr(self, "best_config", None)
         if config is not None:
             into[self.base_fn.__name__] = _fmt_config(config)
+            if decisions is not None:
+                try:
+                    row = _autotune_decision(self, case_key, phase, frame["prior_cache"], frame["event"])
+                    signature = phase, row["kernel"], str(row["key"]), json.dumps(row["config"],
+                                                                                  sort_keys=True), row["selection"]
+                    if row["selection"] == "tuned":
+                        signature += (len(decisions), )
+                    decisions[signature] = row
+                except Exception as exc:
+                    _AUTOTUNE_SOURCES.clear()
+                    decisions[(phase, self.base_fn.__name__, "recording_error")] = {
+                        "kernel": self.base_fn.__name__,
+                        "phase": phase,
+                        "key": None,
+                        "config": None,
+                        "selection": "unobserved",
+                        "selected_by_case": None,
+                        "candidates": [],
+                        "recording_error": type(exc).__name__,
+                    }
         return out
 
     Autotuner.run = run
+    if decisions is not None:
+        knobs.autotuning.listener = listener
     try:
         yield
     finally:
         Autotuner.run = original
+        knobs.autotuning.listener = previous_listener
 
 
 def _render_configs(configs: dict) -> Optional[str]:
@@ -252,7 +332,14 @@ def run_case(bench, case: Case, *, space: str, cold: bool = True, latency_mode: 
 
     if latency_mode not in LATENCY_MODES:
         raise ValueError(f"latency_mode must be one of {LATENCY_MODES}, got {latency_mode!r}")
-    prep = bench.prepare(case, space)
+    # INVARIANT: a case never times an uncompiled torch.compile reference. Dynamo runs a function eagerly once it
+    # has been recompiled 8 times, which a bench that compiles one reference function per case reaches on its 9th
+    # case; the reset gives every case its own budget and the flag turns any overrun into an error.
+    torch._dynamo.reset()
+    torch._dynamo.config.fail_on_recompile_limit_hit = True
+    autotune: dict = {}
+    with _record_configs({}, case_key=case.key, decisions=autotune, phase="prepare"):
+        prep = bench.prepare(case, space)
 
     # Cold pass first, on its own fresh Triton cache. For a backward case
     # `prepare` has already run the forward, so what this times is the backward
@@ -266,10 +353,11 @@ def run_case(bench, case: Case, *, space: str, cold: bool = True, latency_mode: 
         compile_stat = cold_compile(prep.tlx_fn, cap_s=prep.cap_s)
 
     configs: dict = {}
-    with _record_configs(configs):
+    with _record_configs(configs, case_key=case.key, decisions=autotune):
         prep.tlx_fn()  # tune and compile outside the measured window
     if prep.ref_fn is not None:
-        prep.ref_fn()
+        with _record_configs({}, case_key=case.key, decisions=autotune, phase="reference"):
+            prep.ref_fn()
     torch.cuda.synchronize()
     correct, accuracy_note = prep.check() if prep.check is not None else (None, "")
 
@@ -295,6 +383,7 @@ def run_case(bench, case: Case, *, space: str, cold: bool = True, latency_mode: 
     result.ref_host_us = ref_host_us
     result.extra = dict(prep.extra)
     result.best_config = _render_configs(configs)
+    result.autotune = list(autotune.values())
 
     # Optional adapter hook, for an op-specific metric that can only be computed
     # from the measurement -- `prepare` runs before there is one. Mutates in

@@ -57,6 +57,7 @@ See [Buffer Allocation](BufferAllocation.md) for details.
 Step 0:   swapTransposedLocalAllocs   — normalize transposed alloc layouts
 Step 0.5: mergeDuplicateLocalAllocs   — deduplicate allocs with same source/type
 Step 0.75: hoistDescriptorLoadBuffers — hoist pre-converted NVWS destinations
+Step 0.9: foldDescriptorLoadMmaBridge — share exact-layout TMA destinations
 Step 1:   collectAsyncChannels        — discover channels
 Step 2:   reorderEpilogOps            — interleave epilogue stores
 Step 3:   createBuffer                — allocate buffers (single copy)
@@ -117,7 +118,8 @@ epilogue-store partition after buffering. `createBuffer` inserts
 `local_store` ops in producer order, so `reorderEpilogOps` restores producer
 order for channels feeding the same descriptor to match the descriptor-store
 order. This keeps the producer-side `local_store` sequence aligned with the
-consumer-side TMA store sequence.
+consumer-side TMA store sequence. A TMA staging write is never hoisted above
+an earlier TMA store or reduce (see BufferAllocation.md, Step 2).
 
 ## Buffer Creation
 

@@ -16,6 +16,10 @@ using namespace mlir::triton::gpu;
 
 static constexpr llvm::StringRef kMutableMemory = "mutable";
 
+unsigned MemDescType::getElementTypeBitWidth() const {
+  return getIntOrFloatOrPtrBitWidth(getElementType());
+}
+
 Type MemDescType::parse(AsmParser &parser) {
   Location loc = parser.getEncodedSourceLoc(parser.getCurrentLocation());
   if (failed(parser.parseLess()))
@@ -163,7 +167,7 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
     if (memorySpace != nvidia_gpu::TensorMemorySpaceAttr::get(ctx)) {
       return emitError() << "memorySpace must be TensorMemorySpace";
     }
-    unsigned bitwidth = elementType.getIntOrFloatBitWidth();
+    unsigned bitwidth = getIntOrFloatOrPtrBitWidth(elementType);
     if (bitwidth < 8)
       return emitError()
              << "tensor-memory element type bit width must be at least 8; got "
@@ -211,7 +215,7 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
     if (allocShape.size() != 2 && allocShape.size() != 3) {
       return emitError() << "Scales must be 2D or 3D (with multibuffering)";
     }
-    auto bitwidth = elementType.getIntOrFloatBitWidth();
+    auto bitwidth = getIntOrFloatOrPtrBitWidth(elementType);
     if (bitwidth != 8) {
       return emitError() << "bitwidth must be 8";
     }

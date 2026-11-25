@@ -39,9 +39,7 @@ def _gfx950_family_extern(name: str) -> ExternKernelChoice:
 gfx950_mm_streamk_extern = _gfx950_family_extern("tlx_gfx950_mm_streamk")
 gfx950_mm_ragged_n_extern = _gfx950_family_extern("tlx_gfx950_mm_ragged_n")
 gfx950_mm_m192n256_extern = _gfx950_family_extern("tlx_gfx950_mm_m192n256")
-gfx950_mm_hybrid_n160_extern = _gfx950_family_extern(
-    "tlx_gfx950_mm_hybrid_n160"
-)
+gfx950_mm_hybrid_n160_extern = _gfx950_family_extern("tlx_gfx950_mm_hybrid_n160")
 
 
 def load_tlx_template(name: str) -> str:
@@ -58,7 +56,10 @@ def _persistent_mm_grid_split_k(*args, cdiv, min):
     meta = args[-1]
     M = args[-3]
     N = args[-2]
-    num_mn_tiles = cdiv(M, meta["BLOCK_M"]) * cdiv(N, meta["BLOCK_N"])
+    # Pad M tiles to the cluster width like _compute_grid_info; a partial cluster fails to launch.
+    num_ctas = meta.get("NUM_CTAS", 1)
+    num_pid_m = cdiv(cdiv(M, meta["BLOCK_M"]), num_ctas) * num_ctas
+    num_mn_tiles = num_pid_m * cdiv(N, meta["BLOCK_N"])
     split_k = meta.get("SPLIT_K", 1)
     return (min(meta["NUM_SMS"], num_mn_tiles * split_k), 1, 1)
 
@@ -328,12 +329,13 @@ gfx950_addmm_persistent_warppipe_template = TritonTemplate(
 
 # Templates whose every output store goes through reduction_store_output.
 for _template in (
-    gfx942_mm_template,
-    gfx942_addmm_template,
-    gfx950_addmm_warppipe_template,
-    gfx950_addmm_persistent_warppipe_template,
-    gfx950_mm_interwave_template,
-    gfx950_addmm_interwave_template,
+        hopper_gemm_small_k_template,
+        gfx942_mm_template,
+        gfx942_addmm_template,
+        gfx950_addmm_warppipe_template,
+        gfx950_addmm_persistent_warppipe_template,
+        gfx950_mm_interwave_template,
+        gfx950_addmm_interwave_template,
 ):
     _template.tlx_row_partials = True
 
@@ -353,15 +355,18 @@ def append_tlx(templates, op_name, kernel_inputs):
 
 def _append_tlx_hopper(templates, op_name):
     if op_name == "addmm":
-        # tuned_addmm issues several get_template_configs calls; only the unified
-        # one (with the stock mm_template) passes the bias expanded to [M, N],
-        # which the template epilogue indexes in 2-D.
-        from torch._inductor.kernel.mm import mm_template
+        # tuned_addmm issues several get_template_configs calls: join the unified one
+        # (with the stock mm_template) or, without max_autotune, the ATen-only one.
+        # tlx_kernel_inputs expands the latter's bias to the [M, N] the epilogue indexes.
+        from torch._inductor.kernel.mm import aten_addmm, mm_template
 
-        if mm_template.uid not in {getattr(t, "uid", None) for t in templates}:
+        uids = {getattr(t, "uid", None) for t in templates}
+        default_set = not (inductor_config.max_autotune or inductor_config.max_autotune_gemm) and aten_addmm.uid in uids
+        if mm_template.uid not in uids and not default_set:
             return templates
     elif op_name != "mm":
         return templates
+    # Each tuned_mm path makes a single "mm" get_template_configs call, so mm needs no uid gate.
     for template in (hopper_gemm_ws_template, hopper_gemm_small_k_template):
         if template not in templates:
             templates.append(template)
@@ -380,32 +385,28 @@ def _append_tlx_amd(templates, op_name):
         if mm_template.uid not in uids and not default_set:
             return templates
         if current_target().is_gfx942:
-            template = (
-                gfx942_mm_template
-                if op_name == "mm"
-                else gfx942_addmm_template
-            )
+            template = (gfx942_mm_template if op_name == "mm" else gfx942_addmm_template)
             if template.uid not in uids:
                 templates.append(template)
             return templates
         if op_name == "mm":
             for template in (
-                gfx950_mm_extern,
-                gfx950_mm_streamk_extern,
-                gfx950_mm_ragged_n_extern,
-                gfx950_mm_m192n256_extern,
-                gfx950_mm_hybrid_n160_extern,
-                gfx950_mm_cached_b_template,
-                gfx950_mm_interwave_template,
-                gfx950_mm_lds_template,
-                gfx950_mm_fragmented_register_template,
-                gfx950_mm_fragmented_m_template,
-                gfx950_mm_wave_grid_template,
-                gfx950_mm_short_k_template,
-                gfx950_mm_row_major_direct_template,
-                gfx950_mm_local_split_u_template,
-                gfx950_mm_register_template,
-                gfx950_mm_persistent_template,
+                    gfx950_mm_extern,
+                    gfx950_mm_streamk_extern,
+                    gfx950_mm_ragged_n_extern,
+                    gfx950_mm_m192n256_extern,
+                    gfx950_mm_hybrid_n160_extern,
+                    gfx950_mm_cached_b_template,
+                    gfx950_mm_interwave_template,
+                    gfx950_mm_lds_template,
+                    gfx950_mm_fragmented_register_template,
+                    gfx950_mm_fragmented_m_template,
+                    gfx950_mm_wave_grid_template,
+                    gfx950_mm_short_k_template,
+                    gfx950_mm_row_major_direct_template,
+                    gfx950_mm_local_split_u_template,
+                    gfx950_mm_register_template,
+                    gfx950_mm_persistent_template,
             ):
                 if template.uid not in uids:
                     templates.append(template)
@@ -439,8 +440,10 @@ def _append_tlx_amd(templates, op_name):
 
 
 def tlx_kernel_inputs(template, kernel_inputs, op_name):
-    """Expand default addmm bias inputs for the AMD TLX addmm template epilogues."""
+    """Expand default addmm bias inputs for the TLX addmm template epilogues."""
     if op_name != "addmm" or template not in (
+            hopper_gemm_ws_template,
+            hopper_gemm_small_k_template,
             gfx942_addmm_template,
             gfx950_addmm_interwave_template,
             gfx950_addmm_warppipe_template,
@@ -456,7 +459,8 @@ def tlx_kernel_inputs(template, kernel_inputs, op_name):
 
     return MMKernelInputs(
         [ExpandView.create(bias, size), mat1, mat2],
-        scalars=kernel_inputs._scalars, out_dtype=kernel_inputs.out_dtype(),
+        scalars=kernel_inputs._scalars,
+        out_dtype=kernel_inputs.out_dtype(),
     )
 
 

@@ -10,6 +10,7 @@
 
 #include <limits>
 #include <optional>
+#include <string>
 
 namespace mlir {
 
@@ -332,6 +333,33 @@ public:
 private:
   FuncOffsetMapT sharedMemoryValue;
 };
+
+namespace triton {
+
+inline constexpr llvm::StringLiteral kSharedMemoryBreakdownAttr =
+    "ttg.shared_memory_breakdown";
+
+struct SharedMemoryReservation {
+  StringRef kind;
+  size_t offset;
+  size_t size;
+  Operation *owner;
+};
+
+/// Keep original IR identifiers out of downstream printed IR.
+void encodeSharedMemoryBreakdown(ModuleOp mod);
+
+/// Read diagnostic JSON from either its raw or encoded representation.
+std::optional<std::string> getSharedMemoryBreakdown(ModuleOp mod);
+
+/// Capture allocated byte ranges; their sizes are not additive under reuse.
+void attachSharedMemoryBreakdown(ModuleOp mod, ModuleAllocation &allocation);
+
+/// Record reservations made after allocation without changing their placement.
+void appendSharedMemoryReservations(
+    ModuleOp mod, ArrayRef<SharedMemoryReservation> reservations);
+
+} // namespace triton
 
 } // namespace mlir
 

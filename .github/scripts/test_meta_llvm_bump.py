@@ -1,13 +1,17 @@
-from meta_llvm_bump import (bot_branch_for, commit_message, decide, failed_body, issue_body, issue_marker,
-                            issue_release, issue_result, issue_title, oai_pins, pick_tracking, pr_body,
-                            parse_sha256_file, release_for, render, same_tree_chain, variants, verdict, verify_state)
+import hashlib
+import json
+
+import pytest
+
+from meta_llvm_bump import (bot_branch_for, commit_message, failed_body, issue_body, issue_marker, issue_release,
+                            issue_result, issue_title, pick_tracking, pr_body, parse_sha256_file, release_for, render,
+                            same_tree_chain, variants, verdict, verify_state)
 
 OLD = "1889ed344a2ea019320c1a49fc5b7103d0d9468d"
 NEW = "3dd0e43fed8836e77165a4f066b983efe1f13a82"
 SYNC = "aaaaaaaa00000000000000000000000000000000"
 BASE = "5f07f818b51b786b0a87b4e514882600ecba112f"
 META = {
-    "based_on_oai_llvm_hash": BASE,
     "llvm_hash": OLD,
     "llvm_repository": "https://github.com/facebookexperimental/llvm-project",
     "build_number": 1,
@@ -23,12 +27,6 @@ def _release(sha, build, suffixes):
         name = f"llvm-{sha[:8]}-{suffix}-{build}.tar.gz"
         assets += [{"name": name}, {"name": f"{name}.sha256"}]
     return {"tag_name": tag, "target_commitish": sha, "assets": assets}
-
-
-def test_oai_pins_accepts_either_manifest():
-    # main: llvm-build-info.json leads llvm-info.json; release/3.8.x: llvm-build-info.json is a stale leftover.
-    assert oai_pins({"llvm_hash": "info"}, {"llvm_hash": "build"}) == {"info", "build"}
-    assert oai_pins({"llvm_hash": "info"}, None) == {"info"}
 
 
 def test_same_tree_chain_skips_empty_sync_commits():
@@ -68,29 +66,8 @@ def test_render_keeps_key_order_and_unrelated_keys():
                  "facebookexperimental/llvm-project")
     assert list(out) == list(META)
     assert out["llvm_hash"] == NEW
-    assert out["based_on_oai_llvm_hash"] == BASE
     assert out["release_base_url"].endswith("/releases/download/llvm-3dd0e43f-1")
     assert list(out["sha256sum"]) == ["almalinux-x64", "ubuntu-x64"]
-
-
-def test_decide():
-    four = ["almalinux-arm64", "almalinux-x64", "ubuntu-arm64", "ubuntu-x64"]
-    full = _release(NEW, 1, four)
-    assert decide(META, {"f" * 40}, [NEW], full, four)[0] == "pin-moved"
-    assert decide(META, {"f" * 40, BASE}, [NEW], full, four)[0] == "bump"
-    assert decide(META, {BASE}, [NEW], None, four)[0] == "no-release"
-    assert decide(META, {BASE}, [NEW], _release(NEW, 1, four[:2]),
-                  four) == ("incomplete", "llvm-3dd0e43f-1 lacks ubuntu-arm64, ubuntu-x64")
-    assert decide(META, {BASE}, [NEW], full, four) == ("bump", "llvm-3dd0e43f-1")
-    current = {**META, "llvm_hash": NEW, "sha256sum": dict.fromkeys(four, "0" * 64)}
-    assert decide(current, {BASE}, [NEW], full, four)[0] == "current"
-
-
-def test_decide_bumps_when_release_adds_platforms():
-    # Same commit, but the release gained ubuntu variants since the last bump.
-    two = ["almalinux-arm64", "almalinux-x64"]
-    pinned = {**META, "llvm_hash": NEW}
-    assert decide(pinned, {BASE}, [NEW], _release(NEW, 1, two + ["ubuntu-x64"]), two)[0] == "bump"
 
 
 def test_commit_message_plain_wrapped_bare_labels():
@@ -245,3 +222,285 @@ def test_pick_tracking_keeps_newest_and_returns_duplicates():
     assert [d["number"] for d in dups] == [4136, 4133]
     assert pick_tracking(issues, "release/3.8.x")[0]["number"] == 4134
     assert pick_tracking(issues[-1:], "main") == (None, [])
+
+
+BRANCH_PLATFORMS = ["almalinux-arm64", "almalinux-x64", "ubuntu-arm64", "ubuntu-x64"]
+BRANCH_TREE = "b" * 40
+
+
+def _branch_tip(sha=NEW):
+    return {"sha": sha, "commit": {"tree": {"sha": BRANCH_TREE}}}
+
+
+def _branch_bundle(kind, sha=NEW):
+    prefix = "llvm" if kind == "core" else "amd-llvm"
+    stem = f"{prefix}-{sha[:8]}"
+    record = {
+        "schema_version": 1,
+        "kind": kind,
+        "llvm_repository": "facebookexperimental/llvm-project",
+        "llvm_sha": sha,
+        "llvm_tree": BRANCH_TREE,
+        "build_number": 1,
+    }
+    content = json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+    assets = [{"name": f"{stem}-1.source.json", "digest": "sha256:" + hashlib.sha256(content.encode()).hexdigest()}]
+    for platform in BRANCH_PLATFORMS:
+        name = f"{stem}-{platform}-1.tar.gz"
+        digest = hashlib.sha256(name.encode()).hexdigest()
+        checksum = f"{digest}  {name}\n"
+        assets += [{"name": name, "digest": f"sha256:{digest}"},
+                   {"name": f"{name}.sha256", "digest": "sha256:" + hashlib.sha256(checksum.encode()).hexdigest()}]
+    for asset_id, asset in enumerate(assets, 1):
+        asset.update(id=asset_id, state="uploaded", size=1)
+    return assets
+
+
+@pytest.mark.parametrize("status", [404, 502])
+def test_release_lookup_only_not_found_means_absent(monkeypatch, status):
+    import subprocess
+    import meta_llvm_assets
+
+    result = subprocess.CompletedProcess([], 1, "", f"gh: request failed (HTTP {status})")
+    monkeypatch.setattr(meta_llvm_assets.subprocess, "run", lambda *args, **kwargs: result)
+    if status == 404:
+        assert meta_llvm_assets.release_assets("facebookexperimental/triton", "meta-llvm") == (None, [])
+    else:
+        with pytest.raises(subprocess.CalledProcessError):
+            meta_llvm_assets.release_assets("facebookexperimental/triton", "meta-llvm")
+
+
+@pytest.mark.parametrize("current_state", ["starter", "uploaded"])
+def test_recovery_never_deletes_uploaded_or_unrelated_assets(monkeypatch, current_state):
+    import meta_llvm_assets
+
+    published = dict(_branch_bundle("core")[0], id=101)
+    pending = dict(_branch_bundle("core")[2], id=102, state="starter", size=0, digest=None)
+    unrelated = dict(_branch_bundle("amd")[0], id=103, state="starter", size=0, digest=None)
+    current = dict(
+        _branch_bundle("core")[2], id=102, state=current_state, size=0 if current_state == "starter" else 1,
+        digest=None if current_state == "starter" else _branch_bundle("core")[2]["digest"])
+    calls = []
+
+    def github(path, **kwargs):
+        calls.append((path, kwargs))
+        if kwargs.get("method") == "DELETE":
+            return None
+        return {101: published, 102: current, 103: unrelated}[int(path.rsplit("/", 1)[1])]
+
+    monkeypatch.setattr(meta_llvm_assets, "github_json", github)
+    meta_llvm_assets.recover_starters("facebookexperimental/triton", [published, pending, unrelated],
+                                      {published["name"], pending["name"]})
+    path = "repos/facebookexperimental/triton/releases/assets/102"
+    expected = [(path, {})]
+    if current_state == "starter":
+        expected.append((path, {"method": "DELETE"}))
+    assert calls == expected
+
+
+def _ready_fixture(kind):
+    assets = _branch_bundle(kind)
+    prefix = 'llvm' if kind == 'core' else 'amd-llvm'
+    receipt = {
+        'schema_version': 1,
+        'source': {
+            'schema_version': 1, 'kind': kind, 'llvm_repository': 'facebookexperimental/llvm-project', 'llvm_sha': NEW,
+            'llvm_tree': BRANCH_TREE, 'build_number': 1
+        },
+        'sha256sum': {
+            platform:
+            next(a
+                 for a in assets
+                 if a['name'] == f'{prefix}-{NEW[:8]}-{platform}-1.tar.gz')['digest'].removeprefix('sha256:')
+            for platform in BRANCH_PLATFORMS
+        },
+        'build_run': 'https://github.com/facebookexperimental/triton/actions/runs/123',
+        'publication_attempt': 1,
+        'workflow_sha': 'c' * 40,
+    }
+    receipt['sdk_validation'] = {
+        platform: {
+            'schema_version': 1, 'source': receipt['source'], 'platform': platform, 'sha256': digest, 'run':
+            receipt['build_run'], 'attempt': 1, 'workflow_sha': 'c' * 40
+        }
+        for platform, digest in receipt['sha256sum'].items()
+    }
+    assets.append({'name': f'{prefix}-{NEW[:8]}-1.ready.json', 'id': 99, 'state': 'uploaded', 'size': 1})
+    for asset in assets:
+        asset[
+            'browser_download_url'] = f"https://github.com/facebookexperimental/triton/releases/download/meta-llvm/{asset['name']}"
+    candidate = {'kind': kind, 'llvm_sha': NEW, 'llvm_tree': BRANCH_TREE, 'build_number': '1'}
+    return assets, receipt, candidate
+
+
+@pytest.mark.parametrize('kind', ['core', 'amd'])
+def test_ready_issue_requires_complete_validated_publication(monkeypatch, kind):
+    import meta_llvm_ready as ready
+    from select_meta_llvm_builds import pending_builds
+
+    assets, receipt, candidate = _ready_fixture(kind)
+    writes = []
+    marker = ready.issue_marker(kind, NEW, 1)
+    existing_url = 'https://github.com/facebookexperimental/triton/issues/7'
+
+    def api(path, **kwargs):
+        if '/branches/' in path:
+            return {'commit': _branch_tip()}
+        return [[{'number': 7, 'body': marker, 'html_url': existing_url}]]
+
+    monkeypatch.setattr(ready, 'github_json', api)
+    monkeypatch.setattr(ready, 'read_json_asset', lambda *args: receipt)
+    monkeypatch.setattr(ready.subprocess, 'run', lambda *args, **kwargs: writes.append(args))
+    monkeypatch.setattr(ready, 'release_assets', lambda *args: ({'id': 1}, assets))
+    assert pending_builds(ready.REPOSITORY, [candidate], assets, BRANCH_PLATFORMS) == []
+    assert ready.ensure_issue(ready.REPOSITORY, candidate, BRANCH_PLATFORMS) == existing_url
+
+    for missing in assets:
+        partial = [a for a in assets if a is not missing]
+        variants = [partial]
+        for digest in (None, 'sha256:' + hashlib.sha256(b'').hexdigest()):
+            variants.append(partial + [dict(missing, state='starter', size=0, digest=digest)])
+        for incomplete in variants:
+            expected = [{'kind': kind, 'llvm_sha': NEW, 'build_number': '1'}]
+            assert pending_builds(ready.REPOSITORY, [candidate], incomplete, BRANCH_PLATFORMS) == expected
+            monkeypatch.setattr(ready, 'release_assets', lambda *args: ({'id': 1}, incomplete))
+            with pytest.raises(ready.BundleNotReady):
+                ready.ensure_issue(ready.REPOSITORY, candidate, BRANCH_PLATFORMS)
+    assert writes == []
+
+
+@pytest.mark.parametrize('closed', [False, True])
+def test_readiness_issue_reuses_candidate_after_timeout_or_close(monkeypatch, closed):
+    import subprocess
+    import meta_llvm_ready as ready
+    assets, receipt, candidate = _ready_fixture('amd')
+    marker = ready.issue_marker('amd', NEW, 1)
+    saved = {
+        'number': 7, 'body': marker, 'state': 'closed' if closed else 'open', 'html_url':
+        'https://github.com/facebookexperimental/triton/issues/7'
+    }
+    pages = [[], []]
+    calls = []
+
+    def api(path, **kwargs):
+        if '/branches/' in path: return {'commit': _branch_tip()}
+        if '/labels/' in path: return {'name': ready.LABEL}
+        if kwargs.get('method') == 'POST':
+            result = create(['gh', 'api', path], input=json.dumps(kwargs['payload']))
+            raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
+        return pages
+
+    def create(command, **kwargs):
+        calls.append(command)
+        pages[1].append(saved)
+        assert marker in kwargs['input'] and NEW in kwargs['input']
+        return subprocess.CompletedProcess(command, 1, '', 'timeout after creation')
+
+    monkeypatch.setattr(ready, 'github_json', api)
+    monkeypatch.setattr(ready, 'read_json_asset', lambda *args: receipt)
+    monkeypatch.setattr(ready, 'release_assets', lambda *args: ({'id': 1}, assets))
+    monkeypatch.setattr(ready.subprocess, 'run', create)
+    monkeypatch.setattr(ready, 'claim_issue_creation', lambda *args: ('request.json', {'candidate': marker}))
+    assert ready.ensure_issue(ready.REPOSITORY, candidate, BRANCH_PLATFORMS) == saved['html_url']
+    assert ready.ensure_issue(ready.REPOSITORY, candidate, BRANCH_PLATFORMS) == saved['html_url']
+    assert len(calls) == 1
+
+
+def test_unresolved_issue_creation_does_not_submit_again(monkeypatch):
+    import meta_llvm_ready as ready
+    assets, receipt, candidate = _ready_fixture('amd')
+    marker = ready.issue_marker('amd', NEW, 1)
+    intent = {'schema_version': 1, 'candidate': marker}
+    name = ready.ready_name('amd', NEW, 1).replace('.ready.json', '.issue-request.json')
+    assets.append({'name': name, 'id': 100, 'state': 'uploaded', 'size': 1})
+
+    def api(path, **kwargs):
+        if '/branches/' in path: return {'commit': _branch_tip()}
+        if '/labels/' in path: return {'name': ready.LABEL}
+        return [[]]
+
+    monkeypatch.setattr(ready, 'github_json', api)
+    monkeypatch.setattr(ready, 'read_json_asset', lambda repo, asset: intent if asset['name'] == name else receipt)
+    monkeypatch.setattr(ready, 'release_assets', lambda *args: ({'id': 1}, assets))
+    writes = []
+    monkeypatch.setattr(ready.subprocess, 'run', lambda *args, **kwargs: writes.append(args))
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match='unresolved'):
+            ready.ensure_issue(ready.REPOSITORY, candidate, BRANCH_PLATFORMS)
+    assert writes == []
+
+
+def test_validation_attempts_survive_publication_retry(monkeypatch, tmp_path):
+    import subprocess
+    import meta_llvm_ready as ready
+    assets, receipt, candidate = _ready_fixture('amd')
+    assets = [asset for asset in assets if not asset['name'].endswith('.ready.json')]
+    for index, platform in enumerate(BRANCH_PLATFORMS):
+        archive = f'amd-llvm-{NEW[:8]}-{platform}-1.tar.gz'
+        digest = receipt['sha256sum'][platform]
+        (tmp_path / (archive + '.sha256')).write_text(f'{digest}  {archive}\n')
+        validation = dict(receipt['sdk_validation'][platform], attempt=1 + index % 2)
+        (tmp_path / (archive + '.validation.json')).write_text(json.dumps(validation))
+    monkeypatch.setattr(ready, 'release_assets', lambda *args: ({'id': 1}, assets))
+    monkeypatch.setattr(ready, 'recover_starters', lambda *args: assets)
+    monkeypatch.setattr(ready.subprocess, 'run', lambda command, **kwargs: subprocess.CompletedProcess(command, 0))
+    ready.publish_receipt(ready.REPOSITORY, receipt['source'], BRANCH_PLATFORMS, tmp_path, receipt['build_run'], 3,
+                          'c' * 40)
+    saved = json.loads((tmp_path / ready.ready_name('amd', NEW, 1)).read_text())
+    assert saved['publication_attempt'] == 3
+    assert [saved['sdk_validation'][p]['attempt'] for p in BRANCH_PLATFORMS] == [1, 2, 1, 2]
+
+
+def test_failed_intent_upload_cannot_adopt_an_earlier_claim(monkeypatch):
+    import subprocess
+    import meta_llvm_ready as ready
+    marker = ready.issue_marker('amd', NEW, 1)
+    intent = {'schema_version': 1, 'candidate': marker}
+    name = ready.ready_name('amd', NEW, 1).replace('.ready.json', '.issue-request.json')
+    earlier = {'name': name, 'id': 100, 'state': 'uploaded', 'size': 1}
+    snapshots = iter([({'id': 1}, []), ({'id': 1}, [earlier])])
+    monkeypatch.setattr(ready, 'release_assets', lambda *args: next(snapshots))
+    monkeypatch.setattr(ready, 'read_json_asset', lambda *args: intent)
+    calls = []
+
+    def upload(command, **kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 1, '', 'gh: duplicate asset (HTTP 422)')
+
+    monkeypatch.setattr(ready.subprocess, 'run', upload)
+    with pytest.raises(subprocess.CalledProcessError):
+        ready.claim_issue_creation(ready.REPOSITORY, 'amd', NEW, 1, marker)
+    assert len(calls) == 1 and calls[0][:3] == ['gh', 'release', 'upload']
+
+
+def test_explicit_validation_is_not_skipped_for_a_complete_bundle(monkeypatch):
+    import meta_llvm_ready as ready
+    from select_meta_llvm_builds import pending_builds
+    assets, receipt, candidate = _ready_fixture('amd')
+    monkeypatch.setattr(ready, 'read_json_asset', lambda *args: receipt)
+    assert pending_builds(ready.REPOSITORY, [candidate], assets, BRANCH_PLATFORMS) == []
+    assert pending_builds(ready.REPOSITORY, [candidate], assets, BRANCH_PLATFORMS,
+                          validate_existing=True) == [{'kind': 'amd', 'llvm_sha': NEW, 'build_number': '1'}]
+
+
+def test_closed_candidate_is_not_recreated_on_retry(monkeypatch):
+    import meta_llvm_ready as ready
+    assets, receipt, candidate = _ready_fixture('amd')
+    base = 'b' * 40
+    monkeypatch.setattr(ready, 'validated_candidate', lambda *args: ({a['name']: a for a in assets}, receipt))
+    monkeypatch.setattr(ready, 'read_manifest', lambda *args: dict(META))
+    calls = []
+
+    def api(path, **kwargs):
+        calls.append(kwargs)
+        if '/compare/' in path:
+            return {'status': 'ahead'}
+        if '/git/ref/' in path:
+            return None
+        assert '/pulls?' in path
+        return [[{'state': 'closed', 'draft': True}]]
+
+    monkeypatch.setattr(ready, 'github_json', api)
+    with pytest.raises(ValueError, match='closed or changed'):
+        ready.ensure_candidate_pr(ready.REPOSITORY, candidate, BRANCH_PLATFORMS, base)
+    assert all('method' not in call for call in calls)

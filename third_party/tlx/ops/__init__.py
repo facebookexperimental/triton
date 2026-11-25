@@ -37,7 +37,7 @@ Ops with no heuristic yet -- flash_attn on sm90/sm100/gfx950, flash_attn_mxfp8, 
 kimi_delta_attention -- still default to "full". Their remaining space is "smoke", which selects for
 lowering-path coverage rather than speed, so defaulting to it would quietly
 ship a bad config. Each needs its own `heuristic_config` before it can offer a
-fast first call. `mm_mxfp8` defaults to "full" on sm100 because its tuned configs are measurably
+fast first call. `mm_mxfp` defaults to "full" on sm100 because its tuned configs are measurably
 faster; gfx950 uses "heuristic". Pass `space="heuristic"` for a fast first call.
 `mm_mxfp6` also defaults to "full" because its tuned configs are measurably faster.
 `hstu_cross_attn` on gfx950 defaults to "curated": at head dims 64 and 128 it
@@ -64,6 +64,7 @@ enforce it yet raises `UnsupportedOp` rather than being silently ignored.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import math
 
@@ -120,24 +121,26 @@ from ._normalization import (
 )
 
 __all__ = [
-    "mm", "mm_bias_grad", "int4_embedding", "mm_mxfp8", "mm_mxfp6", "grouped_gemm", "grouped_gemm_mxfp8", "moe",
-    "moe_routing", "norm_residual_norm", "addmm", "addmm_mul_add", "addmm_mul_add_launch", "flash_attn",
-    "flash_attn_mxfp8", "flash_attn_varlen", "linear_rowscale", "linear_rowscale_launch", "rmsnorm_cat", "swiglu_ffn",
-    "mla_window_attn", "hstu_attn_dev", "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill",
-    "kda_recurrent_decode", "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward",
-    "paged_attention_decode", "paged_attention_prefill", "paged_attention_decode_workspace",
-    "allocate_paged_kv_cache_5d", "reshape_and_cache_5d", "UnsupportedOp", "UnsupportedBackward", "InvalidInput",
-    "BitwiseInvarianceSpec", "Space"
+    "mm", "mm_bias_grad", "int4_embedding", "mm_mxfp", "mm_mxfp6", "grouped_gemm", "grouped_gemm_mxfp8", "moe",
+    "moe_routing", "moe_finalize", "moe_router_topk_align", "moe_mxfp4_sort_quant", "norm_residual_norm", "all_reduce",
+    "all_reduce_workspace", "all_reduce_norm_residual_norm", "rmsnorm_gate", "router_gemm", "qk_norm_rope_kv_cache",
+    "addmm", "addmm_mul_add", "addmm_mul_add_launch", "flash_attn", "flash_attn_mxfp8", "flash_attn_varlen",
+    "linear_rowscale", "linear_rowscale_launch", "window_attn_varlen", "rmsnorm_cat", "swiglu_ffn", "mla_window_attn",
+    "hstu_attn_dev", "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode",
+    "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward", "paged_attention_decode",
+    "paged_attention_prefill", "paged_attention_decode_workspace", "allocate_paged_kv_cache_5d", "reshape_and_cache_5d",
+    "UnsupportedOp", "UnsupportedBackward", "InvalidInput", "BitwiseInvarianceSpec", "Space"
 ]
 __all__ += [
-    'compute_norm_nvfp4_global_scale', 'layernorm', 'layernorm_add', 'layernorm_backward',
-    'layernorm_backward_from_x_norm', 'layernorm_mxfp4', 'layernorm_mxfp8_gdpa_precomputed_no_normalized',
-    'layernorm_mxfp8_gdpa_with_backward', 'layernorm_mxfp8_quantize', 'layernorm_mxfp8_quantize_numerics_preserving',
-    'layernorm_mxfp8_with_backward', 'layernorm_nvfp4_backward_from_x_norm_padded_dy', 'layernorm_nvfp4_quantize',
-    'layernorm_nvfp4_quantize_inplace', 'layernorm_nvfp4_quantize_q0_jagged_transpose',
-    'layernorm_nvfp4_quantize_q0_jagged_transpose_inplace', 'norm_backward_from_normalized', 'norm_bwd', 'norm_fwd',
-    'norm_quant_mxfp8_fwd', 'nvfp4_quantize_normalized', 'rmsnorm', 'rmsnorm_backward', 'rmsnorm_backward_from_x_norm',
-    'rmsnorm_backward_quantize_dx_mxfp8', 'rmsnorm_backward_quantize_dx_mxfp8_bf16_precomputed',
+    'paged_attention_decode_fp8', 'paged_attention_decode_fp8_workspace', 'compute_norm_nvfp4_global_scale',
+    'layernorm', 'layernorm_add', 'layernorm_backward', 'layernorm_backward_from_x_norm', 'layernorm_mxfp4',
+    'layernorm_mxfp8_gdpa_precomputed_no_normalized', 'layernorm_mxfp8_gdpa_with_backward', 'layernorm_mxfp8_quantize',
+    'layernorm_mxfp8_quantize_numerics_preserving', 'layernorm_mxfp8_with_backward',
+    'layernorm_nvfp4_backward_from_x_norm_padded_dy', 'layernorm_nvfp4_quantize', 'layernorm_nvfp4_quantize_inplace',
+    'layernorm_nvfp4_quantize_q0_jagged_transpose', 'layernorm_nvfp4_quantize_q0_jagged_transpose_inplace',
+    'norm_backward_from_normalized', 'norm_bwd', 'norm_fwd', 'norm_quant_mxfp8_fwd', 'nvfp4_quantize_normalized',
+    'rmsnorm', 'rmsnorm_backward', 'rmsnorm_backward_from_x_norm', 'rmsnorm_backward_quantize_dx_mxfp8',
+    'rmsnorm_backward_quantize_dx_mxfp8_bf16_precomputed',
     'rmsnorm_backward_quantize_dx_mxfp8_from_output_recompute_q_precomputed',
     'rmsnorm_backward_quantize_dx_mxfp8_precomputed', 'rmsnorm_mxfp4', 'rmsnorm_mxfp8_quantize',
     'rmsnorm_mxfp8_quantize_3232_2pass', 'rmsnorm_nvfp4_quantize', 'softmax', 'softmax_bwd', 'softmax_fwd'
@@ -182,7 +185,13 @@ def _mm_impl_for_device(device):
     return impl_for("mm", device=device)
 
 
-def mm(a, b, *, out=None, space=None):
+@functools.lru_cache(maxsize=None)
+def _flash_attn_varlen_impl_for_device(device):
+    """Cache the device-to-implementation lookup, which otherwise re-queries device properties on every call."""
+    return impl_for("flash_attn_varlen", device=device)
+
+
+def mm(a, b, *, out=None, space=None, b_static=False):
     """`a @ b`, for `(M, K) @ (K, N)` fp16/bf16. Either operand may be column-major.
 
     This op is currently forward-only.
@@ -194,6 +203,11 @@ def mm(a, b, *, out=None, space=None):
     unsupported spaces raise `InvalidInput`. See the module docstring.
     `space=` also accepts a `Space` carrying a `BitwiseInvarianceSpec` over
     the M/N/K vocabulary.
+
+    `b_static=True` promises that no kernel that may still be running when this
+    op launches writes `b` (a model weight, for instance). Implementations may
+    then start reading `b` before waiting on earlier kernels; without it they wait
+    first. It never changes the result of a call that keeps the promise.
     """
     if a.ndim != 2 or b.ndim != 2:
         raise InvalidInput("tlx.ops.mm expects two rank-2 tensors; "
@@ -219,9 +233,10 @@ def mm(a, b, *, out=None, space=None):
     _check_enforced("mm", spec, invariance)
     if space_name is None:
         space_name = spec.default_space
+    promise = {"b_static": True} if b_static else {}
     if out is None:
-        return fn(a, b, space=space_name, invariance=invariance)
-    return fn(a, b, out=out, space=space_name, invariance=invariance)
+        return fn(a, b, space=space_name, invariance=invariance, **promise)
+    return fn(a, b, out=out, space=space_name, invariance=invariance, **promise)
 
 
 def int4_embedding(weights, weights_offsets, indices, offsets, D, *, out=None, space=None):
@@ -283,11 +298,11 @@ def mm_bias_grad(dout, input_act, *, out=None, space=None):
     return fn(dout, input_act, out=out, space=spec.default_space if space is None else space)
 
 
-def _check_mm_mxfp8_scales(a_scale, b_scale, *, M, N, K, sf_layout):
+def _check_mm_mxfp_scales(a_scale, b_scale, *, M, N, K, sf_layout):
     if sf_layout == "natural":
         expected_a, expected_b = (M, K // 32), (N, K // 32)
         if a_scale.shape != expected_a or b_scale.shape != expected_b:
-            raise InvalidInput("tlx.ops.mm_mxfp8 natural scales must have exact shapes "
+            raise InvalidInput("tlx.ops.mm_mxfp natural scales must have exact shapes "
                                f"a_scale={expected_a}, b_scale={expected_b}; got "
                                f"a_scale={tuple(a_scale.shape)}, b_scale={tuple(b_scale.shape)}")
         return
@@ -301,26 +316,27 @@ def _check_mm_mxfp8_scales(a_scale, b_scale, *, M, N, K, sf_layout):
                           (2048, 32768, 6144),
                       } else ((N + 95) // 96) * 128 * (K // 32))
         if a_scale.numel() != expected_a or b_scale.numel() != expected_b:
-            raise InvalidInput("tlx.ops.mm_mxfp8 mfma_preshuffled scales must contain exactly "
+            raise InvalidInput("tlx.ops.mm_mxfp mfma_preshuffled scales must contain exactly "
                                f"{expected_a} a-scale and {expected_b} b-scale bytes; "
                                f"got {a_scale.numel()} and {b_scale.numel()}")
         return
     if sf_layout != "cublas_blocked":
-        raise InvalidInput("tlx.ops.mm_mxfp8 sf_layout must be 'natural', 'cublas_blocked', "
+        raise InvalidInput("tlx.ops.mm_mxfp sf_layout must be 'natural', 'cublas_blocked', "
                            "or 'mfma_preshuffled'; "
                            f"got {sf_layout!r}")
     # Each 128x4 atom includes padded rows when M or N is ragged.
     expected_a = ((M + 127) // 128) * 128 * (K // 32)
     expected_b = ((N + 127) // 128) * 128 * (K // 32)
     if a_scale.numel() != expected_a or b_scale.numel() != expected_b:
-        raise InvalidInput("tlx.ops.mm_mxfp8 cublas_blocked scales must contain exactly "
+        raise InvalidInput("tlx.ops.mm_mxfp cublas_blocked scales must contain exactly "
                            f"{expected_a} a-scale and {expected_b} b-scale bytes; "
                            f"got {a_scale.numel()} and {b_scale.numel()}")
 
 
-def mm_mxfp8(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space=None):
-    """``a @ b.T`` over pre-quantized MXFP8 inputs, returning BF16 ``[M, N]``.
+def mm_mxfp(a, a_scale, b, b_scale, *, a_dtype="e4m3", b_dtype="e4m3", out=None, sf_layout="natural", space=None):
+    """``a @ b.T`` over pre-quantized MX inputs, returning BF16 ``[M, N]``.
 
+    ``a_dtype`` and ``b_dtype`` name the MX element formats; every backend supports only ``"e4m3"`` today.
     ``a`` is contiguous E4M3 ``[M, K]`` and ``b`` is contiguous E4M3 ``[N, K]``
     (K-major, as for a linear weight); K must be a multiple of 128.
     M and N may be ragged on gfx950; sm100 still requires 128-aligned rows,
@@ -343,56 +359,59 @@ def mm_mxfp8(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space=Non
     """
     import torch
 
+    if (a_dtype, b_dtype) != ("e4m3", "e4m3"):
+        raise UnsupportedOp("tlx.ops.mm_mxfp supports only a_dtype='e4m3' and b_dtype='e4m3'; "
+                            f"got a_dtype={a_dtype!r}, b_dtype={b_dtype!r}")
     tensors = (a, a_scale, b, b_scale)
     if not all(isinstance(tensor, torch.Tensor) for tensor in tensors):
-        raise InvalidInput("tlx.ops.mm_mxfp8 expects tensor inputs")
+        raise InvalidInput("tlx.ops.mm_mxfp expects tensor inputs")
     if a.ndim != 2 or b.ndim != 2:
-        raise InvalidInput("tlx.ops.mm_mxfp8 expects rank-2 a and b; "
+        raise InvalidInput("tlx.ops.mm_mxfp expects rank-2 a and b; "
                            f"got a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
     M, K = a.shape
     N, b_k = b.shape
     if b_k != K:
-        raise InvalidInput("tlx.ops.mm_mxfp8 reduction dimensions must match; "
+        raise InvalidInput("tlx.ops.mm_mxfp reduction dimensions must match; "
                            f"got a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
     if min(M, N, K) <= 0 or K % 128:
-        raise InvalidInput("tlx.ops.mm_mxfp8 requires positive M and N and K divisible by 128; "
+        raise InvalidInput("tlx.ops.mm_mxfp requires positive M and N and K divisible by 128; "
                            f"got M={M}, N={N}, K={K}")
     if (M % 128 or N % 128) and (a.device.type != "cuda" or _target(a.device).key != "gfx950"):
-        raise InvalidInput("tlx.ops.mm_mxfp8 requires M and N divisible by 128 outside gfx950; "
+        raise InvalidInput("tlx.ops.mm_mxfp requires M and N divisible by 128 outside gfx950; "
                            f"got M={M}, N={N}")
     if a.dtype != torch.float8_e4m3fn or b.dtype != torch.float8_e4m3fn:
-        raise InvalidInput("tlx.ops.mm_mxfp8 expects E4M3 a and b; "
+        raise InvalidInput("tlx.ops.mm_mxfp expects E4M3 a and b; "
                            f"got a.dtype={a.dtype}, b.dtype={b.dtype}")
     valid_scale_dtypes = ((torch.uint8, torch.float8_e8m0fnu) if sf_layout == "mfma_preshuffled" else
                           (torch.float8_e8m0fnu, ))
     if a_scale.dtype not in valid_scale_dtypes or b_scale.dtype not in valid_scale_dtypes:
-        raise InvalidInput("tlx.ops.mm_mxfp8 expects E8M0 a_scale and b_scale; "
+        raise InvalidInput("tlx.ops.mm_mxfp expects E8M0 a_scale and b_scale; "
                            f"got a_scale.dtype={a_scale.dtype}, b_scale.dtype={b_scale.dtype}")
     if not all(tensor.is_contiguous() for tensor in tensors):
-        raise InvalidInput("tlx.ops.mm_mxfp8 expects all inputs to be contiguous")
+        raise InvalidInput("tlx.ops.mm_mxfp expects all inputs to be contiguous")
     if a.device.type != "cuda" or any(tensor.device != a.device for tensor in tensors[1:]):
-        raise InvalidInput("tlx.ops.mm_mxfp8 expects all inputs on the same CUDA device; "
+        raise InvalidInput("tlx.ops.mm_mxfp expects all inputs on the same CUDA device; "
                            f"got {[tensor.device for tensor in tensors]}")
-    _check_mm_mxfp8_scales(a_scale, b_scale, M=M, N=N, K=K, sf_layout=sf_layout)
+    _check_mm_mxfp_scales(a_scale, b_scale, M=M, N=N, K=K, sf_layout=sf_layout)
     if out is not None:
         if not isinstance(out, torch.Tensor):
-            raise InvalidInput("tlx.ops.mm_mxfp8 expects out to be a tensor or None")
+            raise InvalidInput("tlx.ops.mm_mxfp expects out to be a tensor or None")
         if out.shape != (M, N) or out.dtype != torch.bfloat16 or out.device != a.device or not out.is_contiguous():
-            raise InvalidInput("tlx.ops.mm_mxfp8 out must be contiguous BF16 [M, N] on a's device; "
+            raise InvalidInput("tlx.ops.mm_mxfp out must be contiguous BF16 [M, N] on a's device; "
                                f"got shape={tuple(out.shape)}, dtype={out.dtype}, device={out.device}")
         if any(torch._C._overlaps(out, tensor) for tensor in tensors):
-            raise InvalidInput("tlx.ops.mm_mxfp8 out must not overlap any input")
-    space_name, invariance = _normalize_space_arg("mm_mxfp8", space)
+            raise InvalidInput("tlx.ops.mm_mxfp out must not overlap any input")
+    space_name, invariance = _normalize_space_arg("mm_mxfp", space)
     if space_name is not None and space_name not in ("heuristic", "full"):
-        raise InvalidInput(f"tlx.ops.mm_mxfp8 does not provide space={space_name!r}")
+        raise InvalidInput(f"tlx.ops.mm_mxfp does not provide space={space_name!r}")
 
-    fn, spec = impl_for("mm_mxfp8", device=a.device)
+    fn, spec = impl_for("mm_mxfp", device=a.device)
     if space_name is None:
         space_name = spec.default_space
     tma_tensors = tensors if out is None else (*tensors, out)
     check_inputs(spec, dtype=a.dtype, base_ptrs=tuple(tensor.data_ptr() for tensor in tma_tensors))
     check_backward(spec, *tensors, out)
-    _check_enforced("mm_mxfp8", spec, invariance)
+    _check_enforced("mm_mxfp", spec, invariance)
     return fn(a, a_scale, b, b_scale, out=out, sf_layout=sf_layout, space=space_name)
 
 
@@ -414,16 +433,16 @@ def _check_mm_mxfp6_scales(a_scale, b_scale, *, M, N, K, sf_layout):
                            f"got {a_scale.numel()} and {b_scale.numel()}")
 
 
-def mm_mxfp6(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="full"):
+def mm_mxfp6(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="full", a_format="e2m3", b_format="e3m2"):
     """``a @ b.T`` over pre-quantized MXFP6 inputs, returning BF16 ``[M, N]``.
 
-    ``a`` is contiguous dense-packed E2M3 ``[M, K]`` and ``b`` is contiguous
-    dense-packed E3M2 ``[N, K]`` (K-major, as for a linear weight), both uint8
+    ``a`` is contiguous dense-packed ``[M, K]`` and ``b`` is contiguous
+    dense-packed ``[N, K]`` (K-major, as for a linear weight), both uint8
     with groups of 16 codes per 12 bytes LSB-first and the K dim padded to
     the unpacked width; M, N and K must be multiples of 128. The format
-    pairing is fixed (E2M3 A x E3M2 B) to the validated ``mxf8f6f4``
-    configuration; other pairings are not exposed yet. Each run of 32
-    values along K
+    arguments ``a_format`` and ``b_format`` independently select "e2m3"
+    or "e3m2", defaulting to E2M3 A x E3M2 B. They specialize the kernel
+    as constexpr arguments. Each run of 32 values along K
     has one E8M0 scale. ``sf_layout="natural"`` takes ``[M, K // 32]`` and
     ``[N, K // 32]`` scales; ``"cublas_blocked"`` takes the swizzled byte
     layout returned by torchao's ``MXTensor.to_mx(..., is_swizzled_scales=True)``.
@@ -437,6 +456,8 @@ def mm_mxfp6(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="fu
     """
     import torch
 
+    if a_format not in ("e2m3", "e3m2") or b_format not in ("e2m3", "e3m2"):
+        raise InvalidInput("tlx.ops.mm_mxfp6 a_format and b_format must each be 'e2m3' or 'e3m2'")
     tensors = (a, a_scale, b, b_scale)
     if not all(isinstance(tensor, torch.Tensor) for tensor in tensors):
         raise InvalidInput("tlx.ops.mm_mxfp6 expects tensor inputs")
@@ -478,7 +499,7 @@ def mm_mxfp6(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="fu
     tma_tensors = tensors if out is None else (*tensors, out)
     check_inputs(spec, dtype=a.dtype, base_ptrs=tuple(tensor.data_ptr() for tensor in tma_tensors))
     check_backward(spec, *tensors, out)
-    return fn(a, a_scale, b, b_scale, out=out, sf_layout=sf_layout, space=space)
+    return fn(a, a_scale, b, b_scale, out=out, sf_layout=sf_layout, space=space, a_format=a_format, b_format=b_format)
 
 
 def grouped_gemm(group_a, group_b, *, space=None):
@@ -844,6 +865,149 @@ def moe_routing(router_logits, correction_bias, topk=8, *, router_multiplier=1.0
         return fn(router_logits, correction_bias, topk, router_multiplier, route_scale, eps, num_valid_tokens, out)
 
 
+_MOE_FINALIZE_MAX_H = 8192
+_MOE_FINALIZE_MAX_TOPK = 16
+
+
+def moe_finalize(expert_out, topk_weights, *, row_index=None, topk_ids=None, expert_mask=None, norm_weight=None,
+                 input_scale=True, eps=1e-6, gain_center=0.0, out=None, space=None):
+    """Combine routed expert outputs per token: RMSNorm each slot's expert row, scale it by its routing weight, sum
+    over the top-k slots. BF16. Differentiable in ``expert_out``, ``topk_weights`` and ``norm_weight``.
+
+    Layouts, with ``topk_weights`` fp32 ``(T, K)``:
+
+    - ``row_index`` given: ``expert_out`` is ``(R, H)``, the expert outputs in any row order (for example grouped by
+      expert, as an expert GEMM writes them), and ``row_index`` int32/int64 ``(T, K)`` holds the row of each slot. A
+      slot whose row is outside ``[0, R)``, for example -1 for an expert on another rank, has no row.
+    - otherwise ``expert_out`` is ``(T, K, H)``. With ``topk_ids`` int32/int64 ``(T, K)`` and ``expert_mask``
+      bool/int32 ``(E,)``, a slot contributes only when ``0 <= topk_ids[t, k] < E`` and its mask entry is nonzero;
+      without them every slot does.
+
+    A slot that does not contribute is not read. For a contributing slot with row ``x`` (upcast), weight
+    ``w = bf16(norm_weight + gain_center)`` (``norm_weight`` BF16 or FP32 ``(H,)``; ``w = 1`` without one) and
+    ``s = topk_weights[t, k]``, in FP32:
+    ``n = bf16(x * w)`` and ``y = bf16(n * rsqrt(mean(n * n) + eps))`` with ``input_scale``, else
+    ``y = bf16(x * rsqrt(mean(x * x) + eps) * w)``; then ``out[t] = bf16(sum_k bf16(y * s))``, summed in slot order.
+    A token without contributing slots gets zeros. Returns ``out`` (BF16 ``(T, H)``), filling it when passed.
+    ``H`` is at most 8192 and ``K`` at most 16. Batch invariant. Only ``space="heuristic"`` is provided.
+
+    The backward recomputes the norm. The gradient of ``expert_out`` has its shape and is zero for rows that no
+    contributing slot names; with ``row_index`` each row must be named by at most one slot, which the backward
+    checks on the device (a row named twice fails a device-side assertion). The gradient of ``topk_weights`` is
+    ``sum(g * y)`` per slot (zero for slots that do not contribute) and that of ``norm_weight`` is accumulated in
+    FP32 and returned in its dtype; ``gain_center`` passes it through unchanged. ``g * s`` and the
+    gradient of the norm input are rounded to BF16, as in the eager chain.
+
+    ``gain_center`` folds the offset of a norm whose weight is stored centered at zero (for example a learnable
+    input scale applied as ``weight + 1``) into the kernel. It needs ``norm_weight``; the default 0 leaves a BF16
+    weight unchanged.
+    ``out`` is forward only: it cannot be combined with inputs that require grad.
+    """
+    import torch
+
+    name = "tlx.ops.moe_finalize"
+    if not isinstance(expert_out, torch.Tensor) or not isinstance(topk_weights, torch.Tensor):
+        raise InvalidInput(f"{name} expects tensor expert_out and topk_weights")
+    if (topk_weights.ndim != 2 or topk_weights.dtype != torch.float32 or not topk_weights.is_contiguous()):
+        raise InvalidInput(f"{name} expects contiguous fp32 topk_weights (T, K); got {tuple(topk_weights.shape)} "
+                           f"{topk_weights.dtype}")
+    T, K = topk_weights.shape
+    if row_index is not None and (topk_ids is not None or expert_mask is not None):
+        raise InvalidInput(f"{name} takes row_index or topk_ids/expert_mask, not both")
+    if (topk_ids is None) != (expert_mask is None):
+        raise InvalidInput(f"{name} expects topk_ids and expert_mask together")
+    want_dims = 2 if row_index is not None else 3
+    if (expert_out.ndim != want_dims or expert_out.dtype != torch.bfloat16 or not expert_out.is_contiguous()
+            or (want_dims == 3 and tuple(expert_out.shape[:2]) != (T, K))):
+        layout = "(R, H) with row_index" if want_dims == 2 else f"({T}, {K}, H)"
+        raise InvalidInput(f"{name} expects a contiguous BF16 expert_out of shape {layout}; got "
+                           f"{tuple(expert_out.shape)} {expert_out.dtype}")
+    H = expert_out.shape[-1]
+    if not 1 <= H <= _MOE_FINALIZE_MAX_H or not 1 <= K <= _MOE_FINALIZE_MAX_TOPK:
+        raise InvalidInput(f"{name} supports 1 <= H <= {_MOE_FINALIZE_MAX_H} and 1 <= K <= "
+                           f"{_MOE_FINALIZE_MAX_TOPK}; got H={H}, K={K}")
+    for arg, t in (("row_index", row_index), ("topk_ids", topk_ids)):
+        if t is not None and (not isinstance(t, torch.Tensor) or t.shape != (T, K)
+                              or t.dtype not in (torch.int32, torch.int64) or not t.is_contiguous()):
+            raise InvalidInput(f"{name} expects a contiguous int32/int64 {arg} of shape ({T}, {K})")
+    if expert_mask is not None and (not isinstance(expert_mask, torch.Tensor) or expert_mask.ndim != 1
+                                    or expert_mask.numel() == 0 or expert_mask.dtype not in (torch.bool, torch.int32)
+                                    or not expert_mask.is_contiguous()):
+        raise InvalidInput(f"{name} expects a contiguous non-empty bool/int32 expert_mask (E,)")
+    if norm_weight is not None and (not isinstance(norm_weight, torch.Tensor) or norm_weight.shape != (H, )
+                                    or norm_weight.dtype not in (torch.bfloat16, torch.float32)
+                                    or not norm_weight.is_contiguous()):
+        raise InvalidInput(f"{name} expects a contiguous BF16 or FP32 norm_weight of shape ({H},)")
+    if (isinstance(gain_center, bool) or not isinstance(gain_center, (int, float)) or not math.isfinite(gain_center)):
+        raise InvalidInput(f"{name} expects a finite Python number gain_center; got {gain_center!r}")
+    if gain_center != 0 and norm_weight is None:
+        raise InvalidInput(f"{name} applies gain_center to norm_weight; pass norm_weight with gain_center")
+    if isinstance(eps, bool) or not isinstance(eps, (int, float)) or not 0 <= eps < float("inf"):
+        raise InvalidInput(f"{name} expects a finite non-negative Python number eps; got {eps!r}")
+    tensors = [t for t in (expert_out, topk_weights, row_index, topk_ids, expert_mask, norm_weight) if t is not None]
+    if out is not None:
+        if (not isinstance(out, torch.Tensor) or out.shape != (T, H) or out.dtype != torch.bfloat16
+                or not out.is_contiguous()):
+            raise InvalidInput(f"{name} expects a contiguous BF16 out of shape ({T}, {H})")
+        if any(torch._C._overlaps(out, t) for t in tensors):
+            raise InvalidInput(f"{name} out must not alias an input")
+        tensors.append(out)
+    if any(t.device != expert_out.device for t in tensors):
+        raise InvalidInput(f"{name} expects all tensors on one device")
+
+    space_name, invariance = _normalize_space_arg("moe_finalize", space)
+    _check_single_config_space("moe_finalize", space_name)
+    fn, spec = impl_for("moe_finalize", device=expert_out.device)
+    check_inputs(spec, dtype=expert_out.dtype, H=H, K=K)
+    check_backward(spec, *tensors)
+    if out is not None and torch.is_grad_enabled() and any(t.requires_grad for t in tensors):
+        raise UnsupportedBackward(f"{name} fills out only without autograd; pass out=None to differentiate")
+    _check_enforced("moe_finalize", spec, invariance)
+    with torch.cuda.device(expert_out.device):
+        return fn(expert_out, topk_weights, row_index, topk_ids, expert_mask, norm_weight, bool(input_scale), eps,
+                  float(gain_center), out)
+
+
+def _check_boundary_inputs(op, stream, branch, post_weight, pre_weight, alpha, beta, out, new_stream):
+    """Validate a residual-stream boundary call; returns its tensors (inputs, then given outputs) and ``H``."""
+    import torch
+
+    if not isinstance(stream, torch.Tensor) or not isinstance(branch, torch.Tensor):
+        raise InvalidInput(f"tlx.ops.{op} expects tensor stream and branch")
+    if (stream.ndim != 2 or stream.shape != branch.shape or stream.dtype != torch.float32
+            or branch.dtype != torch.bfloat16 or not stream.is_contiguous() or not branch.is_contiguous()):
+        raise InvalidInput(f"tlx.ops.{op} expects contiguous FP32 stream and BF16 branch of one "
+                           f"(T, H) shape; got {tuple(stream.shape)} {stream.dtype} and {tuple(branch.shape)} "
+                           f"{branch.dtype}")
+    T, H = branch.shape
+    for name, w in (("post_weight", post_weight), ("pre_weight", pre_weight)):
+        if w is not None and (not isinstance(w, torch.Tensor) or w.shape != (H, ) or w.dtype != torch.bfloat16
+                              or not w.is_contiguous()):
+            raise InvalidInput(f"tlx.ops.{op} expects a contiguous BF16 {name} of shape ({H},)")
+    if (alpha is None) != (beta is None):
+        raise InvalidInput(f"tlx.ops.{op} expects alpha and beta together")
+    if alpha is not None and any(not isinstance(g, torch.Tensor) or g.shape not in (
+        (H, ), (1, )) or g.dtype != torch.float32 or not g.is_contiguous() or g.shape != alpha.shape
+                                 for g in (alpha, beta)):
+        raise InvalidInput(f"tlx.ops.{op} expects contiguous FP32 alpha and beta of shape ({H},) "
+                           "or (1,)")
+    inputs = tuple(t for t in (stream, branch, post_weight, pre_weight, alpha, beta) if t is not None)
+    outputs = []
+    for name, buf, dtype in (("out", out, torch.bfloat16), ("new_stream", new_stream, torch.float32)):
+        if buf is None:
+            continue
+        if not isinstance(buf, torch.Tensor) or buf.shape != (T, H) or buf.dtype != dtype or not buf.is_contiguous():
+            raise InvalidInput(f"tlx.ops.{op} expects a contiguous {dtype} {name} of shape "
+                               f"({T}, {H})")
+        if any(torch._C._overlaps(buf, t) for t in (*inputs, *outputs)):
+            raise InvalidInput(f"tlx.ops.{op} {name} must not alias an input or output")
+        outputs.append(buf)
+    if any(t.device != branch.device for t in (*inputs, *outputs)):
+        raise InvalidInput(f"tlx.ops.{op} expects all tensors on one device")
+
+    return (*inputs, *outputs), H
+
+
 def norm_residual_norm(stream, branch, *, post_weight=None, post_norm_input_scale=False, pre_weight=None, alpha=None,
                        beta=None, post_eps=1e-6, pre_eps=1e-6, pre_norm_bf16=False, out=None, new_stream=None,
                        space=None):
@@ -862,48 +1026,428 @@ def norm_residual_norm(stream, branch, *, post_weight=None, post_norm_input_scal
     """
     import torch
 
-    if not isinstance(stream, torch.Tensor) or not isinstance(branch, torch.Tensor):
-        raise InvalidInput("tlx.ops.norm_residual_norm expects tensor stream and branch")
-    if (stream.ndim != 2 or stream.shape != branch.shape or stream.dtype != torch.float32
-            or branch.dtype != torch.bfloat16 or not stream.is_contiguous() or not branch.is_contiguous()):
-        raise InvalidInput("tlx.ops.norm_residual_norm expects contiguous FP32 stream and BF16 branch of one "
-                           f"(T, H) shape; got {tuple(stream.shape)} {stream.dtype} and {tuple(branch.shape)} "
-                           f"{branch.dtype}")
-    T, H = branch.shape
-    for name, w in (("post_weight", post_weight), ("pre_weight", pre_weight)):
-        if w is not None and (not isinstance(w, torch.Tensor) or w.shape != (H, ) or w.dtype != torch.bfloat16
-                              or not w.is_contiguous()):
-            raise InvalidInput(f"tlx.ops.norm_residual_norm expects a contiguous BF16 {name} of shape ({H},)")
-    if (alpha is None) != (beta is None):
-        raise InvalidInput("tlx.ops.norm_residual_norm expects alpha and beta together")
-    if alpha is not None and any(not isinstance(g, torch.Tensor) or g.shape not in (
-        (H, ), (1, )) or g.dtype != torch.float32 or not g.is_contiguous() or g.shape != alpha.shape
-                                 for g in (alpha, beta)):
-        raise InvalidInput(f"tlx.ops.norm_residual_norm expects contiguous FP32 alpha and beta of shape ({H},) "
-                           "or (1,)")
-    inputs = tuple(t for t in (stream, branch, post_weight, pre_weight, alpha, beta) if t is not None)
-    outputs = []
-    for name, buf, dtype in (("out", out, torch.bfloat16), ("new_stream", new_stream, torch.float32)):
-        if buf is None:
-            continue
-        if not isinstance(buf, torch.Tensor) or buf.shape != (T, H) or buf.dtype != dtype or not buf.is_contiguous():
-            raise InvalidInput(f"tlx.ops.norm_residual_norm expects a contiguous {dtype} {name} of shape "
-                               f"({T}, {H})")
-        if any(torch._C._overlaps(buf, t) for t in (*inputs, *outputs)):
-            raise InvalidInput(f"tlx.ops.norm_residual_norm {name} must not alias an input or output")
-        outputs.append(buf)
-    if any(t.device != branch.device for t in (*inputs, *outputs)):
-        raise InvalidInput("tlx.ops.norm_residual_norm expects all tensors on one device")
-
+    tensors, H = _check_boundary_inputs("norm_residual_norm", stream, branch, post_weight, pre_weight, alpha, beta, out,
+                                        new_stream)
     space_name, invariance = _normalize_space_arg("norm_residual_norm", space)
     _check_single_config_space("norm_residual_norm", space_name)
     fn, spec = impl_for("norm_residual_norm", device=branch.device)
     check_inputs(spec, dtype=branch.dtype, H=H)
-    check_backward(spec, *inputs, *outputs)
+    check_backward(spec, *tensors)
     _check_enforced("norm_residual_norm", spec, invariance)
     with torch.cuda.device(branch.device):
         return fn(stream, branch, post_weight, bool(post_norm_input_scale), pre_weight, alpha, beta, post_eps, pre_eps,
                   bool(pre_norm_bf16), out, new_stream)
+
+
+def all_reduce_workspace(max_numel, *, group=None):
+    """Peer-mapped buffers for ``all_reduce`` and ``all_reduce_norm_residual_norm`` on the current device.
+
+    Collective over ``group`` (default: the world group of an initialized ``torch.distributed`` with one GPU per
+    rank on one node). ``workspace.input(*shape)`` returns a view of the symmetric BF16 input buffer, which holds
+    ``max_numel`` elements; write the local partial into it and pass that view to the op. Calls on one workspace
+    must not overlap: issue them from one stream or order the streams, and give each concurrent stream its own
+    workspace. A failure during setup raises on every rank.
+    ``workspace.close()``, called on every rank of the group, releases the peer mappings; later calls raise.
+    """
+    import torch
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    fn, spec = impl_for("all_reduce_workspace", device=device)
+    with torch.cuda.device(device):
+        return fn(int(max_numel), group)
+
+
+def _check_all_reduce_input(op, x, workspace):
+    import torch
+
+    if not isinstance(x, torch.Tensor) or x.dtype != torch.bfloat16 or not x.is_contiguous():
+        raise InvalidInput(f"tlx.ops.{op} expects a contiguous BF16 tensor")
+    if getattr(workspace, "closed", False):
+        raise InvalidInput(f"tlx.ops.{op} got a closed workspace")
+    if not hasattr(workspace, "holds") or not workspace.holds(x):
+        raise InvalidInput(f"tlx.ops.{op} expects the input to be workspace.input(...) of its workspace")
+
+
+def all_reduce(x, workspace, *, out=None, space=None):
+    """Sum of ``x`` over the ranks of ``workspace``'s group, returned on every rank. Forward only.
+
+    ``x`` is BF16 and must be ``workspace.input(*x.shape)``. Each element is the FP32 sum of the ranks' values in rank
+    order, rounded to BF16, so every rank gets the same bits for every token count. Returns ``out`` (BF16, the
+    shape of ``x``), filling it when passed. Only ``space="heuristic"`` is provided.
+    """
+    import torch
+
+    _check_all_reduce_input("all_reduce", x, workspace)
+    if out is not None and (not isinstance(out, torch.Tensor) or out.shape != x.shape or out.dtype != x.dtype
+                            or not out.is_contiguous() or out.device != x.device or out.data_ptr() % 16
+                            or torch._C._overlaps(out, x)):
+        raise InvalidInput(f"tlx.ops.all_reduce expects a contiguous, 16-byte aligned BF16 out of shape "
+                           f"{tuple(x.shape)} that does not alias the input")
+    space_name, invariance = _normalize_space_arg("all_reduce", space)
+    _check_single_config_space("all_reduce", space_name)
+    fn, spec = impl_for("all_reduce", device=x.device)
+    check_inputs(spec, dtype=x.dtype, world=workspace.world)
+    check_backward(spec, x, out)
+    _check_enforced("all_reduce", spec, invariance)
+    with torch.cuda.device(x.device):
+        return fn(x, workspace, out)
+
+
+def all_reduce_norm_residual_norm(stream, branch, workspace, *, post_weight=None, post_norm_input_scale=False,
+                                  pre_weight=None, alpha=None, beta=None, post_eps=1e-6, pre_eps=1e-6,
+                                  pre_norm_bf16=False, out=None, new_stream=None, space=None):
+    """``norm_residual_norm`` of ``stream`` and ``all_reduce(branch)``. Forward only.
+
+    ``branch`` is this rank's BF16 partial and must be ``workspace.input(T, H)``; the other arguments and the
+    returns are those of ``norm_residual_norm``. The result is bitwise equal to ``all_reduce`` followed by
+    ``norm_residual_norm``, on every rank. Decode-sized calls run as one kernel. Only
+    ``space="heuristic"`` is provided.
+    """
+    import torch
+
+    _check_all_reduce_input("all_reduce_norm_residual_norm", branch, workspace)
+    tensors, H = _check_boundary_inputs("all_reduce_norm_residual_norm", stream, branch, post_weight, pre_weight, alpha,
+                                        beta, out, new_stream)
+    space_name, invariance = _normalize_space_arg("all_reduce_norm_residual_norm", space)
+    _check_single_config_space("all_reduce_norm_residual_norm", space_name)
+    fn, spec = impl_for("all_reduce_norm_residual_norm", device=branch.device)
+    check_inputs(spec, dtype=branch.dtype, H=H, world=workspace.world)
+    check_backward(spec, *tensors)
+    _check_enforced("all_reduce_norm_residual_norm", spec, invariance)
+    with torch.cuda.device(branch.device):
+        return fn(stream, branch, workspace, post_weight, bool(post_norm_input_scale), pre_weight, alpha, beta,
+                  post_eps, pre_eps, bool(pre_norm_bf16), out, new_stream)
+
+
+def router_gemm(x, weight, *, out=None, space=None):
+    """MoE router logits in fp32: ``x.float() @ weight.T`` for a bf16 ``x`` and an fp32 ``weight``. Forward only.
+
+    Every product is exact (each fp32 weight element is the exact sum of three bf16 values, multiplied by the bf16
+    ``x`` on bf16 matrix cores) and accumulated in fp32, so the logits match an fp32 GEMM on the upcast ``x`` up to
+    the order of the fp32 additions, which depends on the token count's bucket. Pass the bf16 hidden states, not
+    their fp32 upcast; the weight stays fp32 and may be updated in place.
+
+    Shapes: ``x (T, K)`` bf16 with unit column stride, ``weight (E, K)`` fp32 contiguous; returns or fills
+    ``out (T, E)`` fp32 contiguous. ``E`` must be a multiple of 16 and ``K`` a multiple of 1024.
+    Only ``space="heuristic"`` is provided.
+    """
+    import torch
+
+    if not isinstance(x, torch.Tensor) or not isinstance(weight, torch.Tensor):
+        raise InvalidInput("tlx.ops.router_gemm expects tensor x and weight")
+    if x.ndim != 2 or weight.ndim != 2 or x.shape[1] != weight.shape[1]:
+        raise InvalidInput("tlx.ops.router_gemm expects x (T, K) and weight (E, K); got "
+                           f"{tuple(x.shape)} and {tuple(weight.shape)}")
+    T, K = x.shape
+    E = weight.shape[0]
+    if weight.dtype != torch.float32:
+        raise InvalidInput(f"tlx.ops.router_gemm expects an fp32 weight; got {weight.dtype}")
+    if not weight.is_contiguous() or (T > 1 and x.stride(0) < K) or (K > 1 and x.stride(1) != 1):
+        raise InvalidInput("tlx.ops.router_gemm expects a contiguous weight and x with unit column stride and rows "
+                           "that do not overlap")
+    tensors = [x, weight]
+    if out is not None:
+        if (not isinstance(out, torch.Tensor) or out.shape != (T, E) or out.dtype != torch.float32
+                or not out.is_contiguous()):
+            raise InvalidInput(f"tlx.ops.router_gemm expects out as a contiguous fp32 ({T}, {E}) tensor")
+        if torch._C._overlaps(out, x) or torch._C._overlaps(out, weight):
+            raise InvalidInput("tlx.ops.router_gemm out must not alias x or weight")
+        tensors.append(out)
+    if any(t.device != x.device for t in tensors):
+        raise InvalidInput("tlx.ops.router_gemm expects all tensors on one device")
+
+    space_name, invariance = _normalize_space_arg("router_gemm", space)
+    _check_single_config_space("router_gemm", space_name)
+    fn, spec = impl_for("router_gemm", device=x.device)
+    check_inputs(spec, dtype=x.dtype, E=E, K=K)
+    check_backward(spec, *tensors)
+    _check_enforced("router_gemm", spec, invariance)
+    with torch.cuda.device(x.device):
+        return fn(x, weight, out)
+
+
+def moe_router_topk_align(x, weight, correction_bias, topk=8, *, num_local_experts, local_expert_start=0, block_m,
+                          router_multiplier=1.0, route_scale=1.0, eps=0.0, space=None):
+    """The MoE routing front end: router logits, sigmoid top-k, and the expert-aligned slot order of the local experts.
+    Forward only.
+
+    Returns what ``router_gemm``, then ``moe_routing``, then the slot sort inside ``tlx.ops.moe`` return, bit for bit:
+    ``logits = router_gemm(x, weight)`` (fp32, exact products), ``(topk_weights, topk_ids) = moe_routing(logits,
+    correction_bias, topk, ...)``, and the routed slots of the experts ``[local_expert_start, local_expert_start +
+    num_local_experts)`` sorted by local expert into ``block_m``-padded blocks. It runs as three launches: the top-k
+    kernel adds the router GEMM's split-K partials itself, so the GEMM's reduction launch and the logits round trip
+    are gone. The logits are not returned.
+
+    Returns ``(topk_weights, topk_ids, sorted_ids, expert_ids, num_tokens_post_padded)``: fp32 and int32 ``(T, topk)``;
+    ``sorted_ids`` int32 of length ``cap = ceil((T * topk + num_local_experts * (block_m - 1)) / block_m) * block_m``,
+    holding flat slot indices ``token * topk + slot``, in slot order within an expert, and ``T * topk`` in padding
+    positions; ``expert_ids`` int32 ``(cap / block_m,)``, the local expert of each block, ``-1`` past the last; and
+    ``num_tokens_post_padded`` int32 ``(1,)``, the number of positions in used blocks. Slots routed to other ranks'
+    experts are left out. Shapes and dtypes otherwise as ``router_gemm`` and ``moe_routing``; ``block_m`` must be a
+    power of two of at least 16. Graph-capturable: nothing is read on the host.
+    Only ``space="heuristic"`` is provided.
+    """
+    import torch
+
+    if not all(isinstance(t, torch.Tensor) for t in (x, weight, correction_bias)):
+        raise InvalidInput("tlx.ops.moe_router_topk_align expects tensors x, weight and correction_bias")
+    if x.ndim != 2 or weight.ndim != 2 or x.shape[1] != weight.shape[1] or correction_bias.shape != weight.shape[:1]:
+        raise InvalidInput("tlx.ops.moe_router_topk_align expects x (T, K), weight (E, K) and correction_bias (E,); "
+                           f"got {tuple(x.shape)}, {tuple(weight.shape)} and {tuple(correction_bias.shape)}")
+    T, K = x.shape
+    E = weight.shape[0]
+    if (x.dtype != torch.bfloat16 or weight.dtype != torch.float32 or correction_bias.dtype != torch.float32
+            or not weight.is_contiguous() or not correction_bias.is_contiguous() or (T > 1 and x.stride(0) < K)
+            or (K > 1 and x.stride(1) != 1)):
+        raise InvalidInput("tlx.ops.moe_router_topk_align expects bf16 x with unit column stride and rows that do not "
+                           "overlap, a contiguous fp32 weight and a contiguous fp32 correction_bias")
+    for name, value in (("topk", topk), ("num_local_experts", num_local_experts),
+                        ("local_expert_start", local_expert_start), ("block_m", block_m)):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise InvalidInput(f"tlx.ops.moe_router_topk_align expects an int {name}; got {value!r}")
+    if not 1 <= topk <= min(E, _MOE_ROUTING_MAX_TOPK):
+        raise InvalidInput(f"tlx.ops.moe_router_topk_align supports 1 <= topk <= min(E, {_MOE_ROUTING_MAX_TOPK}); got "
+                           f"topk={topk}, E={E}")
+    if not 1 <= num_local_experts <= E or not 0 <= local_expert_start <= E - num_local_experts:
+        raise InvalidInput(f"tlx.ops.moe_router_topk_align expects local experts within [0, {E}); got start "
+                           f"{local_expert_start} and count {num_local_experts}")
+    if block_m < 16 or block_m & (block_m - 1):
+        raise InvalidInput(f"tlx.ops.moe_router_topk_align expects a power-of-two block_m >= 16; got {block_m}")
+    for name, value in (("router_multiplier", router_multiplier), ("route_scale", route_scale), ("eps", eps)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise InvalidInput(f"tlx.ops.moe_router_topk_align expects a Python number for {name}; got {value!r}")
+    if any(t.device != x.device for t in (weight, correction_bias)):
+        raise InvalidInput("tlx.ops.moe_router_topk_align expects all tensors on one device")
+
+    space_name, invariance = _normalize_space_arg("moe_router_topk_align", space)
+    _check_single_config_space("moe_router_topk_align", space_name)
+    fn, spec = impl_for("moe_router_topk_align", device=x.device)
+    check_inputs(spec, dtype=x.dtype, E=E, K=K, topk=topk)
+    check_backward(spec, x, weight, correction_bias)
+    _check_enforced("moe_router_topk_align", spec, invariance)
+    with torch.cuda.device(x.device):
+        return fn(x, weight, correction_bias, topk, num_local_experts, local_expert_start, block_m, router_multiplier,
+                  route_scale, eps)
+
+
+def moe_mxfp4_sort_quant(x, topk_ids, *, num_local_experts, local_expert_start=0, num_experts, block_m=32, space=None):
+    """The decode-sized prologue of an MXFP4 (A4W4) routed MoE in one launch: the expert-aligned slot sort, the
+    per-row MXFP4 quantization of the activations and the scale sort that AITER's A4W4 stage kernels read. Forward
+    only.
+
+    Bit-exact with AITER's ``moe_sorting`` (with the expert mask of the local experts), ``dynamic_mxfp4_quant``
+    (round-up amax, scale ``2^(floor(log2(amax)) - 2)``, RNE E2M1, unshuffled) and ``moe_mxfp4_sort`` on every byte the
+    stage kernels read. Returns ``(x_fp4, sorted_ids, sorted_expert_ids, num_valid_ids, sorted_scales)``:
+
+    - ``x_fp4`` uint8 ``(T, K / 2)``, two E2M1 values per byte (even element in the low nibble), in token order;
+    - ``sorted_ids`` int32 of length ``cap = T * topk + num_experts * block_m - topk`` (AITER's allocation), the routed
+      slots of experts ``[local_expert_start, local_expert_start + num_local_experts)`` grouped by local expert
+      (ascending) into ``block_m``-row blocks, tokens ascending within an expert, each entry ``token | slot << 24`` and
+      padding ``T | topk << 24``; entries past ``num_valid_ids[0]`` are not written;
+    - ``sorted_expert_ids`` int32 ``(ceil(cap / block_m),)``, the local expert of each used block;
+    - ``num_valid_ids`` int32 ``(2,)``: the number of positions in used blocks, and ``T``;
+    - ``sorted_scales`` uint8 ``(ceil(cap / 32) * 32, K / 32)``, the E8M0 scale of each sorted row in
+      ``moe_mxfp4_sort``'s 32 x 8 tiles; rows of padding slots are not written (the GEMMs never use them for a real
+      token's output).
+
+    ``x`` is bf16 ``(T, K)`` with unit column stride, ``1 <= T <= 64`` and ``K % 256 == 0``; ``topk_ids`` int32
+    ``(T, topk)`` with ``1 <= topk <= 8``, contiguous global expert ids, a token's ids distinct, ids outside the local
+    range skipped; ``1 <= num_local_experts <= 64``; ``block_m`` is 32. Graph-capturable: launch shapes depend only on
+    ``T``, nothing is read on the host. Rows are quantized independently, so a row's bytes do not depend on the batch.
+    Only ``space="heuristic"`` is provided.
+    """
+    import torch
+
+    if not isinstance(x, torch.Tensor) or not isinstance(topk_ids, torch.Tensor):
+        raise InvalidInput("tlx.ops.moe_mxfp4_sort_quant expects tensors x and topk_ids")
+    if x.ndim != 2 or topk_ids.ndim != 2 or topk_ids.shape[0] != x.shape[0]:
+        raise InvalidInput("tlx.ops.moe_mxfp4_sort_quant expects x (T, K) and topk_ids (T, topk); got "
+                           f"{tuple(x.shape)} and {tuple(topk_ids.shape)}")
+    T, K = x.shape
+    topk = topk_ids.shape[1]
+    if (x.dtype != torch.bfloat16 or (K > 1 and x.stride(1) != 1) or (T > 1 and x.stride(0) < K)
+            or topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous()):
+        raise InvalidInput("tlx.ops.moe_mxfp4_sort_quant expects bf16 x with unit column stride and rows that do not "
+                           "overlap, and contiguous int32 topk_ids")
+    for name, value in (("num_local_experts", num_local_experts), ("local_expert_start", local_expert_start),
+                        ("num_experts", num_experts), ("block_m", block_m)):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise InvalidInput(f"tlx.ops.moe_mxfp4_sort_quant expects an int {name}; got {value!r}")
+    if not 1 <= num_local_experts <= num_experts or not 0 <= local_expert_start <= num_experts - num_local_experts:
+        raise InvalidInput(f"tlx.ops.moe_mxfp4_sort_quant expects local experts within [0, {num_experts}); got start "
+                           f"{local_expert_start} and count {num_local_experts}")
+    if topk_ids.device != x.device:
+        raise InvalidInput("tlx.ops.moe_mxfp4_sort_quant expects all tensors on one device")
+
+    space_name, invariance = _normalize_space_arg("moe_mxfp4_sort_quant", space)
+    _check_single_config_space("moe_mxfp4_sort_quant", space_name)
+    fn, spec = impl_for("moe_mxfp4_sort_quant", device=x.device)
+    check_inputs(spec, dtype=x.dtype, T=T, K=K, topk=topk, E_local=num_local_experts, block_m=block_m)
+    check_backward(spec, x)
+    _check_enforced("moe_mxfp4_sort_quant", spec, invariance)
+    with torch.cuda.device(x.device):
+        return fn(x, topk_ids, local_expert_start, num_local_experts, num_experts, block_m)
+
+
+def qk_norm_rope_kv_cache(q, k, v, k_cache, v_cache, slot_mapping, *, eps, q_scale=1.0, positions=None,
+                          cos_sin_cache=None, rope_bf16=True, slot_remap=None, k_scale=None, v_scale=None,
+                          q_out_scale=None, q_out=None, space=None):
+    """Attention input preparation in one launch: q/k head RMSNorm, RoPE, the paged FP8 KV cache write and the q cast.
+    Forward only.
+
+    Per token ``t``, with ``D`` the head dim:
+
+    - every head of ``q`` and ``k`` gets a weightless RMSNorm in FP32 (``x * rsqrt(mean(x * x) + eps)``), rounded to
+      BF16; ``q`` is then multiplied by ``q_scale`` and rounded to BF16 again;
+    - with ``positions``, RoPE on interleaved pairs ``(x[2i], x[2i + 1])`` of every head, ``cos``/``sin`` taken from
+      row ``positions[t]`` of the FP32 table ``cos_sin_cache (max_position, D)`` (``cos`` in the first ``D / 2``
+      columns). ``rope_bf16=True`` rounds ``cos``, ``sin`` and every product and sum to BF16, as rotary-embedding
+      kernels that compute in the activation dtype do; ``rope_bf16=False`` computes each output in FP32 and rounds
+      once;
+    - ``k`` (normed and rotated) and ``v`` are divided by ``k_scale``/``v_scale`` (if given) in FP32, converted to
+      ``float8_e4m3fn`` (round to nearest even, saturating at +-448) and written to ``cache[s // page, s % page]``
+      with ``s = slot_mapping[t]``, or ``s = slot_remap[slot_mapping[t]]`` with ``slot_remap``. A negative slot, before
+      or after the remap, writes nothing;
+    - returns ``q`` in BF16, or with ``q_out_scale`` in ``float8_e4m3fn`` as ``clamp(q * rcp(q_out_scale), -448,
+      448)`` rounded to nearest even, ``rcp`` being the hardware reciprocal.
+
+    Shapes: ``q (T, HQ * D)``, ``k`` and ``v (T, HK * D)`` BF16 with unit column stride and any row stride (column
+    slices of a fused QKV projection work); ``k_cache`` and ``v_cache (num_blocks, page, HK, D)`` ``float8_e4m3fn``,
+    contiguous within a block and with one block stride; ``slot_mapping (T,)``, ``positions (T,)`` and ``slot_remap``
+    int32 or int64; ``k_scale``, ``v_scale`` and ``q_out_scale`` one-element FP32 tensors. ``HQ``, ``HK`` and ``D`` are
+    powers of two with ``16 <= D <= 256`` and ``HQ * D``, ``HK * D`` at most 4096. Slots are not range checked; nothing
+    is read on the host, so the call is graph-capturable. Every token is computed alike, so a token's results do not
+    depend on the batch. Only ``space="heuristic"`` is provided.
+    """
+    import torch
+
+    tensors = dict(q=q, k=k, v=v, k_cache=k_cache, v_cache=v_cache, slot_mapping=slot_mapping)
+    if not all(isinstance(t, torch.Tensor) for t in tensors.values()):
+        raise InvalidInput("tlx.ops.qk_norm_rope_kv_cache expects tensors q, k, v, k_cache, v_cache and slot_mapping")
+    if k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
+        raise InvalidInput("tlx.ops.qk_norm_rope_kv_cache expects k_cache and v_cache of one shape (num_blocks, page, "
+                           f"HK, D); got {tuple(k_cache.shape)} and {tuple(v_cache.shape)}")
+    _, page, HK, D = k_cache.shape
+    if q.ndim != 2 or k.ndim != 2 or v.ndim != 2 or D == 0 or q.shape[1] % D or k.shape != (q.shape[0], HK * D) or (
+            v.shape != k.shape) or slot_mapping.shape != (q.shape[0], ):
+        raise InvalidInput(
+            "tlx.ops.qk_norm_rope_kv_cache expects q (T, HQ * D), k and v (T, HK * D) and "
+            f"slot_mapping (T,) for caches of {HK} heads of {D}; got {tuple(q.shape)}, {tuple(k.shape)}, "
+            f"{tuple(v.shape)} and {tuple(slot_mapping.shape)}")
+    T, HQ = q.shape[0], q.shape[1] // D
+    for name, t in (("q", q), ("k", k), ("v", v)):
+        if t.dtype != torch.bfloat16 or (t.shape[1] > 1 and t.stride(1) != 1) or (T > 1 and t.stride(0) < t.shape[1]):
+            raise InvalidInput(f"tlx.ops.qk_norm_rope_kv_cache expects {name} in bfloat16 with unit column stride and "
+                               "rows that do not overlap")
+    for name, t in (("k_cache", k_cache), ("v_cache", v_cache)):
+        if t.dtype != torch.float8_e4m3fn or t.stride()[1:] != (HK * D, D, 1) or t.stride(0) < page * HK * D:
+            raise InvalidInput(f"tlx.ops.qk_norm_rope_kv_cache expects {name} in float8_e4m3fn, contiguous within a "
+                               "block")
+    if v_cache.stride(0) != k_cache.stride(0):
+        raise InvalidInput("tlx.ops.qk_norm_rope_kv_cache expects k_cache and v_cache with one block stride")
+    index_dtypes = (torch.int32, torch.int64)
+    if slot_mapping.dtype not in index_dtypes or (T > 1 and slot_mapping.stride(0) != 1):
+        raise InvalidInput("tlx.ops.qk_norm_rope_kv_cache expects a contiguous int32/int64 slot_mapping")
+    if slot_remap is not None:
+        if (not isinstance(slot_remap, torch.Tensor) or slot_remap.ndim != 1 or slot_remap.dtype not in index_dtypes
+                or (slot_remap.numel() > 1 and slot_remap.stride(0) != 1)):
+            raise InvalidInput("tlx.ops.qk_norm_rope_kv_cache expects slot_remap as a contiguous 1-D int32/int64 "
+                               "tensor")
+        tensors["slot_remap"] = slot_remap
+    if (positions is None) != (cos_sin_cache is None):
+        raise InvalidInput("tlx.ops.qk_norm_rope_kv_cache expects positions and cos_sin_cache together")
+    if positions is not None:
+        if (not isinstance(positions, torch.Tensor) or positions.shape != (T, ) or positions.dtype not in index_dtypes
+                or (T > 1 and positions.stride(0) != 1)):
+            raise InvalidInput(f"tlx.ops.qk_norm_rope_kv_cache expects positions as a contiguous int32/int64 ({T},) "
+                               "tensor")
+        if (not isinstance(cos_sin_cache, torch.Tensor) or cos_sin_cache.ndim != 2 or cos_sin_cache.shape[1] != D
+                or cos_sin_cache.dtype != torch.float32 or cos_sin_cache.stride(1) != 1):
+            raise InvalidInput(f"tlx.ops.qk_norm_rope_kv_cache expects cos_sin_cache as an fp32 (max_position, {D}) "
+                               "tensor with unit column stride")
+        tensors.update(positions=positions, cos_sin_cache=cos_sin_cache)
+    if (k_scale is None) != (v_scale is None):
+        raise InvalidInput("tlx.ops.qk_norm_rope_kv_cache expects k_scale and v_scale together")
+    for name, t in (("k_scale", k_scale), ("v_scale", v_scale), ("q_out_scale", q_out_scale)):
+        if t is not None:
+            if not isinstance(t, torch.Tensor) or t.numel() != 1 or t.dtype != torch.float32:
+                raise InvalidInput(f"tlx.ops.qk_norm_rope_kv_cache expects {name} as a one-element fp32 tensor")
+            tensors[name] = t
+    for name, value in (("eps", eps), ("q_scale", q_scale)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise InvalidInput(f"tlx.ops.qk_norm_rope_kv_cache expects a Python number for {name}; got {value!r}")
+    if q_out is not None:
+        dtype = torch.float8_e4m3fn if q_out_scale is not None else torch.bfloat16
+        if (not isinstance(q_out, torch.Tensor) or q_out.shape != (T, HQ * D) or q_out.dtype != dtype
+                or not q_out.is_contiguous()):
+            raise InvalidInput(f"tlx.ops.qk_norm_rope_kv_cache expects q_out as a contiguous {dtype} ({T}, {HQ * D}) "
+                               "tensor")
+        tensors["q_out"] = q_out
+    if not torch.compiler.is_compiling():  # overlap checks do not trace
+        for out_name in ("k_cache", "v_cache", "q_out"):
+            for name, t in tensors.items():
+                if out_name in tensors and name != out_name and torch._C._overlaps(tensors[out_name], t):
+                    raise InvalidInput(f"tlx.ops.qk_norm_rope_kv_cache {out_name} must not alias {name}")
+    if any(t.device != q.device for t in tensors.values()):
+        raise InvalidInput("tlx.ops.qk_norm_rope_kv_cache expects all tensors on one device")
+
+    space_name, invariance = _normalize_space_arg("qk_norm_rope_kv_cache", space)
+    _check_single_config_space("qk_norm_rope_kv_cache", space_name)
+    fn, spec = impl_for("qk_norm_rope_kv_cache", device=q.device)
+    check_inputs(spec, dtype=q.dtype, HQ=HQ, HK=HK, D=D)
+    check_backward(spec, *tensors.values())
+    _check_enforced("qk_norm_rope_kv_cache", spec, invariance)
+    with torch.cuda.device(q.device):
+        return fn(q, k, v, k_cache, v_cache, slot_mapping, eps, q_scale, positions, cos_sin_cache, rope_bf16,
+                  slot_remap, k_scale, v_scale, q_out_scale, q_out)
+
+
+def rmsnorm_gate(x, gate, *, head_dim=64, eps=1e-6, out=None, space=None):
+    """Per-head RMSNorm without a weight, times a sigmoid gate. Forward only.
+
+    For each token and each ``head_dim``-element head of ``x``, in FP32:
+    ``out = bf16(x * rstd * sigmoid(gate))`` with ``rstd = 1 / sqrt(sum(x * x) / head_dim + eps)``. The sum adds
+    adjacent element pairs and then folds the pair sums in halves (pair ``i`` plus pair ``i + 16``, then ``+ 8``,
+    ``+ 4``, ``+ 2``, ``+ 1``), the order of a plain Triton kernel with 32 two-element lanes per head, so the result
+    is bitwise that kernel's. A row's result does not depend on the batch.
+
+    Shapes: ``x`` and ``gate`` BF16 ``(T, H * head_dim)``, each with a contiguous last dimension and any row stride
+    (``gate`` can be a column slice of a wider projection output). ``head_dim`` must be 64 and ``H`` a multiple of 8.
+    Returns a BF16 ``(T, H * head_dim)`` tensor; ``out`` (contiguous last dimension, any row stride, not overlapping
+    the inputs) is filled and returned when passed. Only ``space="heuristic"`` is provided.
+    """
+    import torch
+
+    if not isinstance(x, torch.Tensor) or not isinstance(gate, torch.Tensor):
+        raise InvalidInput("tlx.ops.rmsnorm_gate expects tensor x and gate")
+    if (x.ndim != 2 or gate.shape != x.shape or x.dtype != torch.bfloat16 or gate.dtype != torch.bfloat16
+            or x.stride(1) != 1 or gate.stride(1) != 1):
+        raise InvalidInput("tlx.ops.rmsnorm_gate expects BF16 x and gate of one (T, N) shape with contiguous rows; "
+                           f"got {tuple(x.shape)} {x.dtype} and {tuple(gate.shape)} {gate.dtype}")
+    T, N = x.shape
+    if not isinstance(head_dim, int) or head_dim <= 0 or N % head_dim:
+        raise InvalidInput(f"tlx.ops.rmsnorm_gate expects head_dim to divide the row width {N}; got {head_dim!r}")
+    if not 0 < eps < math.inf:
+        raise InvalidInput(f"tlx.ops.rmsnorm_gate expects a positive finite eps; got {eps!r}")
+    outputs = []
+    if out is not None:
+        if (not isinstance(out, torch.Tensor) or out.shape != (T, N) or out.dtype != torch.bfloat16
+                or out.stride(1) != 1):
+            raise InvalidInput(f"tlx.ops.rmsnorm_gate expects a BF16 out of shape ({T}, {N}) with contiguous rows")
+        if any(torch._C._overlaps(out, t) for t in (x, gate)):
+            raise InvalidInput("tlx.ops.rmsnorm_gate out must not alias x or gate")
+        outputs.append(out)
+    if any(t.device != x.device for t in (gate, *outputs)):
+        raise InvalidInput("tlx.ops.rmsnorm_gate expects all tensors on one device")
+
+    space_name, invariance = _normalize_space_arg("rmsnorm_gate", space)
+    _check_single_config_space("rmsnorm_gate", space_name)
+    fn, spec = impl_for("rmsnorm_gate", device=x.device)
+    check_inputs(spec, dtype=x.dtype, head_dim=head_dim, H=N // head_dim)
+    check_backward(spec, x, gate, *outputs)
+    _check_enforced("rmsnorm_gate", spec, invariance)
+    with torch.cuda.device(x.device):
+        return fn(x, gate, float(eps), out)
 
 
 def addmm(input, a, b, *, out=None, space=None):
@@ -1124,16 +1668,21 @@ def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full", p_ex
 
 
 def flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, sm_scale=None, causal=False, *,
-                      space=None):
-    """Forward-only attention over packed ``(tokens, heads, HEAD_DIM)`` fp16/bf16 sequences.
+                      window_size=(-1, -1), space=None):
+    """Attention over packed ``(tokens, heads, HEAD_DIM)`` fp16/bf16 sequences.
 
     Sequence ``b`` owns query rows ``cu_seqlens_q[b]:cu_seqlens_q[b + 1]`` and
     key/value rows ``cu_seqlens_k[b]:cu_seqlens_k[b + 1]``; both offset tensors
     are int32 ``(batch + 1,)``. ``max_seqlen_q`` must bound every query length
-    (it sizes the grid); ``max_seqlen_k`` is accepted for flash-attn API
+    (it sizes the grid); ``max_seqlen_k`` must bound every key length on sm100
+    (it sizes the backward grid) and is otherwise accepted for flash-attn API
     parity. K/V may have fewer heads than Q (GQA) if they divide its head count.
     Causal masking is bottom-right aligned: query ``i`` sees keys
     ``j <= i + k_len - q_len``, and a query row that sees no key returns zeros.
+    ``window_size=(left, right)`` (sm100 only) further limits query ``i`` to keys
+    ``i + k_len - q_len - left <= j <= i + k_len - q_len + right``, as in
+    flash-attn; ``-1`` leaves a side unbounded and ``causal`` sets ``right`` to 0.
+    sm100 is differentiable; sm90 and gfx950 are forward-only.
     `sm_scale` defaults to `HEAD_DIM ** -0.5` and must be positive and finite.
     Returns the output only (no log-sum-exp). Output rows not covered by ``cu_seqlens_q`` are left
     uninitialized.
@@ -1157,12 +1706,70 @@ def flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seq
     _check_single_config_space("flash_attn_varlen", space_name)
     if sm_scale is not None and not 0 < sm_scale < math.inf:
         raise InvalidInput(f"tlx.ops.flash_attn_varlen expects a positive finite sm_scale; got {sm_scale!r}")
-    fn, spec = impl_for("flash_attn_varlen", device=q.device)
+    window_size = tuple(int(w) for w in window_size)
+    if len(window_size) != 2 or min(window_size) < -1:
+        raise InvalidInput(f"tlx.ops.flash_attn_varlen expects window_size=(left, right) with -1 for unbounded; "
+                           f"got {window_size!r}")
+    fn, spec = _flash_attn_varlen_impl_for_device(q.device)
     check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[2])
     check_backward(spec, q, k, v)
     _check_enforced("flash_attn_varlen", spec, invariance)
-    with torch.cuda.device(q.device):
+    # Entering torch.cuda.device costs microseconds per call; skip it when q is already on the current device.
+    on_current = q.device.index == torch.cuda.current_device()
+    with contextlib.nullcontext() if on_current else torch.cuda.device(q.device):
+        if spec.supports_window:
+            return fn(q, k, v, cu_seqlens_q, cu_seqlens_k, int(max_seqlen_q), sm_scale, bool(causal),
+                      max_seqlen_k=int(max_seqlen_k), window_size=window_size)
+        if window_size != (-1, -1):
+            raise UnsupportedOp(f"tlx.ops.flash_attn_varlen does not support window_size on {spec.arch}")
         return fn(q, k, v, cu_seqlens_q, cu_seqlens_k, int(max_seqlen_q), sm_scale, bool(causal))
+
+
+def window_attn_varlen(q, k, v, cu_seqlens, window_size, sm_scale=None, *, space=None):
+    """Forward-only sliding-window self-attention over packed ``(tokens, heads, HEAD_DIM)`` fp16/bf16 sequences.
+
+    Sequence ``b`` owns rows ``cu_seqlens[b]:cu_seqlens[b + 1]`` of Q, K and V (int32, ``(batch + 1,)``, starting at 0
+    and ending at ``tokens``; empty sequences are allowed). With ``window_size=(left, right)``, row ``i`` attends the
+    keys ``i - left .. i + right`` of its own sequence, both ends inclusive: FlashAttention's ``window_size`` for
+    self-attention, without causal masking. K/V may have fewer heads than Q (GQA) if they divide its head count.
+    ``sm_scale`` defaults to ``HEAD_DIM ** -0.5`` and must be positive and finite, with ``sm_scale * log2(e)`` finite
+    in float32 (the kernel works in base 2); a scale whose ``sm_scale * log2(e)`` is below the smallest normal float32
+    is treated as 0, which gives the visible keys equal weight.
+    Supported: ``HEAD_DIM`` in (64, 128), ``0 <= left``, ``0 <= right``, ``left + right <= 256``. Returns the output
+    only (no log-sum-exp).
+    """
+    import torch
+    if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
+        raise InvalidInput("tlx.ops.window_attn_varlen expects rank-3 (tokens, heads, head_dim) Q/K/V tensors")
+    if (k.shape != v.shape or q.shape[0] != k.shape[0] or q.shape[2] != k.shape[2] or k.shape[1] < 1
+            or q.shape[1] % k.shape[1] != 0):
+        raise InvalidInput("tlx.ops.window_attn_varlen expects K/V of identical shape, Q's tokens and head dim, and a "
+                           f"head count dividing Q's; got q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}")
+    if q.dtype != k.dtype or q.dtype != v.dtype:
+        raise InvalidInput("tlx.ops.window_attn_varlen expects Q/K/V to have the same dtype")
+    if q.stride(2) != 1 or k.stride(2) != 1 or v.stride(2) != 1:
+        raise InvalidInput("tlx.ops.window_attn_varlen expects unit-stride head dims")
+    if cu_seqlens.ndim != 1 or cu_seqlens.shape[0] < 2 or cu_seqlens.dtype != torch.int32:
+        raise InvalidInput("tlx.ops.window_attn_varlen expects int32 (batch + 1,) cu_seqlens with batch >= 1")
+    if any(t.device != q.device for t in (k, v, cu_seqlens)):
+        raise InvalidInput("tlx.ops.window_attn_varlen expects all tensors on one device")
+    if (not isinstance(window_size, (tuple, list)) or len(window_size) != 2
+            or any(type(w) is not int or w < 0 for w in window_size) or sum(window_size) > 256):
+        raise InvalidInput("tlx.ops.window_attn_varlen expects window_size=(left, right) with non-negative ints and "
+                           f"left + right <= 256; got {window_size!r}")
+    if sm_scale is not None and not 0 < sm_scale < math.inf:
+        raise InvalidInput(f"tlx.ops.window_attn_varlen expects a positive finite sm_scale; got {sm_scale!r}")
+    if sm_scale is not None and sm_scale * math.log2(math.e) > 3.4028234663852886e38:
+        raise InvalidInput(
+            f"tlx.ops.window_attn_varlen: sm_scale * log2(e) overflows float32; got sm_scale={sm_scale!r}")
+    space_name, invariance = _normalize_space_arg("window_attn_varlen", space)
+    _check_single_config_space("window_attn_varlen", space_name)
+    fn, spec = impl_for("window_attn_varlen", device=q.device)
+    check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[2])
+    check_backward(spec, q, k, v)
+    _check_enforced("window_attn_varlen", spec, invariance)
+    with torch.cuda.device(q.device):
+        return fn(q, k, v, cu_seqlens, tuple(window_size), sm_scale)
 
 
 def _check_lora(name, proj, d_model, out_features):
@@ -1497,6 +2104,18 @@ def _check_sliding_window(op, sliding_window):
         raise InvalidInput(f"tlx.ops.{op} expects a non-negative int sliding_window; got {sliding_window!r}")
 
 
+def _check_kv_descales(name, kv_fp8, k_descale, v_descale, device):
+    import torch
+    if not kv_fp8:
+        if k_descale is not None or v_descale is not None:
+            raise InvalidInput(f"{name}: k_descale / v_descale apply only to a float8_e4m3fn K/V cache")
+        return
+    for arg, t in (("k_descale", k_descale), ("v_descale", v_descale)):
+        if t is None or t.numel() != 1 or t.dtype != torch.float32 or t.device != device:
+            raise InvalidInput(f"{name} expects a one-element float32 {arg} tensor on the query's device with an "
+                               f"FP8 K/V cache")
+
+
 def _check_paged_kv(query, key_cache, value_cache, context_lens, block_tables, query_length, kv_layout):
     import torch
     if query.ndim != 3 or key_cache.ndim != value_cache.ndim or key_cache.ndim not in (4, 5):
@@ -1506,10 +2125,18 @@ def _check_paged_kv(query, key_cache, value_cache, context_lens, block_tables, q
     if kv_layout not in ("HND", "NHD") or (kv_layout == "NHD" and key_cache.ndim != 4):
         raise InvalidInput(f"tlx.ops.paged_attention_decode expects kv_layout 'HND', or 'NHD' for a 4-D cache; got "
                            f"{kv_layout!r} with a {key_cache.ndim}-D cache")
-    if key_cache.dtype != query.dtype or value_cache.dtype != query.dtype:
-        raise InvalidInput("tlx.ops.paged_attention_decode expects query and K/V caches of one dtype")
-    if context_lens.dtype != torch.int32 or block_tables.dtype != torch.int32 or block_tables.ndim != 2:
-        raise InvalidInput("tlx.ops.paged_attention_decode expects int32 context_lens and 2-D int32 block_tables")
+    fp8 = torch.float8_e4m3fn
+    kv_fp8 = key_cache.dtype == fp8
+    if value_cache.dtype != key_cache.dtype or not (kv_fp8 or key_cache.dtype == query.dtype):
+        raise InvalidInput("tlx.ops.paged_attention_decode expects K/V caches of the query's dtype, or "
+                           "float8_e4m3fn K/V caches")
+    if (query.dtype == fp8 and not kv_fp8) or (kv_fp8 and key_cache.ndim != 4):
+        raise InvalidInput("tlx.ops.paged_attention_decode supports a float8_e4m3fn query only with float8_e4m3fn "
+                           "K/V, and FP8 K/V only on a 4-D cache")
+    if context_lens.dtype not in (torch.int32, torch.int64):
+        raise InvalidInput("tlx.ops.paged_attention_decode expects int32 or int64 context_lens")
+    if block_tables.dtype != torch.int32 or block_tables.ndim != 2:
+        raise InvalidInput("tlx.ops.paged_attention_decode expects 2-D int32 block_tables")
     if any(t.device != query.device for t in (key_cache, value_cache, context_lens, block_tables)):
         raise InvalidInput("tlx.ops.paged_attention_decode expects all tensors on one device")
     num_kv_heads = key_cache.shape[2 if kv_layout == "NHD" else 1]
@@ -1522,8 +2149,17 @@ def _check_paged_kv(query, key_cache, value_cache, context_lens, block_tables, q
     return query.shape[1] // num_kv_heads
 
 
+def _decode_compute_dtype(query, out):
+    """Output (and MFMA) dtype: the query's, or for an FP8 query ``out``'s dtype, BF16 by default."""
+    import torch
+    if query.dtype != torch.float8_e4m3fn:
+        return query.dtype
+    return torch.bfloat16 if out is None else out.dtype
+
+
 def paged_attention_decode(query, key_cache, value_cache, context_lens, block_tables, *, sm_scale=None, query_length=1,
                            sliding_window=0, max_context_len=None, out=None, workspace=None, kv_layout="HND",
+                           k_descale=None, v_descale=None, q_descale=None, out_gate=None, out_norm_eps=1e-6,
                            space=None):
     """Forward-only GQA decode attention over a paged K/V cache.
 
@@ -1536,11 +2172,30 @@ def paged_attention_decode(query, key_cache, value_cache, context_lens, block_ta
     kv_heads, head_dim)``, or the AITER-packed 5-D layout from
     ``allocate_paged_kv_cache_5d``. A positive ``sliding_window`` limits each
     query row to its last ``sliding_window`` keys, itself included; pages before
-    the earliest window are never read. ``max_context_len`` bounds every context and
+    the earliest window are never read. ``context_lens`` may be int32 or int64.
+    ``max_context_len`` bounds every context and
     picks the split-K plan; pass it, and a buffer from
     ``paged_attention_decode_workspace``, to keep launches graph-capturable.
+
+    FP8: 4-D ``float8_e4m3fn`` K/V caches take one-element float32 ``k_descale``
+    / ``v_descale`` tensors (K/V = stored value * descale). The query may then be
+    BF16/FP16, or ``float8_e4m3fn`` with ``q_descale``; an FP8 query writes a
+    BF16 output unless ``out`` is FP16.
+
+    Output norm and gate: with a BF16 ``out_gate`` of shape ``(tokens, q_heads * 64)`` (contiguous last dimension,
+    any row stride, so a column slice of a projection output) and head_dim 64, the result is
+    ``rmsnorm_gate(attention, out_gate, eps=out_norm_eps)`` of the BF16 attention output, bitwise, applied in the
+    split-K reduce (the plan then has at least two splits; build the workspace with ``norm_gate=True``).
     """
+    import torch
     group = _check_paged_kv(query, key_cache, value_cache, context_lens, block_tables, query_length, kv_layout)
+    name = "tlx.ops.paged_attention_decode"
+    _check_kv_descales(name, key_cache.dtype == torch.float8_e4m3fn, k_descale, v_descale, query.device)
+    q_fp8 = query.dtype == torch.float8_e4m3fn
+    if q_fp8 != (q_descale is not None) or (q_fp8 and (q_descale.numel() != 1 or q_descale.dtype != torch.float32
+                                                       or q_descale.device != query.device)):
+        raise InvalidInput(f"{name} expects a one-element float32 q_descale exactly when the query is float8_e4m3fn")
+    out_dtype = _decode_compute_dtype(query, out)
     space_name, invariance = _normalize_space_arg("paged_attention_decode", space)
     _check_single_config_space("paged_attention_decode", space_name)
     if sm_scale is None:
@@ -1548,16 +2203,30 @@ def paged_attention_decode(query, key_cache, value_cache, context_lens, block_ta
     if not 0 < sm_scale < math.inf:
         raise InvalidInput(f"tlx.ops.paged_attention_decode expects a positive finite sm_scale; got {sm_scale!r}")
     _check_sliding_window("paged_attention_decode", sliding_window)
-    if out is not None and (out.shape != query.shape or out.dtype != query.dtype or out.device != query.device):
-        raise InvalidInput("tlx.ops.paged_attention_decode expects out to match query's shape, dtype and device")
+    if out is not None and (out.shape != query.shape or out.dtype != out_dtype or out.device != query.device
+                            or out.dtype not in (torch.bfloat16, torch.float16)):
+        raise InvalidInput("tlx.ops.paged_attention_decode expects out to match query's shape, dtype and device "
+                           "(BF16/FP16 for an FP8 query)")
+    if out_gate is not None:
+        rows, q_heads, head_dim = query.shape
+        if (not isinstance(out_gate, torch.Tensor) or head_dim != 64 or out_dtype != torch.bfloat16
+                or out_gate.dtype != torch.bfloat16 or out_gate.shape != (rows, q_heads * 64) or out_gate.stride(1) != 1
+                or out_gate.device != query.device):
+            raise InvalidInput(f"{name} expects head_dim 64, a BF16 output and a BF16 out_gate of shape "
+                               f"({rows}, {q_heads * 64}) with a contiguous last dimension")
+        if not 0 < out_norm_eps < math.inf:
+            raise InvalidInput(f"{name} expects a positive finite out_norm_eps; got {out_norm_eps!r}")
+        if out is not None and torch._C._overlaps(out, out_gate):
+            raise InvalidInput(f"{name} out must not alias out_gate")
     fn, spec = impl_for("paged_attention_decode", device=query.device)
-    check_inputs(spec, dtype=query.dtype, HEAD_DIM=query.shape[2], QLEN=query_length, GROUP=group)
-    check_backward(spec, query, key_cache, value_cache)
+    check_inputs(spec, dtype=out_dtype, HEAD_DIM=query.shape[2], QLEN=query_length, GROUP=group)
+    check_backward(spec, query, key_cache, value_cache, out, out_gate, k_descale, v_descale, q_descale)
     _check_enforced("paged_attention_decode", spec, invariance)
-    import torch
+    gate_kwargs = {} if out_gate is None else dict(out_gate=out_gate, out_norm_eps=float(out_norm_eps))
     with torch.cuda.device(query.device):
         return fn(query, key_cache, value_cache, context_lens, block_tables, float(sm_scale), int(query_length),
-                  int(sliding_window), max_context_len, out, workspace, kv_layout)
+                  int(sliding_window), max_context_len, out, workspace, kv_layout, k_descale=k_descale,
+                  v_descale=v_descale, q_descale=q_descale, **gate_kwargs)
 
 
 def paged_attention_prefill(q, k, v, out, cu_seqlens_q, max_seqlen_q, seqused_k, max_seqlen_k, softmax_scale, causal,
@@ -1576,25 +2245,38 @@ def paged_attention_prefill(q, k, v, out, cu_seqlens_q, max_seqlen_q, seqused_k,
     ``max_seqlen_q`` and ``max_seqlen_k`` bound every sequence's query rows and keys.
     The result is written into ``out``, which is returned.
 
-    Supported subset: causal, BF16/FP16 Q and K/V of one dtype, no softcap, no
-    scales (FP8/FP4), no ALiBi, ``qq_bias`` or sinks, the linear (unshuffled) cache,
-    and ``skip_reduce=False``; anything else raises ``InvalidInput``.
+    Supported subset: causal, BF16/FP16 Q with K/V of Q's dtype or FP8 (e4m3fn) K/V with one-element float32
+    ``k_descale`` / ``v_descale`` (K/V = stored value * descale), no softcap, no Q scales or FP4, no ALiBi,
+    ``qq_bias`` or sinks, the linear (unshuffled) cache, and ``skip_reduce=False``; anything else raises
+    ``InvalidInput``.
     """
     import torch
     name = "tlx.ops.paged_attention_prefill"
     unsupported = {
-        "causal=False": not causal, "softcap": bool(softcap), "q_descale": q_descale is not None, "k_descale": k_descale
-        is not None, "v_descale": v_descale is not None, "q_scales": q_scales is not None, "alibi_slopes": alibi_slopes
-        is not None, "output_scale": output_scale is not None, "qq_bias": qq_bias is not None, "sinks": sinks
-        is not None, "shuffled_kv_cache": bool(shuffled_kv_cache), "skip_reduce": bool(skip_reduce)
+        "causal=False": not causal, "softcap": bool(softcap), "q_descale": q_descale is not None, "q_scales": q_scales
+        is not None, "alibi_slopes": alibi_slopes is not None, "output_scale": output_scale is not None, "qq_bias":
+        qq_bias is not None, "sinks": sinks is not None, "shuffled_kv_cache": bool(shuffled_kv_cache), "skip_reduce":
+        bool(skip_reduce)
     }
     if any(unsupported.values()):
         raise InvalidInput(f"{name} does not support {[key for key, bad in unsupported.items() if bad]}")
     if q.ndim != 3 or k.ndim != 4 or v.shape != k.shape:
         raise InvalidInput(f"{name} expects (tokens, q_heads, head_dim) q and 4-D (blocks, page, kv_heads, head_dim) "
                            f"k/v; got q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}")
-    if k.dtype != q.dtype or v.dtype != q.dtype:
-        raise InvalidInput(f"{name} expects q and k/v of one dtype")
+    kv_fp8 = k.dtype == torch.float8_e4m3fn
+    if v.dtype != k.dtype or not (kv_fp8 or k.dtype == q.dtype):
+        raise InvalidInput(f"{name} expects k/v of q's dtype, or float8_e4m3fn k/v; got q {q.dtype}, k {k.dtype}, "
+                           f"v {v.dtype}")
+    _check_kv_descales(name, kv_fp8, k_descale, v_descale, q.device)
+
+    # FP8 tiles load through int32 buffer offsets, so bound the largest offset the strides reach, not numel().
+    def fp8_loadable(t):
+        last = sum((n - 1) * s for n, s in zip(t.shape, t.stride()))
+        return t.data_ptr() % 16 == 0 and all(s % 16 == 0 for s in t.stride()[:3]) and last < 2**31
+
+    if kv_fp8 and not (fp8_loadable(k) and fp8_loadable(v)):
+        raise InvalidInput(f"{name} expects FP8 k/v with 16-byte aligned base pointers and strides, each spanning "
+                           "under 2**31 elements")
     if k.shape[3] != q.shape[2] or q.stride(2) != 1 or k.stride(3) != 1 or v.stride(3) != 1:
         raise InvalidInput(f"{name} expects one head_dim, contiguous in q and k/v")
     if (cu_seqlens_q.dtype != torch.int32 or block_table.dtype != torch.int32 or block_table.ndim != 2
@@ -1621,25 +2303,26 @@ def paged_attention_prefill(q, k, v, out, cu_seqlens_q, max_seqlen_q, seqused_k,
     _check_single_config_space("paged_attention_prefill", space_name)
     fn, spec = impl_for("paged_attention_prefill", device=q.device)
     check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[2], GROUP=q.shape[1] // num_kv_heads)
-    check_backward(spec, q, k, v)
+    check_backward(spec, q, k, v, out, k_descale, v_descale)
     _check_enforced("paged_attention_prefill", spec, invariance)
     with torch.cuda.device(q.device):
         fn(q, k, v, cu_seqlens_q, seqused_k.to(torch.int32), block_table, max_seqlen_q, sm_scale=float(softmax_scale),
-           sliding_window=int(window_size[0]) + 1, out=out, max_context_len=max_seqlen_k)
+           sliding_window=int(window_size[0]) + 1, out=out, max_context_len=max_seqlen_k, k_descale=k_descale,
+           v_descale=v_descale)
     return out
 
 
 def paged_attention_decode_workspace(query, key_cache, value_cache, block_tables, *, query_length=1, sliding_window=0,
-                                     max_context_len=None, kv_layout="HND"):
+                                     max_context_len=None, kv_layout="HND", norm_gate=False):
     """Reusable FP32 split-K workspace for ``paged_attention_decode`` with the same
-    arguments, or None when the plan needs none."""
+    arguments (``norm_gate=True`` for calls with ``out_gate``), or None when the plan needs none."""
     _check_sliding_window("paged_attention_decode_workspace", sliding_window)
     fn, spec = impl_for("paged_attention_decode_workspace", device=query.device)
-    check_inputs(spec, dtype=query.dtype)
+    check_inputs(spec, dtype=_decode_compute_dtype(query, None))
     import torch
     with torch.cuda.device(query.device):
         return fn(query, key_cache, value_cache, block_tables, int(query_length), int(sliding_window), max_context_len,
-                  kv_layout)
+                  kv_layout, bool(norm_gate))
 
 
 def allocate_paged_kv_cache_5d(num_blocks, num_kv_heads, page_size, head_dim, *, dtype, device):
@@ -1657,3 +2340,153 @@ def reshape_and_cache_5d(key, value, key_cache, value_cache, slot_mapping):
     fn, spec = impl_for("reshape_and_cache_5d", device=key.device)
     check_inputs(spec, dtype=key.dtype)
     return fn(key, value, key_cache, value_cache, slot_mapping)
+
+
+def _check_fp8_paged_kv(query, key_cache, value_cache, block_tables, *, max_context_len, query_length, sliding_window,
+                        num_splits):
+    import torch
+    if query.ndim != 3 or query.shape[0] == 0 or query.shape[1] == 0 or query.shape[2] not in (64, 128):
+        raise InvalidInput("tlx.ops.paged_attention_decode_fp8 expects nonempty Q [tokens, heads, D64/D128]")
+    if query.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        raise InvalidInput("tlx.ops.paged_attention_decode_fp8 expects BF16 or E4M3FN Q")
+    if key_cache.ndim != 5 or value_cache.ndim != 5:
+        raise InvalidInput("tlx.ops.paged_attention_decode_fp8 expects packed 5-D K/V caches")
+    blocks, kv_heads, groups, page, x = key_cache.shape
+    if (blocks == 0 or kv_heads == 0 or query.shape[1] % kv_heads or x != 16 or groups * x != query.shape[2]
+            or page < 16 or page % 16):
+        raise InvalidInput("tlx.ops.paged_attention_decode_fp8: invalid packed K layout or head grouping")
+    if value_cache.shape != (blocks, kv_heads, page // x, query.shape[2], x):
+        raise InvalidInput("tlx.ops.paged_attention_decode_fp8: invalid packed V layout")
+    if key_cache.dtype != torch.float8_e4m3fn or value_cache.dtype != torch.float8_e4m3fn:
+        raise InvalidInput("tlx.ops.paged_attention_decode_fp8 requires plain E4M3FN K/V")
+    if not key_cache.is_contiguous() or not value_cache.is_contiguous():
+        raise InvalidInput("tlx.ops.paged_attention_decode_fp8 requires contiguous packed K/V")
+    if isinstance(query_length,
+                  bool) or not isinstance(query_length, int) or query_length < 1 or query.shape[0] % query_length:
+        raise InvalidInput("tlx.ops.paged_attention_decode_fp8: query_length must divide the query token count")
+    if isinstance(max_context_len, bool) or not isinstance(max_context_len, int) or max_context_len < 1:
+        raise InvalidInput("tlx.ops.paged_attention_decode_fp8 expects a positive integer max_context_len")
+    batch = query.shape[0] // query_length
+    if (block_tables.ndim != 2 or block_tables.shape[0] != batch or block_tables.stride(1) != 1
+            or block_tables.dtype not in (torch.int32, torch.int64)
+            or block_tables.shape[1] < (max_context_len + page - 1) // page):
+        raise InvalidInput("tlx.ops.paged_attention_decode_fp8: block table capacity/layout must cover max_context_len")
+    if any(t.device != query.device for t in (key_cache, value_cache, block_tables)):
+        raise InvalidInput("tlx.ops.paged_attention_decode_fp8 expects all inputs on the query device")
+    _check_sliding_window("paged_attention_decode_fp8", sliding_window)
+    if num_splits is not None and (isinstance(num_splits, bool) or not isinstance(num_splits, int)
+                                   or not 1 <= num_splits <= 1024):
+        raise InvalidInput("tlx.ops.paged_attention_decode_fp8 expects num_splits in [1, 1024]")
+    return batch, kv_heads
+
+
+def paged_attention_decode_fp8(query, key_cache, value_cache, context_lens, block_tables, k_scale, v_scale, *,
+                               max_context_len, q_scale=None, query_length=1, causal=True, sliding_window=0,
+                               sm_scale=None, num_splits=None, out=None, workspace=None, space=None):
+    """Forward-only attention over packed E4M3FN KV with per-head multipliers.
+
+    Q is ``[batch * query_length, query_heads, D]``, BF16 or E4M3FN; D is 64/128.
+    K is ``[blocks, kv_heads, D/16, page_size, 16]`` and V is
+    ``[blocks, kv_heads, page_size/16, D, 16]``, contiguous E4M3FN.
+    ``page_size`` counts cached tokens per physical KV block and is a positive
+    multiple of 16; the inner 16 is a separate packing factor. ``block_tables``
+    maps each sequence's logical page to a physical block id: token t uses
+    entry ``t // page_size`` and within-page offset ``t % page_size``.
+    Separate FP32 ``k_scale``/``v_scale`` vectors have one multiplier per KV
+    head; FP8 Q requires an FP32 ``q_scale`` per query head. Scale values must be positive
+    and finite and inputs finite. This is not E8M0 block-scaled MXFP8.
+
+    ``context_lens`` includes the queries' K/V. Causal queries align with the
+    context's final positions; noncausal query sets share the whole cache.
+    A positive ``sliding_window`` includes the current key and requires causal
+    attention. Empty/fully masked rows produce zero. Context lengths must be
+    in ``[0, max_context_len]`` and referenced page ids valid; these device-side
+    value preconditions are not copied to the host for inspection.
+
+    Returns contiguous BF16 with Q's shape, before output projection. ``out``
+    can supply that allocation. Reuse ``paged_attention_decode_fp8_workspace``
+    with the same planning arguments for graph capture. Allocate both before
+    capture; workspace planning uses the same query/cache shapes, context
+    bound, query length, sliding window and optional split override as attention.
+    Automatic batched single-token decode may choose active splits per request
+    from device context lengths within a fixed graph/workspace capacity. Short
+    requests can bypass split scratch and merge while long requests retain
+    partition parallelism. Explicit split counts override this policy. Only the
+    ``heuristic`` search space is supported; implementation choices remain private.
+    """
+    import torch
+    batch, kv_heads = _check_fp8_paged_kv(query, key_cache, value_cache, block_tables, max_context_len=max_context_len,
+                                          query_length=query_length, sliding_window=sliding_window,
+                                          num_splits=num_splits)
+    if (context_lens.shape != (batch, ) or context_lens.dtype not in (torch.int32, torch.int64)
+            or not context_lens.is_contiguous() or context_lens.device != query.device):
+        raise InvalidInput(
+            "tlx.ops.paged_attention_decode_fp8 expects integer context_lens [batch] on the query device")
+    if not isinstance(causal, bool) or (sliding_window and not causal):
+        raise InvalidInput("tlx.ops.paged_attention_decode_fp8: sliding windows require causal=True")
+    if query.dtype == torch.float8_e4m3fn and q_scale is None:
+        raise InvalidInput("tlx.ops.paged_attention_decode_fp8: FP8 Q requires per-query-head q_scale")
+    if query.dtype == torch.bfloat16 and q_scale is not None:
+        raise InvalidInput("tlx.ops.paged_attention_decode_fp8: q_scale applies only to FP8 Q")
+    for name, scale, heads in (("k_scale", k_scale, kv_heads), ("v_scale", v_scale, kv_heads), ("q_scale", q_scale,
+                                                                                                query.shape[1])):
+        if name == "q_scale" and scale is None:
+            continue
+        if (not isinstance(scale, torch.Tensor) or scale.shape != (heads, ) or scale.dtype != torch.float32
+                or scale.device != query.device or not scale.is_contiguous()):
+            raise InvalidInput(
+                f"tlx.ops.paged_attention_decode_fp8: {name} must be contiguous FP32 [{heads}] on the query device")
+    sm_scale = query.shape[2]**-.5 if sm_scale is None else sm_scale
+    if not isinstance(sm_scale, (int, float)) or isinstance(sm_scale, bool) or not 0 < sm_scale < math.inf:
+        raise InvalidInput("tlx.ops.paged_attention_decode_fp8 expects positive finite sm_scale")
+    if out is not None and (out.shape != query.shape or out.dtype != torch.bfloat16 or out.device != query.device
+                            or not out.is_contiguous()):
+        raise InvalidInput("tlx.ops.paged_attention_decode_fp8 expects contiguous BF16 out with Q's shape/device")
+    if workspace is not None:
+        if not isinstance(workspace, (tuple, list)) or len(workspace) != 2:
+            raise InvalidInput("tlx.ops.paged_attention_decode_fp8 workspace must be a partial/LSE pair")
+        partial, lse = workspace
+        if (not isinstance(partial, torch.Tensor) or not isinstance(lse, torch.Tensor) or partial.ndim != 4
+                or lse.ndim != 3 or partial.shape[:2] != query.shape[:2] or partial.shape[-1] != query.shape[-1]
+                or partial.shape[:-1] != lse.shape
+                or any(t.dtype != torch.float32 or t.device != query.device or not t.is_contiguous()
+                       for t in workspace)):
+            raise InvalidInput("tlx.ops.paged_attention_decode_fp8 expects contiguous FP32 partial/LSE workspace for Q")
+    space_name, invariance = _normalize_space_arg("paged_attention_decode_fp8", space)
+    _check_single_config_space("paged_attention_decode_fp8", space_name)
+    fn, spec = impl_for("paged_attention_decode_fp8", device=query.device)
+    check_inputs(spec, dtype=query.dtype, HEAD_DIM=query.shape[2])
+    check_backward(spec, query, key_cache, value_cache, k_scale, v_scale, q_scale)
+    _check_enforced("paged_attention_decode_fp8", spec, invariance)
+    with torch.cuda.device(query.device):
+        try:
+            return fn(query, key_cache, value_cache, context_lens, block_tables, k_scale, v_scale,
+                      max_context_len=max_context_len, q_scale=q_scale, query_length=query_length, causal=causal,
+                      sliding_window=sliding_window, sm_scale=float(sm_scale), num_splits=num_splits, out=out,
+                      workspace=workspace)
+        except ValueError as error:
+            raise InvalidInput(f"tlx.ops.paged_attention_decode_fp8: {error}") from error
+
+
+def paged_attention_decode_fp8_workspace(query, key_cache, value_cache, block_tables, *, max_context_len,
+                                         query_length=1, sliding_window=0, num_splits=None, space=None):
+    """Allocate reusable opaque FP32 split buffers, or None for a single split.
+
+    Planning arguments must match ``paged_attention_decode_fp8``. Returned
+    capacity shapes are ``[tokens, query_heads, splits, D]`` for partial values
+    and ``[tokens, query_heads, splits]`` for log-sum-exp. Both partial values
+    and log-sum-exp retain FP32 precision; treat their contents as opaque.
+    No device metadata values are read back and no quantization or attention
+    is run. Allocate this workspace and output before graph capture.
+    """
+    import torch
+    _check_fp8_paged_kv(query, key_cache, value_cache, block_tables, max_context_len=max_context_len,
+                        query_length=query_length, sliding_window=sliding_window, num_splits=num_splits)
+    name, invariance = _normalize_space_arg("paged_attention_decode_fp8_workspace", space)
+    _check_single_config_space("paged_attention_decode_fp8_workspace", name)
+    fn, spec = impl_for("paged_attention_decode_fp8_workspace", device=query.device)
+    check_inputs(spec, dtype=query.dtype)
+    _check_enforced("paged_attention_decode_fp8_workspace", spec, invariance)
+    with torch.cuda.device(query.device):
+        return fn(query, key_cache, value_cache, block_tables, max_context_len=max_context_len,
+                  query_length=query_length, sliding_window=sliding_window, num_splits=num_splits)
