@@ -415,8 +415,6 @@ def test_compile_only_dot() -> None:
                r"(.|\n)*"
                r"tcgen05\.relinquish_alloc_permit\.cta_group::1\.sync\.aligned"
                r"(.|\n)*"
-               r"tcgen05\.st\.sync\.aligned\.16x32bx2.x32.b32"
-               r"(.|\n)*"
                r"tcgen05\.mma\.cta_group::1.kind::f16"
                r"(.|\n)*"
                r"tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64"
@@ -427,6 +425,8 @@ def test_compile_only_dot() -> None:
                r"(.|\n)*"
                r"tcgen05.wait::ld.sync.aligned")
     assert re.search(pattern, str(ptx)), "The PTX does not match the expected pattern."
+    # The zero accumulator folds into use_acc = false, so TMEM is not zeroed.
+    assert "tcgen05.st" not in str(ptx)
     assert k.asm["cubin"] != b""
 
 

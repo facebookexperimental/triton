@@ -374,6 +374,13 @@
 - **Fix**: before `doTaskIdPropagate`, if the function has any `ttg.partition`/`async_task_id` tag but some `tt.warp_specialize` loop has none, bail out of WS for the whole function. Placing the skipped loop in a single partition is not safe either, since nothing orders it after the other partitions' writes.
 - **Lit test**: `ws-skip-unpartitioned-second-loop.mlir` (register GEMM loop + pointer-load/TMA-reduce loop through PSM and WS): one `tt.descriptor_reduce`, no `ttg.warp_specialize`. Without the fix the reduce appears 3 times.
 
+### 50. CLC persistent GEMM with a single K tile fails warp specialization (2026-11-06, fixed)
+- **Symptom**: `handleOperandD: MMA operation is not inside a scf.for loop` for a CLC (or atomic-counter) persistent autoWS GEMM with `K == BLOCK_K`. Static persistent is fine.
+- **Root cause**: the one-trip K loop folds away, so the MMA sits directly in the warp-specialized `scf.while` tile loop. `handleOperandD` required an `scf.for`; the TMEM planner only allocated TMEM inside innermost `scf.for` loops (no `buffer.id` -> `doCodePartition` assert); `getLastOpInBlock` asserted an `scf.for` parent. `OptimizeAccumulatorInit` also skipped MMAs outside an `scf.for`, so the zero init stayed a per-tile `tmem_store`.
+- **Fix**: accept the warp-specialized `scf.while` (after region) in `handleOperandD` and as an innermost TMEM-planner loop (only when it holds the MMA directly and has no nested loop); `getLastOpInBlock` uses the ops' block; fold a constant-zero accumulator into `use_acc = false` outside loops too.
+- **Follow-up**: the accumulator stays `buffer.copy = 1` under the while (bug #37's multi-buffering is `scf.for`-only), which serializes MMA and epilogue across tiles; revisit together with cross-tile pipelining of the while.
+- **Tests**: `ws_clc_single_k_tile.mlir`, `accumulator-init.mlir` `@zero_init_in_while`.
+
 ## Debugging Workflow
 - `t.dump` captures IR after each WarpSpec pass (doTaskIdPropagate → doBufferAllocation → doMemoryPlanner → doCodePartition → ...)
 - IR after PartitionSchedulingMeta uses `ttg.partition = array<i32: N>` attributes (not `async_task_id`)
