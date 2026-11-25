@@ -424,14 +424,16 @@ def _is_config_valid(
     tma_epilogue_store: bool = False,
     smem_margin: int = 0,
     elem_bytes: int = resources.OPERAND_ELEM_BYTES,
+    out_elem_bytes: int = resources.OPERAND_ELEM_BYTES,
 ) -> bool:
     """Check if a config is valid based on hardware constraints.
 
-    The epilogue staging buffer is charged only for the TMA store path; see
-    ``resources.estimate_smem``.
+    The epilogue staging buffer is charged only for the TMA store path, at
+    ``out_elem_bytes`` per element; see ``resources.estimate_smem``.
     """
     return validate_config(
-        dataclasses.replace(BlackwellWSGemmConfig.from_dict(config), elem_bytes=elem_bytes),
+        dataclasses.replace(BlackwellWSGemmConfig.from_dict(config), elem_bytes=elem_bytes,
+                            out_elem_bytes=out_elem_bytes),
         charge_epilogue=tma_epilogue_store,
         split_k=config.get("SPLIT_K", 1),
         smem_margin=smem_margin,
@@ -1189,6 +1191,7 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
         num_ctas: int,
         epilogue_subtile: int,
         elem_bytes: int = resources.OPERAND_ELEM_BYTES,
+        out_elem_bytes: int = resources.OPERAND_ELEM_BYTES,
     ) -> bool:
         """Validate the final tile's structural rules and SMEM with a safety margin."""
         return validate_config(
@@ -1204,6 +1207,7 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
                     epilogue_subtile,
                 ),
                 elem_bytes=elem_bytes,
+                out_elem_bytes=out_elem_bytes,
             ),
             charge_epilogue=True,
             smem_margin=cls._SMEM_SAFETY_MARGIN,
@@ -1276,6 +1280,7 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
         # The config pool and the heuristic are sized for 2-byte operands.
         elem_bytes = kernel_inputs.dtype(kernel_inputs._mat1_idx).itemsize
         wide_operands = elem_bytes != resources.OPERAND_ELEM_BYTES
+        out_elem_bytes = kernel_inputs.out_dtype().itemsize
 
         # Try heuristic config selection first (matches tlx_matmul_ws behavior).
         # Always validate without TMA epilogue store, matching upstream TLX.
@@ -1338,6 +1343,7 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
                 NUM_CTAS,
                 heuristic_config["EPILOGUE_SUBTILE"],
                 elem_bytes,
+                out_elem_bytes,
             )
             heuristic_yielded = False
             if skip_heuristic:
@@ -1360,7 +1366,7 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
                     yield template_kwargs
                     heuristic_yielded = True
                 else:
-                    for tma_kwargs in self._yield_tma_variants(template_kwargs, elem_bytes):
+                    for tma_kwargs in self._yield_tma_variants(template_kwargs, elem_bytes, out_elem_bytes):
                         yield tma_kwargs
                         heuristic_yielded = True
 
@@ -1427,6 +1433,7 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
                     NUM_CTAS,
                     EPILOGUE_SUBTILE,
                     elem_bytes,
+                    out_elem_bytes,
             ):
                 continue
 
@@ -1438,12 +1445,13 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
                 }
 
             # Yield TMA epilogue store variant(s)
-            yield from self._yield_tma_variants(template_kwargs, elem_bytes)
+            yield from self._yield_tma_variants(template_kwargs, elem_bytes, out_elem_bytes)
 
     @staticmethod
     def _yield_tma_variants(
         template_kwargs: dict[str, Any],
         elem_bytes: int = resources.OPERAND_ELEM_BYTES,
+        out_elem_bytes: int = resources.OPERAND_ELEM_BYTES,
     ) -> Generator[dict[str, Any], None, None]:
         """Yield TMA_EPILOGUE_STORE=1 (preferred) or TMA=0 fallback.
 
@@ -1474,13 +1482,14 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
             # but can fail after fusion adds SMEM in the final codegen.
             _TMA_SMEM_MARGIN = 8192
             if _is_config_valid(config_dict, tma_epilogue_store=True, smem_margin=_TMA_SMEM_MARGIN,
-                                elem_bytes=elem_bytes):
+                                elem_bytes=elem_bytes, out_elem_bytes=out_elem_bytes):
                 yield {**template_kwargs, "TMA_EPILOGUE_STORE": 1}
             else:
                 yield {**template_kwargs, "TMA_EPILOGUE_STORE": 0}
         else:
             # 2-CTA requires TMA (tl.store incompatible with MultiCTAReduction)
-            if _is_config_valid(config_dict, tma_epilogue_store=True, elem_bytes=elem_bytes):
+            if _is_config_valid(config_dict, tma_epilogue_store=True, elem_bytes=elem_bytes,
+                                out_elem_bytes=out_elem_bytes):
                 yield {**template_kwargs, "TMA_EPILOGUE_STORE": 1}
 
 
@@ -4165,6 +4174,80 @@ def _device_tma_for_epilogue_operands(kernel, epilogue_nodes) -> None:  # type: 
     log.debug("tlx hopper template: device-side TMA for %s, read by the fused epilogue", sorted(overrides))
 
 
+_BLACKWELL_WS_META_KEYS = frozenset({
+    "NUM_SMEM_BUFFERS", "NUM_TMEM_BUFFERS", "NUM_MMA_GROUPS", "EPILOGUE_SUBTILE", "BLOCK_M_SPLIT", "slice_size",
+    "TMA_EPILOGUE_STORE", "NUM_CTAS"
+})
+# Headroom for fused-epilogue scratch on top of the operand ring, barriers and
+# the output staging buffers.
+_BLACKWELL_WS_FUSED_SMEM_MARGIN = 4096
+
+
+def _blackwell_ws_tma_smem(meta: dict[str, Any], elem_bytes: int, out_elem_bytes: int) -> int:
+    """SMEM of a Blackwell WS config whose TMA epilogue stages ``out_elem_bytes`` outputs."""
+    tile = BlackwellWSGemmConfig(
+        block_m=meta["BLOCK_M"],
+        block_n=meta["BLOCK_N"],
+        block_k=meta["BLOCK_K"],
+        num_smem_buffers=meta["NUM_SMEM_BUFFERS"],
+        num_tmem_buffers=meta["NUM_TMEM_BUFFERS"],
+        num_mma_groups=meta["NUM_MMA_GROUPS"],
+        num_ctas=meta["NUM_CTAS"],
+        epilogue_subtile=meta["EPILOGUE_SUBTILE"],
+        elem_bytes=elem_bytes,
+        out_elem_bytes=out_elem_bytes,
+    )
+    return resources.BlackwellWSGemmModel.estimate_smem(tile, charge_epilogue=True)
+
+
+def _maybe_fit_blackwell_ws_fused_epilogue(  # type: ignore[no-untyped-def]
+        kernel, template_node, epilogue_nodes) -> None:
+    """Keep a Blackwell WS TMA-epilogue config within SMEM after fusion widens its output.
+
+    Configs are validated for the template's own output dtype; a wider fused output (e.g. ``.float()``)
+    can overflow SMEM, which is fatal when the choice was not benchmarked.
+    """
+    meta = kernel.meta
+    if not epilogue_nodes or not _BLACKWELL_WS_META_KEYS <= meta.keys() or not current_target().is_blackwell:
+        return
+    if not meta["TMA_EPILOGUE_STORE"] or meta.get("SPLIT_K", 1) != 1:
+        return
+    out_name = getattr(kernel, "_final_output_name", None)
+    if out_name is None:
+        return
+    out_bytes = V.graph.get_dtype(out_name).itemsize
+    if out_bytes <= template_node.node.get_dtype().itemsize:
+        return
+    # A (after any addmm bias prefix input) sets the operand ring's element size.
+    elem_bytes = kernel.input_nodes[getattr(kernel, "prefix_args", 0)].get_dtype().itemsize
+    fitted = dict(meta)
+    limit = BLACKWELL_LIMITS.on_chip_bytes - _BLACKWELL_WS_FUSED_SMEM_MARGIN
+    while _blackwell_ws_tma_smem(fitted, elem_bytes, out_bytes) > limit:
+        # A 32-wide fp32 slice is the narrowest 128-byte TMA box.
+        if fitted["slice_size"] >= 64:
+            fitted["EPILOGUE_SUBTILE"] *= 2
+            fitted["slice_size"] //= 2
+        elif fitted["NUM_SMEM_BUFFERS"] > 2:
+            fitted["NUM_SMEM_BUFFERS"] -= 1
+        else:
+            break
+    changed = [key for key in ("EPILOGUE_SUBTILE", "slice_size", "NUM_SMEM_BUFFERS") if fitted[key] != meta[key]]
+    if not changed:
+        return
+    # These reach the kernel only through their constexpr defines; meta is
+    # shared with the unfused renders of this choice, so copy it.
+    if _blackwell_ws_tma_smem(fitted, elem_bytes, out_bytes) > BLACKWELL_LIMITS.on_chip_bytes:
+        log.warning("tlx_blackwell_gemm_ws: fused %d-byte epilogue output does not fit in SMEM", out_bytes)
+    for key in changed:
+        kernel.defines, count = re.subn(rf"^{key} : tl\.constexpr = \d+$", f"{key} : tl.constexpr = {fitted[key]}",
+                                        kernel.defines, flags=re.M)
+        if count != 1:
+            raise AssertionError(f"expected one {key} define in the TLX blackwell_gemm_ws kernel, found {count}")
+    kernel.meta = fitted
+    log.debug("tlx_blackwell_gemm_ws: %s for a %d-byte fused epilogue output",
+              ", ".join(f"{key} {meta[key]} -> {fitted[key]}" for key in changed), out_bytes)
+
+
 def _tlx_codegen_template_body(  # type: ignore[no-untyped-def]
     self,
     scheduling,
@@ -4183,6 +4266,7 @@ def _tlx_codegen_template_body(  # type: ignore[no-untyped-def]
         last_names = epilogue_nodes[-1].get_buffer_names()
         if len(last_names) == 1:
             self._final_output_name = next(iter(last_names))
+            _maybe_fit_blackwell_ws_fused_epilogue(self, template_node, epilogue_nodes)
 
     # Wrap the original render to also handle COMPUTE_EPILOGUE subgraphs.
     orig_render = render
