@@ -8876,17 +8876,8 @@ def test_attention_backward_occ1_assembly(shape, q_splits, packed_dq):
     assert int(re.search(r"\.vgpr_count:\s*(\d+)", assembly)[1]) <= 1024
     # TODO(T298388915): restore spill-free codegen for the admitted sizes below.
     expected_private = {
-        ((1, 8, 2, 512), 3, True): 24,
         ((1, 8, 2, 4096), 1, False): 16,
-        ((1, 8, 2, 4096), 1, True): 32,
         ((1, 8, 2, 8192), 1, False): 16,
-        ((1, 8, 2, 8192), 1, True): 32,
-        ((1, 4, 4, 512), 2, True): 12,
-        ((1, 4, 4, 512), 3, True): 24,
-        ((1, 4, 4, 512), 4, True): 24,
-        ((1, 64, 8, 512), 2, True): 12,
-        ((1, 64, 8, 512), 3, True): 24,
-        ((1, 64, 8, 512), 4, True): 24,
     }.get((shape, q_splits, packed_dq), 0)
     assert int(re.search(r"\.private_segment_fixed_size:\s*(\d+)", assembly)[1]) == expected_private
     assert kernel.metadata.shared == (215536 if config.occ1_pad_k else 211456)
@@ -8965,15 +8956,15 @@ def test_attention_backward_occ1_war_drain_assembly(shape, packed_dq):
     # TODO(T298388915): restore spill-free codegen for the admitted sizes below.
     assert privates == {
         ((16, 16, 16, 16384), False): [0, 16],
-        ((16, 16, 16, 16384), True): [8, 32],
+        ((16, 16, 16, 16384), True): [8, 0],
         ((8, 64, 8, 8192), False): [0, 16],
-        ((8, 64, 8, 8192), True): [8, 28],
+        ((8, 64, 8, 8192), True): [8, 8],
     }[(shape, packed_dq)]
     assert drains == {
-        ((16, 16, 16, 16384), False): [16, 17],
-        ((16, 16, 16, 16384), True): [16, 16],
-        ((8, 64, 8, 8192), False): [16, 17],
-        ((8, 64, 8, 8192), True): [16, 15],
+        ((16, 16, 16, 16384), False): [14, 11],
+        ((16, 16, 16, 16384), True): [14, 11],
+        ((8, 64, 8, 8192), False): [14, 11],
+        ((8, 64, 8, 8192), True): [14, 11],
     }[(shape, packed_dq)]
 
 
@@ -9103,25 +9094,25 @@ def test_attention_backward_occ1_tail_assembly(shape, packed_dq):
     # TODO(T298388915): restore spill-free codegen for the admitted sizes below.
     expected_private = {
         ((16, 16, 16, 1024), False): 20,
-        ((16, 16, 16, 1024), True): 12,
+        ((16, 16, 16, 1024), True): 0,
         ((8, 64, 8, 1024), False): 16,
-        ((8, 64, 8, 1024), True): 28,
+        ((8, 64, 8, 1024), True): 8,
         ((16, 64, 8, 1024), False): 16,
-        ((16, 64, 8, 1024), True): 28,
+        ((16, 64, 8, 1024), True): 8,
         ((8, 64, 8, 2048), False): 16,
-        ((8, 64, 8, 2048), True): 28,
+        ((8, 64, 8, 2048), True): 8,
         ((16, 64, 8, 2048), False): 16,
-        ((16, 64, 8, 2048), True): 28,
+        ((16, 64, 8, 2048), True): 8,
         ((8, 64, 8, 4096), False): 16,
-        ((8, 64, 8, 4096), True): 28,
+        ((8, 64, 8, 4096), True): 8,
         ((1, 4, 4, 512), False): 16,
-        ((1, 4, 4, 512), True): 24,
-        ((2, 4, 4, 512), False): 16,
-        ((2, 4, 4, 512), True): 12,
+        ((1, 4, 4, 512), True): 0,
+        ((2, 4, 4, 512), False): 12,
+        ((2, 4, 4, 512), True): 0,
         ((1, 8, 1, 512), False): 16,
-        ((1, 8, 1, 512), True): 24,
+        ((1, 8, 1, 512), True): 0,
         ((2, 8, 1, 512), False): 16,
-        ((2, 8, 1, 512), True): 24,
+        ((2, 8, 1, 512), True): 0,
     }[(shape, packed_dq)]
     assert int(re.search(r"\.private_segment_fixed_size:\s*(\d+)", assembly)[1]) == expected_private
     assert kernel.metadata.shared == (215536 if config.occ1_pad_k else 211456)
