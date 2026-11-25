@@ -161,7 +161,7 @@ def _wmma(version, a, b, acc, semantic):
     return ttgl.tensor(handle, acc.type)
 
 
-def _mma_scaled(a, a_scale, a_format, b, b_scale, b_format, acc, scale_fn, semantic):
+def _mma_scaled(a, a_scale, a_format, b, b_scale, b_format, acc, scale_fn, semantic, packed=False):
     """ Shared implementation for AMD WMMA scaled and MFMA scaled operation. """
 
     def _unpacked_k(packed_k, format):
@@ -230,7 +230,7 @@ def _mma_scaled(a, a_scale, a_format, b, b_scale, b_format, acc, scale_fn, seman
     a_scale = _create_and_broadcast_default_scale(0, a_scale, a_format, scale_factor)
     b_scale = _create_and_broadcast_default_scale(1, b_scale, b_format, scale_factor)
     output = semantic.dot_scaled(a, a_scale, a_format, b, b_scale, b_format, acc, fast_math=False, lhs_k_pack=True,
-                                 rhs_k_pack=True, out_dtype=ttgl.float32)
+                                 rhs_k_pack=True, out_dtype=ttgl.float32, fp6_packed=packed)
     return ttgl.tensor(output.handle, acc.type)
 
 

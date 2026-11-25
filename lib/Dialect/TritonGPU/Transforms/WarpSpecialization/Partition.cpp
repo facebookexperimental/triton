@@ -48,7 +48,7 @@ LogicalResult verifyPartitionIdsAttr(Operation *op, StringRef attrName,
 }
 
 LogicalResult verifyPartitionAttrs(Operation *op) {
-  bool useMetaWS = triton::tools::getBoolEnv("TRITON_USE_META_WS");
+  bool useMetaWS = triton::isMetaWSEnabled(op);
   // META_WS_CHANGE: PSM intentionally leaves some nested operations without
   // partition annotations for later task-id propagation.
   if (op->hasAttr(kWarpSpecializeAttrName) && !useMetaWS) {
@@ -376,7 +376,7 @@ FailureOr<PartitionSet> PartitionSet::fromLoop(LoopLikeOpInterface loop) {
     });
   bool isMetaWhile =
       isa<scf::WhileOp>(loop.getOperation()) &&
-      (triton::tools::getBoolEnv("TRITON_USE_META_WS") || hasMetaTypes);
+      (triton::isMetaWSEnabled(loop.getOperation()) || hasMetaTypes);
   if (!isMetaWhile && failed(verifyPartitionedLoop(loop)))
     return failure();
   auto stages = loop->getAttrOfType<ArrayAttr>(kPartitionStagesAttrName);

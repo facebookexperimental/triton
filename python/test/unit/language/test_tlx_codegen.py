@@ -7557,6 +7557,11 @@ def _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, c_type="*f
                   XCD_REMAP_MODE=0, NUM_XCDS=8, XCD_CHUNK=2, CLUSTER_SIZE=1, CLUSTER_MULTICAST=True,
                   CLUSTER_BARRIER_INTERVAL=1, CLUSTER_LAYOUT="linear")
     config.update(constants)
+    # ASTSource does not apply parameter defaults; constexprs the caller leaves
+    # out would otherwise arrive as None.
+    for param in kernel.params:
+        if param.is_constexpr and param.has_default and param.name not in config:
+            config[param.name] = param.default
     src = ASTSource(kernel, signature=signature, attrs=attrs, constexprs=config)
     compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32),
                               options=dict(num_warps=4, waves_per_eu=1, ctas_per_cga=(config["CLUSTER_SIZE"], 1, 1)))
@@ -8111,6 +8116,78 @@ def test_amd_scaled_downcast_fp8_constant_scale(block):
     assert "fdiv" not in kernel.asm["llir"]
     assert "v_cvt_scalef32_pk_fp8_f32" in kernel.asm["amdgcn"]
     assert "s_nop" not in kernel.asm["llir"]
+
+
+@triton.jit
+def _amd_scaled_upcast_fp4_kernel(X, S, Y, M: tl.constexpr, K: tl.constexpr, SF: tl.constexpr, F16: tl.constexpr):
+    rows = tl.arange(0, M)[:, None]
+    x = tl.load(X + rows * (K // 2) + tl.arange(0, K // 2)[None, :])
+    s = tl.load(S + rows * (K // SF) + tl.arange(0, K // SF)[None, :])
+    if F16:
+        y = tlx.amd_scaled_upcast_fp4(x, s, tl.float16, axis=1)
+    else:
+        y = tlx.amd_scaled_upcast_fp4(x, s)
+    tl.store(Y + rows * K + tl.arange(0, K)[None, :], y)
+
+
+@triton.jit
+def _amd_scaled_downcast_fp4_kernel(X, S, Y, M: tl.constexpr, K: tl.constexpr, SF: tl.constexpr):
+    rows = tl.arange(0, M)[:, None]
+    v = tl.load(X + rows * K + tl.arange(0, K)[None, :])
+    s = tl.load(S + rows * (K // SF) + tl.arange(0, K // SF)[None, :])
+    q = tlx.amd_scaled_downcast_fp4(v, s, axis=1)
+    tl.store(Y + rows * (K // 2) + tl.arange(0, K // 2)[None, :], q)
+
+
+def _compile_scaled_fp4(kernel, x_ty, y_ty, sf=32, f16=None, arch="gfx1250", warp_size=32):
+    signature = {"X": x_ty, "S": "*u8", "Y": y_ty, "M": "constexpr", "K": "constexpr", "SF": "constexpr"}
+    constexprs = {"M": 32, "K": 128, "SF": sf}
+    if f16 is not None:
+        signature["F16"] = "constexpr"
+        constexprs["F16"] = f16
+    source = ASTSource(kernel, signature=signature, constexprs=constexprs)
+    return triton_compile(source, target=GPUTarget("hip", arch, warp_size), options={"num_warps": 4})
+
+
+_SCALED_FP4_TARGETS = [("gfx1250", 32), ("gfx950", 64)]
+
+
+@pytest.mark.parametrize("arch,warp_size", _SCALED_FP4_TARGETS)
+@pytest.mark.parametrize("f16", [False, True])
+@pytest.mark.parametrize("sf", [32, 8])
+def test_amd_scaled_upcast_fp4(sf, f16, arch, warp_size):
+    kernel = _compile_scaled_fp4(_amd_scaled_upcast_fp4_kernel, "*u8", "*fp16" if f16 else "*bf16", sf=sf, f16=f16,
+                                 arch=arch, warp_size=warp_size)
+    assert "amdg.scaled_upcast_fp4" in kernel.asm["ttgir"]
+    insn = "v_cvt_scale_pk8_{}_fp4" if arch == "gfx1250" else "v_cvt_scalef32_pk_{}_fp4"
+    assert insn.format("f16" if f16 else "bf16") in kernel.asm["amdgcn"]
+    assert "llvm.inline" not in kernel.asm["ttgir"]
+
+
+@pytest.mark.parametrize("arch,warp_size", _SCALED_FP4_TARGETS)
+@pytest.mark.parametrize("x_ty,suffix", [("*fp32", "f32"), ("*bf16", "bf16"), ("*fp16", "f16")])
+def test_amd_scaled_downcast_fp4(x_ty, suffix, arch, warp_size):
+    kernel = _compile_scaled_fp4(_amd_scaled_downcast_fp4_kernel, x_ty, "*u8", arch=arch, warp_size=warp_size)
+    assert "amdg.scaled_downcast_fp4" in kernel.asm["ttgir"]
+    insn = "v_cvt_scalef32_pk8_fp4_{}" if arch == "gfx1250" else "v_cvt_scalef32_pk_fp4_{}"
+    assert insn.format(suffix) in kernel.asm["amdgcn"]
+
+
+def test_amd_scaled_fp4_rejects_other_targets():
+    with pytest.raises(CompilationError, match="requires gfx950 or gfx1250"):
+        _compile_scaled_fp4(_amd_scaled_upcast_fp4_kernel, "*u8", "*bf16", f16=False, arch="gfx942", warp_size=64)
+
+
+def test_amd_scaled_downcast_fp4_rejects_short_scale_block():
+    with pytest.raises(CompilationError, match="multiple of 8"):
+        _compile_scaled_fp4(_amd_scaled_downcast_fp4_kernel, "*fp32", "*u8", sf=4)
+
+
+@pytest.mark.parametrize("sf", [1, 4])
+def test_amd_scaled_upcast_fp4_rejects_short_scale_block(sf):
+    # Both lowerings apply one scale per group of 8 converted values.
+    with pytest.raises(CompilationError, match="multiple of 8"):
+        _compile_scaled_fp4(_amd_scaled_upcast_fp4_kernel, "*u8", "*bf16", sf=sf, f16=False)
 
 
 @triton.jit
