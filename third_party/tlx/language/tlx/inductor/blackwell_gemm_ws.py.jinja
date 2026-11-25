@@ -96,7 +96,7 @@ from triton.tlx.ops.kernels.mm._sm100_core import (
         {{output_ptr()}}.dtype.element_ty,
         NUM_EPILOGUE_SMEM_BUFFERS,
     )
-    stride_cm = {{stride(None, 0)}}
+    stride_cm = {{output_stride(0)}}
     desc_c = tl.make_tensor_descriptor(
         {{output_ptr()}}, shape=[M, N], strides=[stride_cm, 1],
         block_shape=[BLOCK_M_SPLIT, slice_size])
