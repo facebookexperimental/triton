@@ -13,7 +13,7 @@ mkdir -p "$consumer"
 cat > "$consumer/CMakeLists.txt" <<'CMAKE'
 cmake_minimum_required(VERSION 3.20)
 project(llvm_sdk_consumer LANGUAGES C CXX)
-find_package(LLVM REQUIRED CONFIG)
+find_package(LLVM REQUIRED CONFIG PATHS "${LLVM_DIR}" NO_DEFAULT_PATH)
 add_executable(sdk_consumer main.cpp)
 target_compile_features(sdk_consumer PRIVATE cxx_std_17)
 target_include_directories(sdk_consumer PRIVATE ${LLVM_INCLUDE_DIRS})

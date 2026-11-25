@@ -619,12 +619,11 @@ def test_compile_only_dot_mxfp6_sm100(block_k: int, monkeypatch) -> None:
 
 @pytest.mark.parametrize("nonkdim", [16, 32])
 def test_compile_only_dot_mxfp6_gfx950(nonkdim: int) -> None:
-    # MXFP6 stays native on gfx950 for blocked K=128 tiles: the kernel
-    # unpacks its dense factor-3-packed K in-register and feeds the
-    # unpacked codes to `tl.dot_scaled`, which lowers to native
-    # v_mfma_scale_*_f8f6f4 instead of decomposing to a plain bf16 dot.
-    # Storage is dense (4 values per 3 bytes); BLOCK_K is the logical
-    # width.
+    # Dense MXFP6 without `fp6_packed` decomposes to a plain bf16 dot on
+    # gfx950: only the TLX native kernel (which passes `fp6_packed=True`
+    # for per-segment packed fragments) lowers to native
+    # v_mfma_scale_*_f8f6f4. Storage is dense (4 values per 3 bytes);
+    # BLOCK_K is the logical width.
 
     k = triton.compile(
         triton.compiler.ASTSource(
@@ -645,8 +644,8 @@ def test_compile_only_dot_mxfp6_gfx950(nonkdim: int) -> None:
         options={"matrix_instr_nonkdim": nonkdim},
     )
     amdgcn = k.asm["amdgcn"]
-    assert re.search(r"v_mfma_scale_f32_", amdgcn), "The AMDGCN does not contain scaled v_mfma_scale_f32 instructions."
-    assert not re.search(r"v_mfma_f32_", amdgcn), "The AMDGCN unexpectedly contains plain v_mfma_f32 instructions."
+    assert re.search(r"v_mfma_f32_", amdgcn), "The AMDGCN does not contain plain v_mfma_f32 instructions."
+    assert "f8f6f4" not in amdgcn, "The AMDGCN unexpectedly uses the native f8f6f4 instruction."
 
 
 def test_compile_only_dot_mxfp6_gfx1250(monkeypatch) -> None:
@@ -739,3 +738,25 @@ def test_fp8_compiles_for_multiple_architectures_cuda():
     src = ASTSource(fn=fp8_convert, signature={"src": "*fp32", "dst": "*fp8e5"}, constexprs={})
     triton.compile(src, target=GPUTarget("cuda", 90, 32))
     triton.compile(src, target=GPUTarget("cuda", 80, 32))
+
+
+def test_compile_only_use_slp_vectorizer_option(monkeypatch) -> None:
+    # The per-kernel option must select the same LLVM vectorizer as the
+    # TRITON_USE_SLP_VECTORIZER knob, and differ from the default
+    # target-aware NVPTX vectorizer on a kernel where the two disagree.
+
+    @triton.jit
+    def bf16_mad_kernel(x_ptr, y_ptr):
+        offsets = tl.arange(0, 512)
+        x = tl.load(x_ptr + offsets).to(tl.float32)
+        tl.store(y_ptr + offsets, (x * 1.5 + x).to(tl.bfloat16))
+
+    monkeypatch.setenv("TRITON_ALWAYS_COMPILE", "1")
+    src = ASTSource(fn=bf16_mad_kernel, signature={"x_ptr": "*bf16", "y_ptr": "*bf16"})
+    target = GPUTarget("cuda", 90, 32)
+    default = triton.compile(src, target=target).asm["llir"]
+    option = triton.compile(src, target=target, options={"use_slp_vectorizer": True}).asm["llir"]
+    monkeypatch.setenv("TRITON_USE_SLP_VECTORIZER", "1")
+    knob = triton.compile(src, target=target).asm["llir"]
+    assert option == knob
+    assert option != default
