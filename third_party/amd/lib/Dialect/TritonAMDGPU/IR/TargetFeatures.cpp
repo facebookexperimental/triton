@@ -143,6 +143,11 @@ int TargetFeatures::getWarpSize() const {
   }
 }
 
+unsigned TargetFeatures::getCoalescingSectorBytes() const {
+  // TODO: Extend sector scoring to other GPU architectures.
+  return isCDNA4() ? 32 : 0;
+}
+
 bool TargetFeatures::supportsWaveId() const {
   return getISAFamily() == ISAFamily::RDNA4 ||
          getISAFamily() == ISAFamily::CDNA5;

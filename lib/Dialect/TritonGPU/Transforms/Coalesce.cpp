@@ -112,8 +112,8 @@ struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
     // Run axis info analysis
     ModuleOp moduleOp = getOperation();
     ModuleAxisInfoAnalysis axisInfoAnalysis(moduleOp);
-    CoalescedEncodingAnalysis coalescedEncodingAnalysis(axisInfoAnalysis,
-                                                        maxVecBits);
+    CoalescedEncodingAnalysis coalescedEncodingAnalysis(
+        axisInfoAnalysis, maxVecBits, sectorBytes);
 
     // For each i/o operation, we determine what layout
     // the pointers should have for best memory coalescing

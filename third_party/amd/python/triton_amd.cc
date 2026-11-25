@@ -1,4 +1,5 @@
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
+#include "Dialect/TritonAMDGPU/IR/TargetFeatures.h"
 #include "TritonAMDGPUToLLVM/MembarUtility.h"
 #include "TritonAMDGPUToLLVM/Passes.h"
 #include "TritonAMDGPUTransforms/Passes.h"
@@ -13,6 +14,7 @@
 #include "mlir/Target/LLVMIR/Dialect/ROCDL/ROCDLToLLVMIRTranslation.h"
 #include "passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonInstrument/Transforms/Passes.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LLVMOptions.h"
@@ -144,6 +146,14 @@ void init_triton_amd_passes_ttgpuir(py::module_ &m) {
                             mlir::createTritonAMDGPUScheduleLoops, int);
   ADD_PASS_OPTION_WRAPPER_2("add_pipeline", mlir::createTritonAMDGPUPipeline,
                             bool, bool);
+  m.def("add_coalesce", [](mlir::PassManager &pm, const std::string &arch,
+                           unsigned maxVecBits) {
+    gpu::TritonGPUCoalesceOptions options;
+    options.maxVecBits = maxVecBits;
+    options.sectorBytes = amdgpu::TargetFeatures(llvm::StringRef(arch))
+                              .getCoalescingSectorBytes();
+    pm.addPass(gpu::createTritonGPUCoalesce(options));
+  });
   ADD_PASS_WRAPPER_0("add_coalesce_buffer_ops",
                      mlir::createTritonAMDGPUCoalesceBufferOps);
   ADD_PASS_OPTION_WRAPPER_2("add_coalesce_async_copy",
