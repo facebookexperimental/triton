@@ -24,6 +24,7 @@
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Pass/Pass.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
+#include "nvidia/hopper/lib/Transforms/WarpSpecialization/WarpSpecializationPipeline.h"
 #include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -283,6 +284,13 @@ struct Transform2CTALoads
       }
       if (registerSplitBAllocs.contains(b.getDefiningOp()))
         mma->setAttr(ttng::AttrTwoCTARegisterBName,
+                     UnitAttr::get(mma->getContext()));
+      // The leader also reads the peer CTA's A half. A descriptor-loaded A
+      // that is also read in registers (or that TMA cannot write in the MMA's
+      // layout) keeps a register to shared-memory copy, since the bridge fold
+      // is 1-CTA only, so each CTA writes its A half with generic stores.
+      if (isRegisterStagedMMAOperand(mma.getA()))
+        mma->setAttr(ttng::AttrTwoCTARegisterAName,
                      UnitAttr::get(mma->getContext()));
     }
 

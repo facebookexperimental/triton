@@ -133,43 +133,49 @@ getTMAWritableEncoding(tt::DescriptorLoadOp load, RankedTensorType tensorType,
 //    synchronous (warp_group_dot_wait 0) unless its shared operands are
 //    multi-buffered or loop-invariant, so a register-staged operand is never
 //    overwritten while a wgmma still reads it.
+bool isRegisterStagedMMAOperand(Value operand) {
+  while (auto trans = operand.getDefiningOp<ttg::MemDescTransOp>())
+    operand = trans.getSrc();
+  auto alloc = operand.getDefiningOp<ttg::LocalAllocOp>();
+  if (!alloc || !alloc.getSrc())
+    return false;
+  Value src = alloc.getSrc();
+  while (auto cvt = src.getDefiningOp<ttg::ConvertLayoutOp>())
+    src = cvt.getSrc();
+  // A gather is never lowered to a TMA copy into its alloc, so the alloc is
+  // always filled from registers.
+  if (src.getDefiningOp<tt::DescriptorGatherOp>())
+    return true;
+  auto load = src.getDefiningOp<tt::DescriptorLoadOp>();
+  if (!load)
+    return false;
+  // Mirror doConvertDescriptorLoadsToNVWS: the TMA copy lands in the alloc only
+  // when the alloc is the load's sole user and a legal destination.
+  auto tensorType = dyn_cast<RankedTensorType>(load.getType());
+  Attribute descEnc =
+      cast<tt::TensorDescType>(load.getDesc().getType()).getSharedLayout();
+  bool fused =
+      tensorType && load->hasOneUse() &&
+      *load->user_begin() == alloc.getOperation() &&
+      getTMAWritableEncoding(load, tensorType,
+                             cast<ttg::MemDescType>(alloc.getType()), descEnc);
+  return !fused;
+}
+
 bool hasRegisterStagedMMAOperand(triton::FuncOp funcOp) {
   bool found = false;
   funcOp.walk([&](ttng::MMAv5OpInterface mma) {
     SmallVector<AsyncTaskId> mmaTasks = getAsyncTaskIds(mma);
     for (Value operand : {mma.getA(), mma.getB()}) {
-      while (auto trans = operand.getDefiningOp<ttg::MemDescTransOp>())
-        operand = trans.getSrc();
-      auto alloc = operand.getDefiningOp<ttg::LocalAllocOp>();
-      if (!alloc || !alloc.getSrc())
-        continue;
-      if (!llvm::any_of(getAsyncTaskIds(alloc), [&](AsyncTaskId id) {
+      Value root = operand;
+      while (auto trans = root.getDefiningOp<ttg::MemDescTransOp>())
+        root = trans.getSrc();
+      auto alloc = root.getDefiningOp<ttg::LocalAllocOp>();
+      if (!alloc || !llvm::any_of(getAsyncTaskIds(alloc), [&](AsyncTaskId id) {
             return llvm::is_contained(mmaTasks, id);
           }))
         continue;
-      Value src = alloc.getSrc();
-      while (auto cvt = src.getDefiningOp<ttg::ConvertLayoutOp>())
-        src = cvt.getSrc();
-      // A gather is never lowered to a TMA copy into its alloc, so the alloc
-      // is always filled from registers.
-      if (src.getDefiningOp<tt::DescriptorGatherOp>()) {
-        found = true;
-        return WalkResult::interrupt();
-      }
-      auto load = src.getDefiningOp<tt::DescriptorLoadOp>();
-      if (!load)
-        continue;
-      // Mirror doConvertDescriptorLoadsToNVWS: the TMA copy lands in the alloc
-      // only when the alloc is the load's sole user and a legal destination.
-      auto tensorType = dyn_cast<RankedTensorType>(load.getType());
-      Attribute descEnc =
-          cast<tt::TensorDescType>(load.getDesc().getType()).getSharedLayout();
-      bool fused = tensorType && load->hasOneUse() &&
-                   *load->user_begin() == alloc.getOperation() &&
-                   getTMAWritableEncoding(
-                       load, tensorType,
-                       cast<ttg::MemDescType>(alloc.getType()), descEnc);
-      if (!fused) {
+      if (isRegisterStagedMMAOperand(operand)) {
         found = true;
         return WalkResult::interrupt();
       }
