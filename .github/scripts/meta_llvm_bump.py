@@ -223,6 +223,78 @@ def verdict(latest):
     return "ready" if all(run["conclusion"] == "success" for run in latest.values()) else "failed"
 
 
+def readiness_text(kind, sha, tree, build, branch, source_url, ready_url, marker):
+    return '\n'.join([
+        marker,
+        '',
+        f'The beta {kind} LLVM bundle is published and all required SDK validations passed.',
+        '',
+        f'- LLVM source: [`{sha[:12]}`](https://github.com/facebookexperimental/llvm-project/commit/{sha}) on `{branch}`.',
+        f'- Source tree: `{tree}`. Packaging revision: `{build}`.',
+        f'- [Source record]({source_url}) and [SDK validation record]({ready_url}).',
+        '',
+        'Triton correctness and A/B performance have not been verified by this SDK build. '
+        'Use a candidate PR to validate the consumer before adoption.',
+        '',
+        'Keep this issue open until the manifest update lands and the exported consumer pin is verified. '
+        'This issue does not authorize landing.',
+        '',
+    ])
+
+
+def candidate_text(kind, old, source, ready_url, base_sha):
+    """Draft-candidate text in the updater's Summary/Test Plan format."""
+    sha, build = source['llvm_sha'], source['build_number']
+    title = f'[Meta LLVM] {kind} bundle candidate: {old["llvm_hash"][:8]} to {sha[:8]}'
+    problem = (
+        f'Triton at {base_sha[:12]} selects the {kind} SDK at {old["llvm_hash"][:12]}. The tracked LLVM branch has '
+        'a validated bundle that has not yet been checked with this Triton consumer.')
+    solution = 'This proposes the published SDK as a draft candidate for consumer correctness and performance validation.'
+    test = 'The source, tree and platform digests match the published SDK validation record.'
+    marker = f'<!-- llvm-candidate beta/{kind}/{sha}/{build}/{base_sha} -->'
+    body = '\n'.join([
+        '# Summary:',
+        '',
+        '**Problem**',
+        '',
+        problem,
+        '',
+        '**Solution**',
+        '',
+        solution,
+        '',
+        '# Test Plan:',
+        '',
+        test,
+        '',
+        f'SDK validation provenance: [completion record]({ready_url}).',
+        '',
+        *_job_block([('Triton correctness', 'Not run'), ('A/B performance', 'Not run')]),
+        '',
+        'Source comparison: ' + compare_url('facebookexperimental/llvm-project', old['llvm_hash'], sha) + '.',
+        '',
+        marker,
+    ])
+    commit = '\n'.join([
+        title,
+        '',
+        'Summary:',
+        '**Problem**',
+        '',
+        textwrap.fill(problem, 72),
+        '',
+        '**Solution**',
+        '',
+        textwrap.fill(solution, 72),
+        '',
+        'Test Plan:',
+        '',
+        textwrap.fill(test, 72),
+        'Consumer correctness and performance checks have not run.',
+    ])
+    return title, commit, body
+
+
 def _date(release):
     return release["published_at"][:10]
 
