@@ -140,6 +140,18 @@ increase look free even when reuse realization must reject the alias and
 materialize a separate allocation, which can make the final physical layout
 exceed the planner budget.
 
+#### Opt-in: operand ring before outer staging
+
+The warp-specialized loop (or an enclosing loop) can set `tt.smem_operand_ring_first` (`tl.range(...,
+smem_operand_ring_first=True)`). The planner then also builds a plan in which
+outer-loop staging (P4/P5 tiers) only grows from the budget left once the
+TMA-fed MMA operands reach `min(num_stages, K-loop trip count)` copies, and
+keeps it if it deepens the shallowest MMA operand ring. This helps when large
+staging slots (for example a fused fp32 cast) would leave the operand ring at
+1-2 copies; small bf16 slots usually overlap their stores cheaply and are
+better left at the default. Inner-loop staging keeps first claim. Blackwell
+(MMAv5) only.
+
 #### `K | S` cap for same-partition (wait_group-drained) staging
 
 A staging group holds **S** subtiles (`S = indices.size()`, the fused
@@ -359,6 +371,18 @@ pipeliner. Barrier-free wraparound token waits are therefore materialized as
 queue-wide `wait_group(K-1)` operations before the next iteration's staging
 writers, followed by one `wait_group(0)` drain after the loop. Ordinary
 software-pipelined loops retain their loop-carried token schedule.
+
+When a planned-count wait (K > 1) moves to a later iteration of an ordinary
+pipelined loop, it sits a stage after the staging writer, so the pipeliner's
+prologue has no copy of it: the first iterations of the next run of the loop
+(for example the next persistent tile's epilogue) would write the staging slots
+while the previous run's last K-1 stores are still in flight (the drain copies
+keep the rotated count). For barrier- and token-free waits the pass therefore
+also gives the target writer a queue-wide `wait_group(min(K-1, n))` in the
+writer's own stage, where n is the number of TMA store-like ops issued between
+the store and that writer. In steady state it waits for the same store as the
+token wait. One `wait_group(0)` after the outermost enclosing loop drains the
+last run.
 
 The merge attribute can be on an enclosing persistent loop rather than the
 loop containing the dQ stores. The pass therefore searches the loop ancestry:

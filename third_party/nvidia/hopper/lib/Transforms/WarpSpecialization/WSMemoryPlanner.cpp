@@ -1297,6 +1297,25 @@ isDescriptorFedComputedMMAOperandChannel(Operation *alloc,
   return false;
 }
 
+/// Return the MMAs consuming a TMA-fed SMEM channel (the operand ring of a GEMM
+/// main loop); empty if there are none.
+static SmallVector<Operation *>
+getTMAFedMMAOperandConsumers(Operation *alloc,
+                             SmallVector<Channel *> &channels) {
+  SmallVector<Operation *> mmas;
+  if (!isSmemTMAChannel(alloc, channels))
+    return mmas;
+  Channel *ch = findChannelForOp(alloc, channels);
+  if (!ch)
+    return mmas;
+  DenseSet<Operation *> consumers;
+  (void)getAllAcutalUsersForChannel(ch, consumers, alloc);
+  for (Operation *op : consumers)
+    if (isa<ttng::MMAv5OpInterface>(op))
+      mmas.push_back(op);
+  return mmas;
+}
+
 /// Helper to read the loop.stage attribute from an op. Returns -1 if absent.
 static int getLoopStage(Operation *op) {
   auto attr = op->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName);
@@ -1598,7 +1617,8 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
                                         SmallVector<Channel *> &channels,
                                         triton::FuncOp funcOp,
                                         unsigned numBuffers,
-                                        unsigned smemBudget) {
+                                        unsigned smemBudget,
+                                        unsigned outerSmemBudget) {
   // Staging-depth search axis: cap the bump target (K|S/budget still enforced).
   if (unsigned cap = getStagingCopiesCap())
     numBuffers = std::min(numBuffers, cap);
@@ -1816,10 +1836,13 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
           wsBuffers[idx].numCopies = tryCopies;
 
         unsigned totalSmem = computeTotalSmem(wsBuffers);
-        if (totalSmem <= smemBudget) {
+        unsigned tierBudget = pri == WSBufferPriority::P3_InnerTMAStaging
+                                  ? smemBudget
+                                  : outerSmemBudget;
+        if (totalSmem <= tierBudget) {
           LDBG("Phase 3.7:     bufferId=" << bufferId << " copies=" << tryCopies
                                           << " totalSmem=" << totalSmem
-                                          << " \u2264 " << smemBudget
+                                          << " \u2264 " << tierBudget
                                           << " \u2014 kept");
           tryCopies++;
         } else {
@@ -1827,7 +1850,7 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
             wsBuffers[indices[k]].numCopies = saved[k];
           LDBG("Phase 3.7:     bufferId="
                << bufferId << " copies=" << tryCopies
-               << " totalSmem=" << totalSmem << " > " << smemBudget
+               << " totalSmem=" << totalSmem << " > " << tierBudget
                << " \u2014 budget exhausted, reverted to copies=" << saved[0]);
           break;
         }
@@ -2434,12 +2457,14 @@ static void dumpMemPlans(ArrayRef<wsplan::Plan> plans, StringRef pool,
 static unsigned allocateSmemBuffers(
     triton::FuncOp funcOp, SmallVector<Channel *> &channels,
     unsigned numBuffers, unsigned smemBudget, bool smemCircularReuse,
+    bool smemOperandRingFirst,
     const DenseMap<Operation *, ChannelAnnotation> &allocToAnnotation,
     unsigned annotationMaxId);
 
 static unsigned allocateSmemBuffersViaSearch(
     triton::FuncOp funcOp, SmallVector<Channel *> &channels,
     unsigned numBuffers, unsigned smemBudget, bool smemCircularReuse,
+    bool smemOperandRingFirst,
     const DenseMap<Operation *, ChannelAnnotation> &allocToAnnotation,
     unsigned annotationMaxId) {
   // Safety fallback: the search does not yet model (a) annotation /
@@ -2490,8 +2515,8 @@ static unsigned allocateSmemBuffersViaSearch(
     LDBG("SMEM plan-search: unmodeled feature present, falling back to "
          "heuristic");
     return allocateSmemBuffers(funcOp, channels, numBuffers, smemBudget,
-                               smemCircularReuse, allocToAnnotation,
-                               annotationMaxId);
+                               smemCircularReuse, smemOperandRingFirst,
+                               allocToAnnotation, annotationMaxId);
   }
 
   SmemBufferModel model(funcOp, channels, numBuffers);
@@ -2513,9 +2538,12 @@ static unsigned allocateSmemBuffersViaSearch(
   if (plans.empty()) {
     LDBG("SMEM plan-search: no plan found, falling back to heuristic");
     return allocateSmemBuffers(funcOp, channels, numBuffers, smemBudget,
-                               smemCircularReuse, allocToAnnotation,
-                               annotationMaxId);
+                               smemCircularReuse, smemOperandRingFirst,
+                               allocToAnnotation, annotationMaxId);
   }
+  if (smemOperandRingFirst)
+    funcOp.emitRemark()
+        << "tt.smem_operand_ring_first is ignored by the SMEM plan search";
 
   // Normalize each plan's block copies to the value that will actually be
   // emitted, so the dump reflects reality (not the raw CopySolver count) and
@@ -2602,6 +2630,7 @@ getRequestedDescriptorBufferDepth(ttg::LocalAllocOp alloc) {
 static unsigned allocateSmemBuffers(
     triton::FuncOp funcOp, SmallVector<Channel *> &channels,
     unsigned numBuffers, unsigned smemBudget, bool smemCircularReuse,
+    bool smemOperandRingFirst,
     const DenseMap<Operation *, ChannelAnnotation> &allocToAnnotation,
     unsigned annotationMaxId = 0) {
   // ── Phase 1: Create WSBuffers ───────────────────────────────────────
@@ -2909,208 +2938,306 @@ static unsigned allocateSmemBuffers(
                          ? epilogueBudget - static_cast<unsigned>(reserve)
                          : 0;
   }
-  increaseFusedEpilogueCopies(wsBuffers, channels, funcOp, numBuffers,
-                              epilogueBudget);
-
-  LDBG("Phase 3.7 epilogue copies complete: totalSmem="
-       << computeTotalSmem(wsBuffers));
-
-  // ── Phase 4: Iterative copy increase ────────────────────────────────
-  // Computed MMA tiles first: they are narrower than their descriptor sources.
-  for (auto priority : {WSBufferPriority::P0_ComputedMMAOperand,
-                        WSBufferPriority::P1_InnermostTMA,
-                        WSBufferPriority::P2_InnermostNonTMA}) {
-    // Collect candidate indices at this priority.
-    SmallVector<unsigned> candidateIndices;
-    // Candidates before dropping unaligned TMA landing buffers. Grouping is
-    // decided on this count so that dropping such a buffer never turns a
-    // three-buffer set into the two-buffer circular reuse group.
-    unsigned numCandidates = 0;
-    for (unsigned i = 0; i < wsBuffers.size(); ++i) {
-      if (wsBuffers[i].isPinned || wsBuffers[i].priority != priority)
-        continue;
-      ++numCandidates;
-      if (isUnalignedTMALoadSlot(wsBuffers[i].allocOp, wsBuffers[i].sizeBytes,
-                                 channels)) {
-        LDBG("Phase 4: WSBuffer["
-             << wsBuffers[i].bufferId << "] is a TMA landing buffer of "
-             << wsBuffers[i].sizeBytes << " bytes; keeping its copy count");
-        continue;
-      }
-      candidateIndices.push_back(i);
-    }
-    if (candidateIndices.empty())
+  // Outer-loop staging (a persistent GEMM's epilogue ring) stores once per
+  // tile, while the TMA operand ring feeds every K step. When a loop requests
+  // it (`tt.smem_operand_ring_first`), also build a plan where outer staging
+  // only grows from the budget left after
+  // the TMA-fed MMA operands reach the requested depth, and keep it if it
+  // deepens the shallowest operand ring (e.g. an fp32 epilogue ring taking 4
+  // slots and leaving A/B at 1).
+  unsigned outerEpilogueBudget = epilogueBudget;
+  // A ring deeper than its K loop's trip count buys little, so each operand's
+  // goal is capped by that loop (e.g. K = 2 * BLOCK_K keeps the deeper
+  // epilogue ring).
+  SmallVector<unsigned> mmaOperandIdx;
+  SmallVector<unsigned> operandDepthGoal;
+  for (unsigned i = 0; i < wsBuffers.size(); ++i) {
+    const auto &buf = wsBuffers[i];
+    if (buf.isPinned || buf.priority != WSBufferPriority::P1_InnermostTMA)
       continue;
-
-    llvm::stable_sort(candidateIndices, [&](unsigned a, unsigned b) {
-      unsigned orderA = getWSBufferUsageOrder(wsBuffers[a], channels, opOrder);
-      unsigned orderB = getWSBufferUsageOrder(wsBuffers[b], channels, opOrder);
-      if (orderA != orderB)
-        return orderA < orderB;
-      return a < b;
-    });
-
-    LDBG("Phase 4: processing priority=" << static_cast<int>(priority)
-                                         << " with " << candidateIndices.size()
-                                         << " candidates");
-
-    // Step 0: Decide grouping upfront.
-    bool isReuseGroup = false;
-    if (smemCircularReuse && numCandidates == 2 &&
-        candidateIndices.size() == 2) {
-      isReuseGroup = true;
-      auto &bufA = wsBuffers[candidateIndices[0]];
-      auto &bufB = wsBuffers[candidateIndices[1]];
-
-      // B shares A's buffer.id.
-      bufB.bufferId = bufA.bufferId;
-
-      // Compute starting copies for the group from the already-enforced
-      // per-buffer floors. A reuse group with a member needing N individual
-      // copies needs 2*N-1 group copies so that member still has N effective
-      // slots after interleaving with its partner.
-      unsigned maxMinCopies = std::max(bufA.minCopies, bufB.minCopies);
-      unsigned groupStart = maxMinCopies >= 2 ? (2 * maxMinCopies - 1) : 1;
-      if (groupStart > numBuffers) {
-        bufA.allocOp->emitWarning()
-            << "cross-stage SMEM reuse group requires buffer.copy="
-            << groupStart << ", exceeding configured num-buffers=" << numBuffers
-            << "; enforcing the correctness floor";
-        LDBG("WARNING: reuse group ["
-             << bufA.bufferId << "] cross-stage floor " << groupStart
-             << " exceeds configured numBuffers=" << numBuffers
-             << " - enforcing correctness floor");
-      }
-
-      bufA.numCopies = groupStart;
-      bufB.numCopies = groupStart;
-
-      LDBG("Phase 4: formed reuse group ["
-           << bufA.bufferId << "] with startCopies=" << groupStart
-           << " (maxMinCopies=" << maxMinCopies << ")");
+    SmallVector<Operation *> mmas =
+        getTMAFedMMAOperandConsumers(buf.allocOp, channels);
+    if (mmas.empty() ||
+        isUnalignedTMALoadSlot(buf.allocOp, buf.sizeBytes, channels))
+      continue;
+    // With several MMA consumers, take the largest per-loop cap so the goal
+    // does not depend on the consumer set's iteration order.
+    unsigned goal = 0;
+    for (Operation *mma : mmas) {
+      unsigned cap = numBuffers;
+      if (auto forOp = mma->getParentOfType<scf::ForOp>())
+        if (auto tripCount = forOp.getStaticTripCount())
+          cap = std::min<uint64_t>(
+              cap, std::max<uint64_t>(1, tripCount->getZExtValue()));
+      goal = std::max(goal, cap);
     }
-
-    // Step 1: Incremental loop.
-    unsigned currentGroupCopies;
-    if (isReuseGroup) {
-      currentGroupCopies = wsBuffers[candidateIndices[0]].numCopies;
-    } else {
-      // Start at the minimum numCopies across candidates (may be > 1
-      // after Phase 2 cross-stage enforcement).
-      currentGroupCopies = numBuffers; // will be lowered
-      for (unsigned idx : candidateIndices)
-        currentGroupCopies =
-            std::min(currentGroupCopies, wsBuffers[idx].numCopies);
+    mmaOperandIdx.push_back(i);
+    operandDepthGoal.push_back(goal);
+  }
+  for (auto [i, goal] : llvm::zip(mmaOperandIdx, operandDepthGoal)) {
+    const auto &buf = wsBuffers[i];
+    if (buf.numCopies >= goal)
+      continue;
+    uint64_t reserve = uint64_t(goal - buf.numCopies) * uint64_t(buf.sizeBytes);
+    outerEpilogueBudget =
+        reserve < outerEpilogueBudget
+            ? outerEpilogueBudget - static_cast<unsigned>(reserve)
+            : 0;
+  }
+  // Shallowest operand depth, each capped at its goal; the operand-first plan
+  // is tried only while this is below the smallest goal. Operands in one
+  // circular reuse group share its copies: a group of 2N-1 copies gives each
+  // of two members N slots.
+  auto minMMAOperandCopies = [&]() {
+    unsigned m = std::numeric_limits<unsigned>::max();
+    for (auto [i, goal] : llvm::zip(mmaOperandIdx, operandDepthGoal)) {
+      unsigned sharers = llvm::count_if(wsBuffers, [&](const WSBuffer &b) {
+        return !b.isPinned && b.bufferId == wsBuffers[i].bufferId;
+      });
+      // Defensive: operands here are never pinned, so they count themselves.
+      sharers = std::max(1u, sharers);
+      unsigned depth = (wsBuffers[i].numCopies + sharers - 1) / sharers;
+      m = std::min(m, std::min(depth, goal));
     }
+    return m;
+  };
+  auto runCopyPhases = [&](unsigned outerStagingBudget) {
+    increaseFusedEpilogueCopies(wsBuffers, channels, funcOp, numBuffers,
+                                epilogueBudget, outerStagingBudget);
 
-    bool foundValidSolution = false;
+    LDBG("Phase 3.7 epilogue copies complete: totalSmem="
+         << computeTotalSmem(wsBuffers));
 
-    while (currentGroupCopies <= numBuffers) {
-      if (isReuseGroup) {
-        // Reuse group path: set group copies and check budget.
-        auto &bufA = wsBuffers[candidateIndices[0]];
-        auto &bufB = wsBuffers[candidateIndices[1]];
-        unsigned savedA = bufA.numCopies, savedB = bufB.numCopies;
-        bufA.numCopies = currentGroupCopies;
-        bufB.numCopies = currentGroupCopies;
-
-        unsigned totalSmem = computeTotalSmem(wsBuffers);
-        if (totalSmem <= smemBudget) {
-          foundValidSolution = true;
-          LDBG("Phase 4: reuse group copies=" << currentGroupCopies
-                                              << " totalSmem=" << totalSmem
-                                              << " ≤ " << smemBudget);
-          currentGroupCopies++;
-        } else {
-          bufA.numCopies = savedA;
-          bufB.numCopies = savedB;
-          LDBG("Phase 4: reuse group copies="
-               << currentGroupCopies << " totalSmem=" << totalSmem << " > "
-               << smemBudget << " — budget exhausted");
-          break;
-        }
-      } else {
-        // Individual path: bring each pending candidate to currentGroupCopies.
-        SmallVector<unsigned> pending;
-        for (unsigned idx : candidateIndices) {
-          if (wsBuffers[idx].numCopies < currentGroupCopies)
-            pending.push_back(idx);
-        }
-
-        if (pending.empty()) {
-          currentGroupCopies++;
+    // ── Phase 4: Iterative copy increase ────────────────────────────────
+    // Computed MMA tiles first: they are narrower than their descriptor
+    // sources.
+    for (auto priority : {WSBufferPriority::P0_ComputedMMAOperand,
+                          WSBufferPriority::P1_InnermostTMA,
+                          WSBufferPriority::P2_InnermostNonTMA}) {
+      // Collect candidate indices at this priority.
+      SmallVector<unsigned> candidateIndices;
+      // Candidates before dropping unaligned TMA landing buffers. Grouping is
+      // decided on this count so that dropping such a buffer never turns a
+      // three-buffer set into the two-buffer circular reuse group.
+      unsigned numCandidates = 0;
+      for (unsigned i = 0; i < wsBuffers.size(); ++i) {
+        if (wsBuffers[i].isPinned || wsBuffers[i].priority != priority)
+          continue;
+        ++numCandidates;
+        if (isUnalignedTMALoadSlot(wsBuffers[i].allocOp, wsBuffers[i].sizeBytes,
+                                   channels)) {
+          LDBG("Phase 4: WSBuffer["
+               << wsBuffers[i].bufferId << "] is a TMA landing buffer of "
+               << wsBuffers[i].sizeBytes << " bytes; keeping its copy count");
           continue;
         }
+        candidateIndices.push_back(i);
+      }
+      if (candidateIndices.empty())
+        continue;
 
-        bool advancedAny = false;
-        for (unsigned idx : pending) {
-          auto &buf = wsBuffers[idx];
-          unsigned saved = buf.numCopies;
-          buf.numCopies = currentGroupCopies;
-          buf.isAllocated = true;
+      llvm::stable_sort(candidateIndices, [&](unsigned a, unsigned b) {
+        unsigned orderA =
+            getWSBufferUsageOrder(wsBuffers[a], channels, opOrder);
+        unsigned orderB =
+            getWSBufferUsageOrder(wsBuffers[b], channels, opOrder);
+        if (orderA != orderB)
+          return orderA < orderB;
+        return a < b;
+      });
+
+      LDBG("Phase 4: processing priority="
+           << static_cast<int>(priority) << " with " << candidateIndices.size()
+           << " candidates");
+
+      // Step 0: Decide grouping upfront.
+      bool isReuseGroup = false;
+      if (smemCircularReuse && numCandidates == 2 &&
+          candidateIndices.size() == 2) {
+        isReuseGroup = true;
+        auto &bufA = wsBuffers[candidateIndices[0]];
+        auto &bufB = wsBuffers[candidateIndices[1]];
+
+        // B shares A's buffer.id.
+        bufB.bufferId = bufA.bufferId;
+
+        // Compute starting copies for the group from the already-enforced
+        // per-buffer floors. A reuse group with a member needing N individual
+        // copies needs 2*N-1 group copies so that member still has N effective
+        // slots after interleaving with its partner.
+        unsigned maxMinCopies = std::max(bufA.minCopies, bufB.minCopies);
+        unsigned groupStart = maxMinCopies >= 2 ? (2 * maxMinCopies - 1) : 1;
+        if (groupStart > numBuffers) {
+          bufA.allocOp->emitWarning()
+              << "cross-stage SMEM reuse group requires buffer.copy="
+              << groupStart
+              << ", exceeding configured num-buffers=" << numBuffers
+              << "; enforcing the correctness floor";
+          LDBG("WARNING: reuse group ["
+               << bufA.bufferId << "] cross-stage floor " << groupStart
+               << " exceeds configured numBuffers=" << numBuffers
+               << " - enforcing correctness floor");
+        }
+
+        bufA.numCopies = groupStart;
+        bufB.numCopies = groupStart;
+
+        LDBG("Phase 4: formed reuse group ["
+             << bufA.bufferId << "] with startCopies=" << groupStart
+             << " (maxMinCopies=" << maxMinCopies << ")");
+      }
+
+      // Step 1: Incremental loop.
+      unsigned currentGroupCopies;
+      if (isReuseGroup) {
+        currentGroupCopies = wsBuffers[candidateIndices[0]].numCopies;
+      } else {
+        // Start at the minimum numCopies across candidates (may be > 1
+        // after Phase 2 cross-stage enforcement).
+        currentGroupCopies = numBuffers; // will be lowered
+        for (unsigned idx : candidateIndices)
+          currentGroupCopies =
+              std::min(currentGroupCopies, wsBuffers[idx].numCopies);
+      }
+
+      bool foundValidSolution = false;
+
+      while (currentGroupCopies <= numBuffers) {
+        if (isReuseGroup) {
+          // Reuse group path: set group copies and check budget.
+          auto &bufA = wsBuffers[candidateIndices[0]];
+          auto &bufB = wsBuffers[candidateIndices[1]];
+          unsigned savedA = bufA.numCopies, savedB = bufB.numCopies;
+          bufA.numCopies = currentGroupCopies;
+          bufB.numCopies = currentGroupCopies;
 
           unsigned totalSmem = computeTotalSmem(wsBuffers);
           if (totalSmem <= smemBudget) {
-            advancedAny = true;
             foundValidSolution = true;
-            LDBG("Phase 4: WSBuffer["
-                 << buf.bufferId << "] copies=" << currentGroupCopies
-                 << " totalSmem=" << totalSmem << " ≤ " << smemBudget);
+            LDBG("Phase 4: reuse group copies=" << currentGroupCopies
+                                                << " totalSmem=" << totalSmem
+                                                << " ≤ " << smemBudget);
+            currentGroupCopies++;
           } else {
-            // Never drop below the enforced cross-stage floor.
-            buf.numCopies = std::max(saved, buf.minCopies);
-            // Try reusing an already-allocated buffer instead.
-            DenseMap<unsigned, unsigned> phase4Claimed;
-            if (auto *target = findReuseCandidate(buf, wsBuffers, channels,
-                                                  numClusters, phase4Claimed)) {
-              buf.isAllocated = false;
+            bufA.numCopies = savedA;
+            bufB.numCopies = savedB;
+            LDBG("Phase 4: reuse group copies="
+                 << currentGroupCopies << " totalSmem=" << totalSmem << " > "
+                 << smemBudget << " — budget exhausted");
+            break;
+          }
+        } else {
+          // Individual path: bring each pending candidate to
+          // currentGroupCopies.
+          SmallVector<unsigned> pending;
+          for (unsigned idx : candidateIndices) {
+            if (wsBuffers[idx].numCopies < currentGroupCopies)
+              pending.push_back(idx);
+          }
+
+          if (pending.empty()) {
+            currentGroupCopies++;
+            continue;
+          }
+
+          bool advancedAny = false;
+          for (unsigned idx : pending) {
+            auto &buf = wsBuffers[idx];
+            unsigned saved = buf.numCopies;
+            buf.numCopies = currentGroupCopies;
+            buf.isAllocated = true;
+
+            unsigned totalSmem = computeTotalSmem(wsBuffers);
+            if (totalSmem <= smemBudget) {
+              advancedAny = true;
               foundValidSolution = true;
               LDBG("Phase 4: WSBuffer["
-                   << idx << "] reuses WSBuffer[" << target->bufferId
-                   << "] (size=" << target->sizeBytes << ")");
-            } else {
-              buf.isAllocated = true;
-              LDBG("Phase 4: WSBuffer["
                    << buf.bufferId << "] copies=" << currentGroupCopies
-                   << " totalSmem=" << totalSmem << " > " << smemBudget
-                   << " — skipped");
+                   << " totalSmem=" << totalSmem << " ≤ " << smemBudget);
+            } else {
+              // Never drop below the enforced cross-stage floor.
+              buf.numCopies = std::max(saved, buf.minCopies);
+              // Try reusing an already-allocated buffer instead.
+              DenseMap<unsigned, unsigned> phase4Claimed;
+              if (auto *target = findReuseCandidate(
+                      buf, wsBuffers, channels, numClusters, phase4Claimed)) {
+                buf.isAllocated = false;
+                foundValidSolution = true;
+                LDBG("Phase 4: WSBuffer["
+                     << idx << "] reuses WSBuffer[" << target->bufferId
+                     << "] (size=" << target->sizeBytes << ")");
+              } else {
+                buf.isAllocated = true;
+                LDBG("Phase 4: WSBuffer["
+                     << buf.bufferId << "] copies=" << currentGroupCopies
+                     << " totalSmem=" << totalSmem << " > " << smemBudget
+                     << " — skipped");
+              }
             }
           }
+
+          if (!advancedAny)
+            break;
+
+          currentGroupCopies++;
         }
+      }
 
-        if (!advancedAny)
-          break;
+      // Step 2: Finalize reuse decision.
+      // If final copies is even, split the group back — but never below either
+      // member's enforced cross-stage floor.
+      if (isReuseGroup) {
+        auto &bufA = wsBuffers[candidateIndices[0]];
+        auto &bufB = wsBuffers[candidateIndices[1]];
+        unsigned half = bufA.numCopies / 2;
+        if (bufA.numCopies % 2 == 0 && half >= bufA.minCopies &&
+            half >= bufB.minCopies) {
+          bufA.numCopies = half;
+          bufB.numCopies = half;
+          bufB.bufferId = nextBufferId++;
+          isReuseGroup = false;
+          LDBG("Phase 4: split reuse group — even copies="
+               << (half * 2) << " → each gets " << half);
+        }
+      }
 
-        currentGroupCopies++;
+      // Step 3: Validate.
+      if (!foundValidSolution) {
+        LDBG("Phase 4: WARNING — no valid SMEM allocation found for priority="
+             << static_cast<int>(priority));
       }
     }
 
-    // Step 2: Finalize reuse decision.
-    // If final copies is even, split the group back — but never below either
-    // member's enforced cross-stage floor.
-    if (isReuseGroup) {
-      auto &bufA = wsBuffers[candidateIndices[0]];
-      auto &bufB = wsBuffers[candidateIndices[1]];
-      unsigned half = bufA.numCopies / 2;
-      if (bufA.numCopies % 2 == 0 && half >= bufA.minCopies &&
-          half >= bufB.minCopies) {
-        bufA.numCopies = half;
-        bufB.numCopies = half;
-        bufB.bufferId = nextBufferId++;
-        isReuseGroup = false;
-        LDBG("Phase 4: split reuse group — even copies="
-             << (half * 2) << " → each gets " << half);
-      }
-    }
+    LDBG("Phase 4 complete: totalSmem=" << computeTotalSmem(wsBuffers));
+  };
 
-    // Step 3: Validate.
-    if (!foundValidSolution) {
-      LDBG("Phase 4: WARNING — no valid SMEM allocation found for priority="
-           << static_cast<int>(priority));
+  SmallVector<WSBuffer> preCopyBuffers = wsBuffers;
+  unsigned preCopyNextBufferId = nextBufferId;
+  runCopyPhases(epilogueBudget);
+  if (smemOperandRingFirst && mmaOperandIdx.empty())
+    funcOp.emitRemark() << "tt.smem_operand_ring_first is ignored: no unpinned "
+                           "TMA-fed MMAv5 operand ring";
+  unsigned defaultMin = minMMAOperandCopies();
+  if (smemOperandRingFirst && outerEpilogueBudget < epilogueBudget &&
+      !mmaOperandIdx.empty() &&
+      defaultMin < *llvm::min_element(operandDepthGoal) &&
+      !funcOp->hasAttr("ttg.ws_memory_plan_invalid")) {
+    SmallVector<WSBuffer> defaultPlan = wsBuffers;
+    unsigned defaultNextBufferId = nextBufferId;
+    wsBuffers = preCopyBuffers;
+    nextBufferId = preCopyNextBufferId;
+    runCopyPhases(outerEpilogueBudget);
+    // Give outer-loop staging whatever the operand ring could not use.
+    increaseFusedEpilogueCopies(wsBuffers, channels, funcOp, numBuffers,
+                                epilogueBudget, smemBudget);
+    unsigned operandFirstMin = minMMAOperandCopies();
+    LDBG("Phase 4: min MMA operand copies default="
+         << defaultMin << " operand-first=" << operandFirstMin);
+    if (operandFirstMin <= defaultMin) {
+      wsBuffers = defaultPlan;
+      nextBufferId = defaultNextBufferId;
     }
   }
-
-  LDBG("Phase 4 complete: totalSmem=" << computeTotalSmem(wsBuffers));
 
   // ── Phase 5: Emit buffer.id and buffer.copy attributes ──────────────
   auto i32Type = IntegerType::get(funcOp.getContext(), 32);
@@ -5998,6 +6125,7 @@ LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
   int effectiveSmemAllocAlgo = options.smemAllocAlgo;
   unsigned effectiveSmemBudget = smemBudget;
   bool effectiveSmemCircularReuse = options.smemCircularReuse;
+  bool effectiveSmemOperandRingFirst = false;
   bool hasSmemAllocAlgoAttr = false;
   funcOp->walk([&](LoopLikeOpInterface wsLoop) {
     if (!wsLoop->hasAttr(tt::kWarpSpecializeAttrName))
@@ -6020,8 +6148,15 @@ LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
         effectiveSmemBudget = static_cast<unsigned>(attr.getInt());
       if (auto attr = loop->getAttrOfType<BoolAttr>("tt.smem_circular_reuse"))
         effectiveSmemCircularReuse = attr.getValue();
+      if (auto attr =
+              loop->getAttrOfType<BoolAttr>("tt.smem_operand_ring_first"))
+        effectiveSmemOperandRingFirst = attr.getValue();
     }
   });
+  if (effectiveSmemOperandRingFirst && effectiveSmemAllocAlgo != 1)
+    funcOp.emitRemark() << "tt.smem_operand_ring_first is ignored with "
+                           "tt.smem_alloc_algo="
+                        << effectiveSmemAllocAlgo;
 
   unsigned bufferId;
   if (effectiveSmemAllocAlgo == 1) {
@@ -6058,15 +6193,16 @@ LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
           annotationMaxId = std::max(annotationMaxId, ann.bufferId + 1);
     }
 
-    bufferId = smemPlanSearch
-                   ? allocateSmemBuffersViaSearch(
-                         funcOp, channels, numBuffers, effectiveSmemBudget,
-                         effectiveSmemCircularReuse, smemAllocAnnotations,
-                         annotationMaxId)
-                   : allocateSmemBuffers(funcOp, channels, numBuffers,
-                                         effectiveSmemBudget,
-                                         effectiveSmemCircularReuse,
-                                         smemAllocAnnotations, annotationMaxId);
+    bufferId =
+        smemPlanSearch
+            ? allocateSmemBuffersViaSearch(
+                  funcOp, channels, numBuffers, effectiveSmemBudget,
+                  effectiveSmemCircularReuse, effectiveSmemOperandRingFirst,
+                  smemAllocAnnotations, annotationMaxId)
+            : allocateSmemBuffers(
+                  funcOp, channels, numBuffers, effectiveSmemBudget,
+                  effectiveSmemCircularReuse, effectiveSmemOperandRingFirst,
+                  smemAllocAnnotations, annotationMaxId);
     if (funcOp->hasAttr("ttg.ws_memory_plan_invalid")) {
       funcOp->removeAttr("ttg.ws_memory_plan_invalid");
       return failure();
