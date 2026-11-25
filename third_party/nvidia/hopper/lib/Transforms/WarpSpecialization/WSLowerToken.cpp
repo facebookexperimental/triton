@@ -190,6 +190,8 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
     // multiple producers or consumers? Check if num_warps agree.
     unsigned producerWarps = 0, consumerWarps = 0;
     SmallVector<Operation *> usersForToken;
+    SmallPtrSet<Value, 4> tokenValues;
+    tokenValues.insert(createTokenOp.getResult());
     for (OpOperand &use : createTokenOp.getResult().getUses()) {
       Operation *user = use.getOwner();
       if (auto wsOp = dyn_cast<ttg::WarpSpecializePartitionsOp>(user)) {
@@ -199,6 +201,7 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
         for (Region &region : wsOp.getPartitionRegions()) {
           LDBG("-- region " << region.getNumArguments());
           auto tArg = region.getArgument(opndNum);
+          tokenValues.insert(tArg);
           for (Operation *tUser : tArg.getUsers()) {
             // Use of TokenOp via capture of warp_specialize.
             usersForToken.push_back(tUser);
@@ -328,15 +331,24 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
         deprecatedOps.push_back(user);
         return true;
       } else if (auto op = dyn_cast<ttng::TMAStoreTokenWaitOp>(user)) {
+        // A wait can release several tokens; lower only this token's entries.
         Value truePred = arith::ConstantIntOp::create(builder, loc, 1, 1);
-        for (auto [nvwsTok, nvwsIdx] :
-             llvm::zip(op.getNvwsTokens(), op.getNvwsTokenIndices())) {
+        // Snapshot the entries: addBarrier below reallocates the operands.
+        SmallVector<Value> toks(op.getNvwsTokens());
+        SmallVector<Value> idxs(op.getNvwsTokenIndices());
+        SmallVector<Value> otherToks, otherIdxs;
+        for (auto [nvwsTok, nvwsIdx] : llvm::zip(toks, idxs)) {
+          if (!tokenValues.contains(nvwsTok)) {
+            otherToks.push_back(nvwsTok);
+            otherIdxs.push_back(nvwsIdx);
+            continue;
+          }
           Value bufferEmpty = extractBufferEmpty(loc, nvwsIdx);
           setAsyncTaskIds(bufferEmpty.getDefiningOp(), getAsyncTaskIds(user));
           op.addBarrier(bufferEmpty, truePred);
         }
-        op.getNvwsTokensMutable().clear();
-        op.getNvwsTokenIndicesMutable().clear();
+        op.getNvwsTokensMutable().assign(otherToks);
+        op.getNvwsTokenIndicesMutable().assign(otherIdxs);
         // Do NOT erase — the op stays with its newly-added real barriers.
         return true;
       }
