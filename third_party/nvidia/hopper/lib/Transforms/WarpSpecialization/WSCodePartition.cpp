@@ -5107,17 +5107,34 @@ void insertAsyncComm(
 
     // Optimize TMA loads.
     if (tmaLoads.size() > 0) {
-      // Instead of headConsumer, need to lift out to the same scope.
-      auto consumerWaitPoint = getSameLevelOp(tmaHeadProducer, headConsumer);
-      // Collect additional consumer task IDs beyond the primary headConsumer.
-      SmallVector<int> additionalConsumerTaskIds;
-      auto primaryTaskIds = getAsyncTaskIds(headConsumer);
-      for (const auto &token : commChannel.tokens) {
-        int taskId = token.first;
-        if (std::find(primaryTaskIds.begin(), primaryTaskIds.end(), taskId) ==
-            primaryTaskIds.end())
-          additionalConsumerTaskIds.push_back(taskId);
-      }
+      // One readiness wait per consumer task (the head consumer's tasks plus
+      // every token's task), placed before that task's first consumer in
+      // program order, lifted to the TMA producer's level. A task with no
+      // such consumer waits at the head consumer, as before.
+      SmallVector<AsyncTaskId> waitTaskIds(getAsyncTaskIds(headConsumer));
+      for (const auto &token : commChannel.tokens)
+        if (!llvm::is_contained(waitTaskIds, token.first))
+          waitTaskIds.push_back(token.first);
+      Operation *headWaitPoint = getSameLevelOp(tmaHeadProducer, headConsumer);
+      SmallVector<TMAConsumerWaitInfo> consumerWaits;
+      for (AsyncTaskId taskId : waitTaskIds)
+        consumerWaits.push_back({taskId, headWaitPoint});
+      SmallVector<bool> placed(consumerWaits.size(), false);
+      funcOp.walk<WalkOrder::PreOrder>([&](Operation *op) {
+        if (!consumerOps.contains(op))
+          return;
+        Operation *insertionPoint = getSameLevelOp(tmaHeadProducer, op);
+        if (!insertionPoint)
+          return;
+        for (AsyncTaskId taskId : getAsyncTaskIds(op)) {
+          for (auto [i, wait] : llvm::enumerate(consumerWaits)) {
+            if (wait.taskId != taskId || placed[i])
+              continue;
+            wait.insertionPoint = insertionPoint;
+            placed[i] = true;
+          }
+        }
+      });
       auto waitConstraints =
           WSBarrierAttr::forDstTaskAndDirection(
               funcOp.getContext(), masterChannel->relation.first,
@@ -5128,8 +5145,7 @@ void insertAsyncComm(
               .build(funcOp.getContext());
       optimizeTMALoads(builder, tmaLoads, *commChannel.producerBarrier,
                        bufferIdx, bufferIdx, phase, tmaHeadProducer,
-                       headConsumer, consumerWaitPoint,
-                       additionalConsumerTaskIds, waitConstraints);
+                       consumerWaits, waitConstraints);
     }
   }
 

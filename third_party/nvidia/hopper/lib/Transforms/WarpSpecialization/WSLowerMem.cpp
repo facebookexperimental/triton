@@ -409,9 +409,8 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
                             SmallVector<ttnvws::DescriptorLoadOp> &tmaLoads,
                             Value barrierAlloc, Value bufferIdx,
                             Value bufferIdxExtract, Value phase,
-                            Operation *headProducer, Operation *headConsumer,
-                            Operation *headConsumerSameLevel,
-                            ArrayRef<int> additionalConsumerTaskIds,
+                            Operation *headProducer,
+                            ArrayRef<TMAConsumerWaitInfo> consumerWaits,
                             DictionaryAttr consumerWaitConstraints) {
   // Callers group at least one load behind each fused barrier. Make the
   // precondition explicit instead of dereferencing front() blind below.
@@ -478,66 +477,62 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
     copy = copyOp;
   }
 
-  // Create a wait_barrier before the first consumer.
-  // For data-partitioned channels, shared ops (consBarrier, phase, pred)
-  // need ALL consumer task IDs so they survive specializeRegion.
-  builder.setInsertionPoint(headConsumerSameLevel);
-  SmallVector<int> consumerTaskIds;
-  for (int id : getAsyncTaskIds(headConsumer))
-    consumerTaskIds.push_back(id);
-  for (int id : additionalConsumerTaskIds)
-    consumerTaskIds.push_back(id);
-  builder.setAsynTaskIdsFromArray(consumerTaskIds);
-  builder.setLoopScheduleInfoFromOp(headConsumerSameLevel);
-  auto consBarrier =
-      getBarrierForPipelineStage(builder, barrierAlloc, bufferIdxExtract);
-  phase = builder.createWithAsyncTaskIds<arith::ExtUIOp>(
-      loc, builder.getI32Type(), phase);
-  Value waitPred =
-      builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 1);
-  Value followerWaitPred;
-  Value peerBarrier;
-  if (twoCTA) {
-    TwoCTAPairRank rank = buildTwoCTAPairRank(builder, loc);
-    waitPred = builder.createWithAsyncTaskIds<arith::CmpIOp>(
-        loc, arith::CmpIPredicate::eq, rank.rankInPair, rank.zero);
-    followerWaitPred = builder.createWithAsyncTaskIds<arith::CmpIOp>(
-        loc, arith::CmpIPredicate::ne, rank.rankInPair, rank.zero);
-    peerBarrier = mapBarrierTo2CTAPeer(builder, loc, consBarrier, rank.ctaId);
+  assert(!consumerWaits.empty() && "TMA load must have a consumer task");
+  // In 2-CTA mode the leader's barrier completes for the pair, and the
+  // leader relays that completion to the follower's barrier. The relay must
+  // run once per transfer: the follower barrier expects one arrival, and an
+  // extra arrival would complete its next phase early. Issue it from the
+  // producer's task when that task is also a consumer, else from the first
+  // consumer task.
+  int relayTaskId = consumerWaits.front().taskId;
+  for (int producerTaskId : getAsyncTaskIds(headProducer)) {
+    if (llvm::any_of(consumerWaits, [&](const TMAConsumerWaitInfo &wait) {
+          return wait.taskId == producerTaskId;
+        })) {
+      relayTaskId = producerTaskId;
+      break;
+    }
   }
 
-  // Create one WaitBarrierOp per consumer task ID.
-  builder.setAsyncTaskIdsFromOp(headConsumer);
-  builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
-      loc, consBarrier, phase, waitPred, /*deps=*/ValueRange{},
-      consumerWaitConstraints);
-  if (twoCTA) {
-    // The hardware CTA-group TMA transaction completes the leader's local
-    // mbarrier. Relay that completion to the follower's corresponding local
-    // barrier, then let the follower wait on it. A cluster barrier is not
-    // valid here: only this warp-specialized consumer partition executes the
-    // handoff, while cluster barriers require participation from every warp.
-    builder.createWithAsyncTaskIds<ttng::FenceAsyncSharedOp>(
-        loc, /*bCluster=*/false);
-    builder.createWithAsyncTaskIds<ttng::ArriveBarrierOp>(
-        loc, peerBarrier, /*count=*/1, waitPred);
-    builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
-        loc, consBarrier, phase, followerWaitPred, /*deps=*/ValueRange{},
-        consumerWaitConstraints);
-  }
-  for (int extraTaskId : additionalConsumerTaskIds) {
-    builder.setAsynTaskIdsFromArray({extraTaskId});
-    builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
-        loc, consBarrier, phase, waitPred,
-        /*deps=*/ValueRange{}, consumerWaitConstraints);
+  // Emit each task's wait at its own earliest consumer, with that consumer's
+  // schedule and only that task's ID, so specialization does not clone a
+  // wait (or the relay) into other tasks.
+  for (const TMAConsumerWaitInfo &wait : consumerWaits) {
+    builder.setInsertionPoint(wait.insertionPoint);
+    builder.setAsynTaskIdsFromArray({wait.taskId});
+    builder.setLoopScheduleInfoFromOp(wait.insertionPoint);
+    auto consBarrier =
+        getBarrierForPipelineStage(builder, barrierAlloc, bufferIdxExtract);
+    Value waitPhase = builder.createWithAsyncTaskIds<arith::ExtUIOp>(
+        loc, builder.getI32Type(), phase);
+    Value waitPred =
+        builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 1);
+    Value followerWaitPred;
+    Value peerBarrier;
     if (twoCTA) {
-      builder.createWithAsyncTaskIds<ttng::FenceAsyncSharedOp>(
-          loc, /*bCluster=*/false);
-      builder.createWithAsyncTaskIds<ttng::ArriveBarrierOp>(
-          loc, peerBarrier, /*count=*/1, waitPred);
+      TwoCTAPairRank rank = buildTwoCTAPairRank(builder, loc);
+      waitPred = builder.createWithAsyncTaskIds<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::eq, rank.rankInPair, rank.zero);
+      followerWaitPred = builder.createWithAsyncTaskIds<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::ne, rank.rankInPair, rank.zero);
+      peerBarrier = mapBarrierTo2CTAPeer(builder, loc, consBarrier, rank.ctaId);
+    }
+    builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
+        loc, consBarrier, waitPhase, waitPred, /*deps=*/ValueRange{},
+        consumerWaitConstraints);
+    if (twoCTA) {
+      // A cluster barrier is not valid here: only warp-specialized consumer
+      // partitions execute the handoff, while cluster barriers require
+      // participation from every warp.
+      if (wait.taskId == relayTaskId) {
+        builder.createWithAsyncTaskIds<ttng::FenceAsyncSharedOp>(
+            loc, /*bCluster=*/false);
+        builder.createWithAsyncTaskIds<ttng::ArriveBarrierOp>(
+            loc, peerBarrier, /*count=*/1, waitPred);
+      }
       builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
-          loc, consBarrier, phase, followerWaitPred, /*deps=*/ValueRange{},
-          consumerWaitConstraints);
+          loc, consBarrier, waitPhase, followerWaitPred,
+          /*deps=*/ValueRange{}, consumerWaitConstraints);
     }
   }
 

@@ -326,13 +326,19 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
 Value getBarrierForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
                                  Value barrierAlloc, Value bufferIdx);
 
+// The readiness wait for one consumer task of a TMA channel: placed before
+// that task's earliest consumer, at the TMA producer's nesting level.
+struct TMAConsumerWaitInfo {
+  AsyncTaskId taskId;
+  Operation *insertionPoint;
+};
+
 Operation *
 optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
                  SmallVector<triton::nvws::DescriptorLoadOp> &tmaLoads,
                  Value barrierAlloc, Value bufferIdx, Value bufferIdxExtract,
-                 Value phase, Operation *headProducer, Operation *headConsumer,
-                 Operation *headConsumerSameLevel,
-                 ArrayRef<int> additionalConsumerTaskIds = {},
+                 Value phase, Operation *headProducer,
+                 ArrayRef<TMAConsumerWaitInfo> consumerWaits,
                  DictionaryAttr consumerWaitConstraints = {});
 void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters);
 Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
