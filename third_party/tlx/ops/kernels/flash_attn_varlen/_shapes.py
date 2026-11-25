@@ -75,8 +75,13 @@ SM90_3 = FocusSuite(
         for requests in range(4, 13)),
 )
 SM90_ALL = FocusSuite(name="sm90_all", op="flash_attn_varlen", includes=("sm90_1", "sm90_2", "sm90_3"))
-FOCUS_SUITES = (GFX950_1, SM90_1, SM90_2, SM90_3, SM90_ALL)
-DEFAULT_SUITES = {"gfx950": ("gfx950_1", ), "sm90": ("sm90_all", )}
+# The sm100 export set mirrors the gfx950 focus shapes: D128 self-attention
+# at production sequence lengths, in the dtype the sm100 impl accepts, plus
+# one causal shape so the packed_causal masking value is covered.
+SM100_1 = FocusSuite(name="sm100_1", op="flash_attn_varlen",
+                     shapes=(*GFX950_1.shapes, FlashAttentionVarlenShape(10, 1000, 1000, 1, 128, True, "fp16")))
+FOCUS_SUITES = (GFX950_1, SM90_1, SM90_2, SM90_3, SM90_ALL, SM100_1)
+DEFAULT_SUITES = {"gfx950": ("gfx950_1", ), "sm90": ("sm90_all", ), "sm100": ("sm100_1", )}
 FOCUS = FocusRegistry("flash_attn_varlen", FOCUS_SUITES, DEFAULT_SUITES)
 CORRECTNESS_SHAPES = tuple(dict.fromkeys((*SYNTHETIC, *FOCUS.all_shapes())))
 
