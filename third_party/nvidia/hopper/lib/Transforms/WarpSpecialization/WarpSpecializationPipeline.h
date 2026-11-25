@@ -43,6 +43,9 @@ struct MemoryPlannerOptions {
   bool smemCircularReuse = false;
   bool smemPlanSearch = false;
   bool reserveAuxiliarySmem = true;
+  // smemBudget is the device limit: fail on a plan whose buffers alone exceed
+  // it, since it can never launch.
+  bool rejectOverDeviceLimit = true;
 };
 
 // Plans SMEM/TMEM allocation (multi-buffering, liveness). Production passes

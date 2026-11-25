@@ -1298,6 +1298,12 @@ class CUDABackend(BaseBackend):
             nvidia.passes.ttnvgpuir.add_verify_named_barrier_counts(pm)
 
         pm.run(mod, "make_ttgir")
+        # The autoWS memory planner records a plan that cannot fit; report it
+        # as the launch-time shared-memory check would, so autotuners skip it.
+        ws_smem = mod.get_int_attr("ttg.ws_shared_memory_overflow")
+        if ws_smem is not None:
+            from triton.runtime.errors import OutOfResources
+            raise OutOfResources(ws_smem, _max_shared_mem_for_capability(capability), "shared memory")
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         # Capture compiler-synthesized auto-TMA descriptors (PromoteLoadToTMA)
         # here, AFTER WS / 2-CTA / data-partitioning, so each recipe's
