@@ -54,6 +54,19 @@ from triton.tlx.ops.kernels.mm._sm100_core import (
             block_shape=[BLOCK_N // NUM_CTAS, BLOCK_K],
         )
 
+    # Allocate all barriers before any TMEM allocation. With NUM_CTAS == 2 (paired MMA), entry-block barrier inits
+    # must precede the first TMEM alloc so a cluster sync fits between them; the compiler hoists them and errors if
+    # it cannot. Not required for NUM_CTAS == 1.
+    if NUM_CTAS == 2:
+        cta_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=2)
+    else:
+        cta_bars = None
+    A_smem_full_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1)
+    A_smem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1)
+    B_smem_full_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
+    tmem_full_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1)
+    tmem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=EPILOGUE_SUBTILE)
+
     if A_ROW_MAJOR:
         buffers_A = tlx.local_alloc(
             (BLOCK_M_SPLIT, BLOCK_K),
@@ -105,17 +118,9 @@ from triton.tlx.ops.kernels.mm._sm100_core import (
     if NUM_CTAS == 2:
         cluster_cta_rank = tlx.cluster_cta_rank()
         pred_cta0 = cluster_cta_rank == 0
-        cta_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=2)
     else:
         cluster_cta_rank = 0
         pred_cta0 = False
-        cta_bars = None
-
-    A_smem_full_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1)
-    A_smem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1)
-    B_smem_full_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
-    tmem_full_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1)
-    tmem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=EPILOGUE_SUBTILE)
 
     with tlx.async_tasks():
         with tlx.async_task("default"):  # epilogue consumer
