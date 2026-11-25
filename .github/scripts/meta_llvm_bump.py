@@ -1,4 +1,4 @@
-"""Decide whether cmake/meta-llvm-info.json should move to a newer fork release (pure, unit-tested).
+"""Pure helpers for Meta LLVM bundle bumps: release lookup, manifest rendering and PR/issue text.
 
 The Meta LLVM fork publishes immutable releases named llvm-<sha8>-<build> whose
 assets are llvm-<sha8>-<suffix>-<build>.tar.gz plus a .sha256 file each. A
@@ -11,17 +11,6 @@ import re
 import textwrap
 
 _TAG = re.compile(r"^llvm-([0-9a-f]{8})-([0-9]+)$")
-
-
-def oai_pins(llvm_info, llvm_build_info):
-    """OAI core revisions a fork build may sit on.
-
-    Which manifest is authoritative differs per branch: on main llvm-build-info.json
-    leads llvm-info.json until OAI publishes; on release/3.8.x llvm-build-info.json is
-    a stale leftover and llvm-info.json is the pin. Each branch's build_helpers.py
-    enforces its own rule, so accept either and flag only a pin matching neither.
-    """
-    return {info["llvm_hash"] for info in (llvm_info, llvm_build_info) if info}
 
 
 def same_tree_chain(commits):
@@ -92,34 +81,18 @@ def render(meta, release, sha256sums, repository):
     return updated
 
 
-def decide(meta, pins, chain, release, required):
-    """One of ("pin-moved"|"no-release"|"incomplete"|"current"|"bump", detail)."""
-    if meta["based_on_oai_llvm_hash"] not in pins:
-        return "pin-moved", (f"meta-llvm-info.json is based on {meta['based_on_oai_llvm_hash'][:12]} but OAI pins "
-                             f"{', '.join(sorted(p[:12] for p in pins))}")
-    if release is None:
-        return "no-release", f"no release yet for fork tip {chain[0][:12]}"
-    missing = sorted(set(required) - set(variants(release)))
-    if missing:
-        return "incomplete", f"{release['tag_name']} lacks {', '.join(missing)}"
-    if meta["llvm_hash"] == release["target_commitish"] and set(meta["sha256sum"]) >= set(variants(release)):
-        return "current", f"already pins {release['tag_name']}"
-    return "bump", release["tag_name"]
-
-
 def _bump_text(repo, target, fork, fork_branch, meta, new, release=None):
     """(problem, solution, test plan, log header) prose shared by the commit message and the PR body."""
     old_tag = meta["release_base_url"].rsplit("/", 1)[-1]
-    tip, base = new["llvm_hash"], new["based_on_oai_llvm_hash"]
+    tip = new["llvm_hash"]
     tag = new["release_base_url"].rsplit("/", 1)[-1]
     published = f" (published {_date(release)})" if release else ""
-    return (
-        f"{repo}@{target} tracks the Meta LLVM fork branch {fork}@{fork_branch}. It pins {old_tag}, but the "
-        "fork branch has a newer published release.",
-        f"This points cmake/meta-llvm-info.json at {tag}{published}, built from fork tip {tip[:12]} on the same OAI "
-        f"pin {base[:12]}.", "The pinned digests match the release's .sha256 assets and GitHub's asset digests "
-        f"({', '.join(sorted(new['sha256sum']))}).",
-        f"Fork changes in this bump ({meta['llvm_hash'][:12]}...{tip[:12]}):")
+    return (f"{repo}@{target} tracks the Meta LLVM fork branch {fork}@{fork_branch}. It pins {old_tag}, but the "
+            "fork branch has a newer published release.",
+            f"This points cmake/meta-llvm-info.json at {tag}{published}, built from fork tip {tip[:12]}.",
+            "The pinned digests match the release's .sha256 assets and GitHub's asset digests "
+            f"({', '.join(sorted(new['sha256sum']))}).",
+            f"Fork changes in this bump ({meta['llvm_hash'][:12]}...{tip[:12]}):")
 
 
 def commit_message(title, repo, target, fork, fork_branch, meta, new, log, width=72):
@@ -248,6 +221,78 @@ def verify_state(runs, workflows, age_hours, timeout_hours):
 def verdict(latest):
     """"ready" when every required run concluded success, else "failed"."""
     return "ready" if all(run["conclusion"] == "success" for run in latest.values()) else "failed"
+
+
+def readiness_text(kind, sha, tree, build, branch, source_url, ready_url, marker):
+    return '\n'.join([
+        marker,
+        '',
+        f'The beta {kind} LLVM bundle is published and all required SDK validations passed.',
+        '',
+        f'- LLVM source: [`{sha[:12]}`](https://github.com/facebookexperimental/llvm-project/commit/{sha}) on `{branch}`.',
+        f'- Source tree: `{tree}`. Packaging revision: `{build}`.',
+        f'- [Source record]({source_url}) and [SDK validation record]({ready_url}).',
+        '',
+        'Triton correctness and A/B performance have not been verified by this SDK build. '
+        'Use a candidate PR to validate the consumer before adoption.',
+        '',
+        'Keep this issue open until the manifest update lands and the exported consumer pin is verified. '
+        'This issue does not authorize landing.',
+        '',
+    ])
+
+
+def candidate_text(kind, old, source, ready_url, base_sha):
+    """Draft-candidate text in the updater's Summary/Test Plan format."""
+    sha, build = source['llvm_sha'], source['build_number']
+    title = f'[Meta LLVM] {kind} bundle candidate: {old["llvm_hash"][:8]} to {sha[:8]}'
+    problem = (
+        f'Triton at {base_sha[:12]} selects the {kind} SDK at {old["llvm_hash"][:12]}. The tracked LLVM branch has '
+        'a validated bundle that has not yet been checked with this Triton consumer.')
+    solution = 'This proposes the published SDK as a draft candidate for consumer correctness and performance validation.'
+    test = 'The source, tree and platform digests match the published SDK validation record.'
+    marker = f'<!-- llvm-candidate beta/{kind}/{sha}/{build}/{base_sha} -->'
+    body = '\n'.join([
+        '# Summary:',
+        '',
+        '**Problem**',
+        '',
+        problem,
+        '',
+        '**Solution**',
+        '',
+        solution,
+        '',
+        '# Test Plan:',
+        '',
+        test,
+        '',
+        f'SDK validation provenance: [completion record]({ready_url}).',
+        '',
+        *_job_block([('Triton correctness', 'Not run'), ('A/B performance', 'Not run')]),
+        '',
+        'Source comparison: ' + compare_url('facebookexperimental/llvm-project', old['llvm_hash'], sha) + '.',
+        '',
+        marker,
+    ])
+    commit = '\n'.join([
+        title,
+        '',
+        'Summary:',
+        '**Problem**',
+        '',
+        textwrap.fill(problem, 72),
+        '',
+        '**Solution**',
+        '',
+        textwrap.fill(solution, 72),
+        '',
+        'Test Plan:',
+        '',
+        textwrap.fill(test, 72),
+        'Consumer correctness and performance checks have not run.',
+    ])
+    return title, commit, body
 
 
 def _date(release):
