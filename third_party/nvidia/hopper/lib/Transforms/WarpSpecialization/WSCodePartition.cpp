@@ -6610,14 +6610,22 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
             lastStoreWait = nullptr;
         }
         if (lastStoreWait) {
-          // Rotating the wait further would place the release after the next
-          // tile's staging waits, whose data depends on the loads this release
-          // gates; cap the wait's rotation at one iteration.
+          // The loader waits on this single-slot barrier before it refills the
+          // host for the next tile, and this task's next wait_barriers (that
+          // tile's accumulator and staging waits) depend on that refill. If
+          // the release lands after one of them, neither side can proceed
+          // and the kernel hangs. Cap the wait's rotation at one iteration,
+          // and mark it so doTMAStoreWaitReorder keeps it ahead of every
+          // wait_barrier it would otherwise be rotated past.
           auto rotate = lastStoreWait->getAttrOfType<IntegerAttr>(
               "can_rotate_by_buffer_count");
-          if (rotate && rotate.getInt() > 1)
-            lastStoreWait->setAttr("can_rotate_by_buffer_count",
-                                   IntegerAttr::get(rotate.getType(), 1));
+          if (rotate) {
+            if (rotate.getInt() > 1)
+              lastStoreWait->setAttr("can_rotate_by_buffer_count",
+                                     IntegerAttr::get(rotate.getType(), 1));
+            lastStoreWait->setAttr("tma_store_wait_before_wait_barrier",
+                                   UnitAttr::get(ctx));
+          }
         }
         releaseAtBottom =
             !lastStoreWait && !hasTopLevelStore && nestedStoresWaitedInBody;
