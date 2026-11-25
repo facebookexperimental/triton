@@ -374,6 +374,12 @@
 - **Fix**: before `doTaskIdPropagate`, if the function has any `ttg.partition`/`async_task_id` tag but some `tt.warp_specialize` loop has none, bail out of WS for the whole function. Placing the skipped loop in a single partition is not safe either, since nothing orders it after the other partitions' writes.
 - **Lit test**: `ws-skip-unpartitioned-second-loop.mlir` (register GEMM loop + pointer-load/TMA-reduce loop through PSM and WS): one `tt.descriptor_reduce`, no `ttg.warp_specialize`. Without the fix the reduce appears 3 times.
 
+### 50. Phase 3.6 lands a TMA staging buffer on another staging buffer → cross-tile WAR token dropped (2026-10-16, fixed)
+- **Symptom**: Silent wrong output (about 45% of elements, unstable across relaunches) in a persistent autoWS GEMM with two TMEM accumulators whose fp32 tiles are both TMA-stored through one descriptor under `separate_epilogue_store=True` (BM64 BN128 BK128 `num_stages=1`). SES=0 and non-persistent are correct.
+- **Root cause**: the plan is over budget, so Phase 3.6 (`WSMemoryPlanner.cpp`, `findReuseCandidate`) picks hosts for both staging buffers: staging 4 → staging 5, then staging 5 → operand 9. `mergeStagingReuseIntoHost` never realizes a staging host, so 4 stays standalone and the planner under-counted SMEM. Worse, Step 7.5 (`WSCodePartition.cpp`) resolves each pair's "load" task from the host channel's producer: the staging fill task for 4→5, the real load task for 5→9. The pairs disagree, so it only logged "unhandled" and inserted no cross-tile WAR token, yet 5→9 was still realized: the next tile's operand load could overwrite staging 5 while its TMA store was reading it.
+- **Fix**: `findReuseCandidate` skips TMA staging targets (and any target in the candidate's own `buffer.id` group), so the planner only proposes realizable reuses and counts SMEM honestly. The Step 7.5 side (collect only realizable pairs; drop any reuse it cannot guard) is the companion fix in the parent PR.
+- **Lit test**: `ws_memory_planner_staging_no_staging_reuse.mlir` (real pre-planner IR: staging 4 → operand 9, staging 5 → operand 12, and planner + code partition emit the WAR token and realize both reuses). Fails on the unfixed planner.
+
 ## Debugging Workflow
 - `t.dump` captures IR after each WarpSpec pass (doTaskIdPropagate → doBufferAllocation → doMemoryPlanner → doCodePartition → ...)
 - IR after PartitionSchedulingMeta uses `ttg.partition = array<i32: N>` attributes (not `async_task_id`)
