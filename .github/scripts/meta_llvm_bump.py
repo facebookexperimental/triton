@@ -226,36 +226,22 @@ def verdict(latest):
 def readiness_text(kind, sha, tree, build, branch, source_url, ready_url, marker, pr, run_url):
     sdk = 'AMD codegen' if kind == 'amd' else 'core'
     fork = 'facebookexperimental/llvm-project'
-    if pr.get('url'):
-        lines = [
-            f"- Draft PR: {pr['url']}, updating the {sdk} pin" +
-            (f" from `{pr['old'][:8]}` to `{sha[:8]}` ([LLVM changes]({compare_url(fork, pr['old'], sha)}))."
-             if pr.get('old') else f" to `{sha[:8]}`.")
-        ]
+    if pr['url']:
+        link = (f"- Draft PR: {pr['url']}, updating the {sdk} pin from `{pr['old'][:8]}` to `{sha[:8]}` "
+                f"([LLVM changes]({compare_url(fork, pr['old'], sha)})).")
     else:
-        lines = [
-            f"- Draft PR: not created ({pr['status']}; [candidate run]({run_url})). Fix the cause and rerun the "
-            'workflow to create it.'
-        ]
-    lines += [
-        f'- LLVM source: [`{sha[:12]}`](https://github.com/{fork}/commit/{sha}) on `{branch}`, tree `{tree}`, '
-        f'packaging revision `{build}`.', f'- [Source record]({source_url}) and [SDK validation record]({ready_url}).'
-    ]
-    if pr.get('error') and pr.get('url'):
-        lines.append(f'- The [candidate run]({run_url}) failed after creating the PR, so its consumer tests or the '
-                     'cleanup of older candidates may not have run. Rerun the workflow.')
-    if pr.get('kept'):
-        lines.append('- Still open because they were reviewed or changed: ' + ', '.join(f'#{n}' for n in pr['kept']) +
-                     '. Close them once they are no longer needed.')
+        link = f'- Draft PR: not created; see the [failed run]({run_url}), fix the cause and rerun the workflow.'
     return '\n'.join([
-        marker, '', f'A validated {sdk} LLVM SDK is ready for Triton adoption.', '', *lines, '', '## Action items', '',
-        '- [ ] Review the Triton GPU tests in the draft PR checks.',
+        marker, '', f'A validated {sdk} LLVM SDK is ready for Triton adoption.', '', link,
+        f'- LLVM source: [`{sha[:12]}`](https://github.com/{fork}/commit/{sha}) on `{branch}`, tree `{tree}`, '
+        f'packaging revision `{build}`.', f'- [Source record]({source_url}) and [SDK validation record]({ready_url}).',
+        '', '## Action items', '', '- [ ] Review the Triton GPU tests in the draft PR checks.',
         '- [ ] Review the TLX.ops perf smoke comment on the draft PR.',
         '- [ ] If both are acceptable, mark the PR ready for review, then import and land it.',
         '- [ ] If Triton does not build or pass with this pin, prepare a combined source and pin change instead of '
         'landing the pin-only PR.', '- [ ] After landing, confirm the exported pin selects this bundle, then close '
-        'this issue.', '', 'A newer bundle closes this issue and its draft PR automatically unless the PR was '
-        'reviewed or changed. This issue does not authorize landing.', ''
+        'this issue.', '', 'A newer bundle closes this issue and its PR while the PR is still a draft. Mark the PR '
+        'ready for review to keep it. This issue does not authorize landing.', ''
     ])
 
 
@@ -292,7 +278,7 @@ def candidate_text(kind, old, source, ready_url, base_sha):
                      ('TLX.ops perf smoke', 'Starts after this PR is created; results are posted as a PR comment')]),
         '',
         'Keep this PR in draft until the Triton GPU tests and perf smoke results are reviewed. A newer bundle '
-        'closes it automatically unless it was reviewed or changed.',
+        'closes it while it is a draft; mark it ready for review to keep it.',
         '',
         'Source comparison: ' + compare_url('facebookexperimental/llvm-project', old['llvm_hash'], sha) + '.',
         '',
