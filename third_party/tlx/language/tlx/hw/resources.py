@@ -302,8 +302,10 @@ class BlackwellWSGemmConfig:
     num_mma_groups: int
     num_ctas: int
     epilogue_subtile: int
-    #: Bytes per element of the A/B operands and the epilogue staging buffer.
+    #: Bytes per element of the A/B operands.
     elem_bytes: int = OPERAND_ELEM_BYTES
+    #: Bytes per element of the epilogue staging buffer (the stored output).
+    out_elem_bytes: int = OPERAND_ELEM_BYTES
 
     @classmethod
     def from_dict(cls, config: dict[str, Any]) -> BlackwellWSGemmConfig:
@@ -367,7 +369,9 @@ class BlackwellWSGemmModel:
         """
         smem_a = (tile.block_m * tile.block_k * tile.elem_bytes * tile.num_smem_buffers)
         smem_b = (tile.block_k * (tile.block_n // tile.num_ctas) * tile.elem_bytes * tile.num_smem_buffers)
-        smem_epilog = (tile.block_m * tile.slice_size * tile.elem_bytes if charge_epilogue else 0)
+        # The template double-buffers the staging tile even with one MMA group.
+        smem_epilog = (max(tile.num_mma_groups, 2) * tile.block_m_per_group * tile.slice_size *
+                       tile.out_elem_bytes if charge_epilogue else 0)
         # In 2-CTA mode each CTA allocates its own copy of the barriers.
         smem_barriers = (tile.num_smem_buffers * tile.num_mma_groups * MBARRIER_BYTES *
                          (2 if tile.num_ctas == 2 else 1))
