@@ -987,7 +987,7 @@ def TTG_Clock64Op
 }
 
 def TTG_BarrierOp : TTG_Op<"barrier"> {
-  let summary = "Synchronizes execution and memory accesses within a CTA or warp.";
+  let summary = "Synchronizes execution and memory accesses within a CTA or warp, optionally ordering global memory at GPU scope.";
   let description = [{
     At the default CTA scope, the `barrier` op synchronises the execution and all operations between the selected address spaces for all
     threads in the CTA. It is used to coordinate communication between threads in the CTA.
@@ -1003,12 +1003,25 @@ def TTG_BarrierOp : TTG_Op<"barrier"> {
     Warp scope currently supports only the `local` address space. It synchronizes
     all lanes of each participating warp and orders their shared memory accesses.
 
+    GPU scope is the same CTA-wide rendezvous, but it orders the selected global address spaces at
+    GPU (device, or agent on AMD) scope. Global memory operations that any thread of the CTA performed
+    before the barrier become visible to the whole device before any thread of the CTA performs a memory
+    operation after it. Memory operations after the barrier observe writes that were visible device-wide
+    before it. Use it when the CTA communicates with other CTAs through global memory, for example before
+    one thread publishes a flag that other CTAs poll for data the whole CTA wrote. The flag accesses
+    should be atomic: a release store to publish and an acquire load to observe give this ordering under
+    the memory model of every target. Asynchronous copies (for example TMA or TDM stores) are covered only
+    once their completion has been waited for before the barrier. It is NOT a grid-wide
+    barrier: it does not wait for, or synchronize with, any other CTA. GPU scope requires the
+    `global_read` or `global_write` address space. Shared memory and tensor memory are CTA-local, so
+    `local`, `tensor_read` and `tensor_write` keep their CTA-scope meaning when combined with it.
+
     The mandatory `addrspace` attribute is a bitmask describing which address spaces will be visible when the `barrier` completes:
 
     * `none`         control-only synchronization (no memory ordering).
     * `local`        shared-memory operations are complete and visible within the selected scope.
-    * `global_read`  global memory reads are complete and visible CTA-wide.
-    * `global_write` global memory writes are complete and visible CTA-wide.
+    * `global_read`  global memory reads are complete and visible CTA-wide (device-wide at GPU scope).
+    * `global_write` global memory writes are complete and visible CTA-wide (device-wide at GPU scope).
     * `tensor_read`  tensor memory read operations are complete and visible CTA-wide.
     * `tensor_write` tensor memory write operations are complete and visible CTA-wide.
     * `all`          convenience alias for `["local", "global_read", "global_write", "tensor_read", "tensor_write"]`.
@@ -1021,6 +1034,7 @@ def TTG_BarrierOp : TTG_Op<"barrier"> {
     ttg.barrier local
     ttg.barrier local|global_read|global_write
     ttg.barrier warp local
+    ttg.barrier gpu all
     ```
   }];
 
@@ -1031,6 +1045,7 @@ def TTG_BarrierOp : TTG_Op<"barrier"> {
 
   let extraClassDeclaration = [{
     bool isWarp() { return getScope() == BarrierScope::Warp; }
+    bool isGPU() { return getScope() == BarrierScope::GPU; }
 
     /// Returns true if the barrier includes all of the given address spaces.
     /// For example, hasAddrSpaces(Local | GlobalRead) returns true only if

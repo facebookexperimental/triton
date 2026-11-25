@@ -132,3 +132,64 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// ==== GPU-scope barrier between the stages of a pipelined_for body ====
+//
+// The two warp groups reach a barrier between stages one stage apart, so a
+// GPU-scope barrier there cannot order the memory operations of the whole CTA.
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @bad_gpu_barrier_between_stages(%n: index, %ptr: !tt.ptr<f32>) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %v0 = arith.constant 0.0 : f32
+    %v1 = arith.constant 1.0 : f32
+
+    scf.for %i = %c0 to %n step %c1 {
+      scf.execute_region {
+        tt.store %ptr, %v0 : !tt.ptr<f32>
+        scf.yield
+      } {triton.warp_pipeline.stage = "stage0"}
+
+      // expected-error @+1 {{gpu-scope barrier cannot appear between warp-pipeline stages}}
+      ttg.barrier gpu all
+
+      scf.execute_region {
+        tt.store %ptr, %v1 : !tt.ptr<f32>
+        scf.yield
+      } {triton.warp_pipeline.stage = "stage1"}
+
+      scf.yield
+    } {triton.warp_pipeline.pipelined_for}
+
+    tt.return
+  }
+}
+
+// -----
+
+// ==== GPU-scope barrier between the stages of a flat pipeline ====
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @bad_gpu_barrier_between_flat_stages(%ptr: !tt.ptr<f32>, %flag: !tt.ptr<i32>) {
+    %v0 = arith.constant 0.0 : f32
+    %one = arith.constant 1 : i32
+
+    scf.execute_region no_inline {
+      tt.store %ptr, %v0 : !tt.ptr<f32>
+      scf.yield
+    } {triton.warp_pipeline.stage = "stage0"}
+
+    // expected-error @+1 {{gpu-scope barrier cannot appear between warp-pipeline stages}}
+    ttg.barrier gpu all
+
+    scf.execute_region no_inline {
+      tt.store %flag, %one : !tt.ptr<i32>
+      scf.yield
+    } {triton.warp_pipeline.stage = "stage1"}
+
+    tt.return
+  }
+}

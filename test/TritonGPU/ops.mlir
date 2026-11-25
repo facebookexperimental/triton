@@ -619,3 +619,21 @@ module attributes {"ttg.num-warps" = 4 : i32} {
     tt.return
   }
 }
+
+// -----
+
+// The scope keyword is printed only when it is not the default CTA scope.
+// CHECK-LABEL: @barrier_scopes
+tt.func @barrier_scopes() {
+  // CHECK-NEXT: ttg.barrier local
+  ttg.barrier local
+  // CHECK-NEXT: ttg.barrier all
+  ttg.barrier cta all
+  // CHECK-NEXT: ttg.barrier warp local
+  ttg.barrier warp local
+  // CHECK-NEXT: ttg.barrier gpu all
+  ttg.barrier gpu all
+  // CHECK-NEXT: ttg.barrier gpu global_read|global_write
+  ttg.barrier gpu global_read|global_write
+  tt.return
+}

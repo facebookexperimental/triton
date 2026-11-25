@@ -2164,8 +2164,16 @@ class TritonSemantic(Generic[TensorTy]):
         x.handle.set_attr("tt.constancy", ir.make_attr(values, x.handle.get_context()))
         return x
 
-    def debug_barrier(self) -> TensorTy:
-        return self.make_tensor(self.builder.create_barrier(), tl.void)
+    def debug_barrier(self, scope: str = "cta") -> TensorTy:
+        # Not _str_to_scope: that defaults to "gpu" and accepts "sys", neither
+        # of which a barrier supports.
+        if scope == "cta":
+            mem_scope = ir.MEM_SYNC_SCOPE.CTA
+        elif scope == "gpu":
+            mem_scope = ir.MEM_SYNC_SCOPE.GPU
+        else:
+            raise ValueError(f"debug_barrier scope must be 'cta' or 'gpu', got {scope!r}")
+        return self.make_tensor(self.builder.create_barrier(mem_scope), tl.void)
 
     def grid_dependency_wait(self) -> None:
         self.builder.create_grid_dependency_wait()

@@ -2990,6 +2990,14 @@ void printSimplifiedOp(
   // they constrain scheduling but not results. Local must match exactly -- a
   // wider mask would be silently under-fenced, so it goes to the generic path.
   if (auto barrier = dyn_cast<ttg::BarrierOp>(op)) {
+    // A GPU-scope barrier orders global memory device-wide on every target.
+    // tl.debug_barrier(scope="gpu") fences every address space, so it covers
+    // any subset the barrier selects.
+    if (barrier.isGPU()) {
+      os << "tl.debug_barrier(scope=\"gpu\")";
+      printLocComment(op, os);
+      return;
+    }
     if (isAMDTarget(op) && barrier.getAddrSpace() == ttg::AddrSpace::Local) {
       os << "tlx.workgroup_barrier()";
       printLocComment(op, os);

@@ -15,6 +15,7 @@ import triton.language.extra.tlx as tlx
 from triton import knobs
 from triton._internal_testing import is_hip
 from triton.compiler.compiler import ASTSource, compile as triton_compile
+from triton.compiler.errors import CompilationError
 from triton.backends.compiler import GPUTarget
 from triton.runtime.jit import MockTensor
 from triton.tlx.ops.kernels.flash_attn import gfx950 as _amd_fa_cluster_module
@@ -681,3 +682,129 @@ def test_a4w4_inter_wave_merged_scale_codegen_gfx950(device, fresh_triton_cache)
     assert ".sgpr_count:     53" in amdgcn or ".sgpr_count:     55" in amdgcn
     assert ".sgpr_spill_count: 0" in amdgcn
     assert re.search(r"^\s*\.vgpr_spill_count:\s*(0|46|7|43)\s*$", amdgcn, re.MULTILINE)
+
+
+@triton.jit
+def _publish_partial_tile_kernel(partial_ptr, flag_ptr, BLOCK: tl.constexpr, SCOPE: tl.constexpr):
+    # Stream-K style hand-off: every thread stores part of a partial tile, the
+    # barrier publishes it, then an atomic raises the ready flag that other
+    # programs poll. The atomic is relaxed so that only the barrier adds code
+    # around s_barrier. SCOPE "default" calls the barrier without a scope.
+    offsets = tl.arange(0, BLOCK)
+    tl.store(partial_ptr + offsets, offsets.to(tl.float32))
+    if SCOPE == "default":
+        tl.debug_barrier()
+    else:
+        tl.debug_barrier(scope=SCOPE)
+    tl.atomic_xchg(flag_ptr, 1, sem="relaxed", scope="gpu")
+
+
+def _compile_publish_partial_tile(target, scope):
+    return compile_for_target(
+        _publish_partial_tile_kernel,
+        signature={"partial_ptr": "*fp32", "flag_ptr": "*i32", "BLOCK": "constexpr", "SCOPE": "constexpr"},
+        constexprs={"BLOCK": 256, "SCOPE": scope},
+        target=target,
+    )
+
+
+_VECTOR_MEMORY_OP = r"^(buffer|global|flat|scratch)_"
+_BLOCK_END = re.compile(r"^(s_branch|s_cbranch_\w+|s_setpc_b64|s_endpgm)\b")
+
+
+def _asm_lines(amdgcn):
+    """The instructions and basic-block labels of an AMDGCN listing."""
+    lines = (line.split(";", 1)[0].strip() for line in amdgcn.splitlines())
+    return [
+        line for line in lines
+        if re.fullmatch(r"\.LBB\w+:", line) or (line and not line.startswith(".") and not line.endswith(":"))
+    ]
+
+
+def _nearest(lines, index, step, pattern):
+    """The closest line to lines[index], searching in direction step (-1 or 1), that matches pattern.
+
+    The search stops at labels and branches, so it stays in the basic block of
+    lines[index]: a match before it is on every path to it, and a match after it
+    runs whenever it does.
+    """
+    i = index + step
+    while 0 <= i < len(lines) and not lines[i].endswith(":") and not _BLOCK_END.match(lines[i]):
+        if re.search(pattern, lines[i]):
+            return lines[i]
+        i += step
+    return None
+
+
+def _agent_fences(llir):
+    """The orderings of the agent-scope fences in an LLVM IR listing, in program order."""
+    return re.findall(r'\bfence syncscope\("agent"\) (\w+)', llir)
+
+
+@pytest.mark.parametrize("arch", ["gfx942", "gfx950"])
+@pytest.mark.parametrize("scope", ["default", "cta", "gpu"])
+def test_debug_barrier_scope_codegen_cdna(arch, scope):
+    """scope="gpu" adds an agent-scope release and acquire around s_barrier; the default scope is "cta"."""
+    compiled = _compile_publish_partial_tile(GPUTarget("hip", arch, 64), scope)
+    assert ("ttg.barrier gpu" in compiled.asm["ttgir"]) == (scope == "gpu")
+    assert _agent_fences(compiled.asm["llir"]) == (["release", "acquire"] if scope == "gpu" else [])
+    amdgcn = compiled.asm["amdgcn"]
+    lines = _asm_lines(amdgcn)
+    barriers = [i for i, line in enumerate(lines) if line == "s_barrier"]
+    assert barriers
+    vmcnt0 = r"^s_waitcnt\b.*\bvmcnt\(0\)"
+    for i in barriers:
+        last = _nearest(lines, i, -1, f"{_VECTOR_MEMORY_OP}|{vmcnt0}")
+        assert last is not None
+        if scope == "gpu":
+            # Release: write L2 back, then wait for every vector memory
+            # operation, the partial-tile stores included.
+            assert re.search(vmcnt0, last)
+            assert _nearest(lines, i, -1, _VECTOR_MEMORY_OP) == "buffer_wbl2 sc1"
+            # Acquire: invalidate L2 before any later vector memory access.
+            assert _nearest(lines, i, 1, _VECTOR_MEMORY_OP) == "buffer_inv sc1"
+        else:
+            # The CTA barrier waits for nothing: the stores may still be in
+            # flight at s_barrier.
+            assert re.search(_VECTOR_MEMORY_OP, last)
+    if scope != "gpu":
+        assert "buffer_wbl2" not in amdgcn
+        assert "buffer_inv" not in amdgcn
+
+
+@pytest.mark.parametrize("scope", ["default", "cta", "gpu"])
+def test_debug_barrier_scope_codegen_gfx1250(scope):
+    """On gfx1250, scope="gpu" adds a cache invalidate after the split barrier."""
+    compiled = _compile_publish_partial_tile(GPUTarget("hip", "gfx1250", 32), scope)
+    # On this target LLVM can emit the same machine code for agent and cluster
+    # scope fences, so the LLVM IR pins the scope.
+    assert _agent_fences(compiled.asm["llir"]) == (["release", "acquire"] if scope == "gpu" else [])
+    amdgcn = compiled.asm["amdgcn"]
+    lines = _asm_lines(amdgcn)
+    signals = [i for i, line in enumerate(lines) if line.startswith("s_barrier_signal ")]
+    waits = [i for i, line in enumerate(lines) if line.startswith("s_barrier_wait ")]
+    assert signals and len(signals) == len(waits)
+    storecnt0 = r"^s_wait_storecnt(_dscnt)? 0x0$"
+    for signal, wait in zip(signals, waits):
+        if scope == "gpu":
+            # Release: every store has completed before the barrier.
+            last = _nearest(lines, signal, -1, f"{_VECTOR_MEMORY_OP}|{storecnt0}")
+            assert last is not None and re.search(storecnt0, last)
+            # Acquire: invalidate before any later vector memory access. LLVM
+            # picks the cache scope that covers the agent.
+            after = _nearest(lines, wait, 1, _VECTOR_MEMORY_OP)
+            assert after is not None and after.startswith("global_inv ")
+    if scope != "gpu":
+        assert "global_inv" not in amdgcn
+
+
+@pytest.mark.parametrize("scope", ["sys", "warp", "block"])
+def test_debug_barrier_invalid_scope(scope):
+    """Only "cta" and "gpu" are barrier scopes."""
+    with pytest.raises(CompilationError) as exc_info:
+        _compile_publish_partial_tile(GFX950, scope)
+    error = exc_info.value
+    while error.__cause__ is not None:
+        error = error.__cause__
+    assert isinstance(error, ValueError)
+    assert str(error) == f"debug_barrier scope must be 'cta' or 'gpu', got {scope!r}"

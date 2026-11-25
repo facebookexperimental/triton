@@ -254,6 +254,16 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.thr
     tt.return
   }
 
+  // A GPU-scope barrier puts a device-scope fence on each side of bar.sync.
+  // CHECK-LABEL: gpu_scope_barrier
+  // CHECK: fence.acq_rel.gpu;
+  // CHECK-NEXT: bar.sync 0;
+  // CHECK-NEXT: fence.acq_rel.gpu;
+  tt.func public @gpu_scope_barrier() {
+    ttg.barrier gpu all
+    tt.return
+  }
+
   // CHECK-LABEL: reduce_f16_store
   // SM80-NOT: add.rn.f16x2
   // SM90: add.rn.f16x2

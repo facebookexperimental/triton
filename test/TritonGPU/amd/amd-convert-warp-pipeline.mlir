@@ -864,6 +864,51 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 
 // -----
 
+// ---- Flat pipeline with GPU-scope barriers outside it ----
+//
+// GPU-scope barriers are rejected only between stages. One before the first
+// stage runs before the phase shift, and one after the last stage runs after
+// the reconverge, so both warp groups reach them in the same phase.
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @flat_pipeline_gpu_barriers_outside(%ptr: !tt.ptr<f32>, %flag: !tt.ptr<i32>) {
+    %v0 = arith.constant 0.0 : f32
+    %v1 = arith.constant 1.0 : f32
+    %one = arith.constant 1 : i32
+
+    ttg.barrier gpu all
+
+    scf.execute_region no_inline {
+      tt.store %ptr, %v0 : !tt.ptr<f32>
+      scf.yield
+    } {triton.warp_pipeline.stage = "stage0"}
+
+    scf.execute_region no_inline {
+      tt.store %ptr, %v1 : !tt.ptr<f32>
+      scf.yield
+    } {triton.warp_pipeline.stage = "stage1"}
+
+    ttg.barrier gpu all
+    tt.store %flag, %one : !tt.ptr<i32>
+    tt.return
+  }
+}
+
+// CHECK-LABEL: tt.func @flat_pipeline_gpu_barriers_outside
+// The first GPU-scope barrier, then the pre-barrier and phase shift.
+// CHECK: ttg.barrier gpu all
+// CHECK-NEXT: ttg.barrier local
+// CHECK: amdg.cond_barrier
+// CHECK: tt.store
+// CHECK: tt.store
+// The reconverge, then the second GPU-scope barrier and the flag store.
+// CHECK: amdg.cond_barrier
+// CHECK-NEXT: ttg.barrier gpu all
+// CHECK-NEXT: tt.store
+// CHECK: tt.return
+
+// -----
+
 // ---- Back-to-back: no cross-pipeline LDS dep → barriers eliminated ----
 //
 // Loop 1 reads+writes shared memory.  Loop 2 only does global ops (no LDS).
@@ -945,6 +990,208 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // No cross-pipeline LDS dep → barriers eliminated, phase carries over.
 // CHECK-NOT: amdg.cond_barrier
 // CHECK-NOT: ttg.barrier local
+// CHECK: scf.for
+// Post-loop reconverge for loop 2.
+// CHECK: amdg.cond_barrier
+// CHECK: tt.return
+
+// -----
+
+// ---- Back-to-back: a user GPU-scope barrier between pipelines is kept ----
+//
+// Three back-to-back pipelines. Loop 1 reads and writes shared memory, loops 2
+// and 3 only store to global memory. Between loops 1 and 2 nothing else runs,
+// so the boundary barriers are eliminated as above. Between loops 2 and 3 a
+// user GPU-scope barrier publishes loop 2's stores device-wide. It is not the
+// prelude barrier and must survive. The cond_barriers and the prelude barrier
+// around it stay too: without them the two warp groups would pass the GPU
+// barrier at different stages, so it would not order all of loop 2.
+//
+// Expected:
+//   ttg.barrier local          (pre-barrier for loop 1)
+//   amdg.cond_barrier          (phase shift for loop 1)
+//   scf.for { loop 1 }
+//   NO amdg.cond_barrier       (eliminated)
+//   NO ttg.barrier local       (eliminated)
+//   NO amdg.cond_barrier       (eliminated)
+//   scf.for { loop 2 }
+//   amdg.cond_barrier          (reconverge for loop 2)
+//   ttg.barrier gpu all        (user barrier)
+//   ttg.barrier local          (pre-barrier for loop 3)
+//   amdg.cond_barrier          (phase shift for loop 3)
+//   scf.for { loop 3 }
+//   amdg.cond_barrier          (reconverge for loop 3)
+
+#b2bgpu_blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [8, 8], warpsPerCTA = [8, 1], order = [1, 0]}>
+#b2bgpu_mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [2, 4], instrShape = [16, 16, 16], isTransposed = true}>
+#b2bgpu_shared = #ttg.swizzled_shared<{vec = 4, perPhase = 1, maxPhase = 16, order = [1, 0]}>
+#b2bgpu_smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @back_to_back_gpu_barrier_kept(
+      %lb: i32, %ub: i32, %step: i32,
+      %acc: tensor<256x256xf32, #b2bgpu_mma>,
+      %ptr: tensor<256x64x!tt.ptr<f16>, #b2bgpu_blocked>,
+      %gptr: !tt.ptr<f32>) {
+
+    %smem = ttg.local_alloc : () -> !ttg.memdesc<256x64xf16, #b2bgpu_shared, #b2bgpu_smem, mutable>
+    %v0 = arith.constant 0.0 : f32
+    %v1 = arith.constant 1.0 : f32
+
+    // Loop 1: stage0 reads LDS, stage1 writes LDS
+    %r1:2 = scf.for %i = %lb to %ub step %step
+        iter_args(%a1 = %acc, %s1 = %smem)
+        -> (tensor<256x256xf32, #b2bgpu_mma>, !ttg.memdesc<256x64xf16, #b2bgpu_shared, #b2bgpu_smem, mutable>) : i32 {
+      %ld1 = scf.execute_region -> tensor<256x16xf16, #ttg.dot_op<{opIdx = 0, parent = #b2bgpu_mma, kWidth = 4}>> no_inline {
+        %sub = ttg.memdesc_subslice %s1[0, 0] : !ttg.memdesc<256x64xf16, #b2bgpu_shared, #b2bgpu_smem, mutable> -> !ttg.memdesc<256x16xf16, #b2bgpu_shared, #b2bgpu_smem, mutable, 256x64>
+        %v = ttg.local_load %sub : !ttg.memdesc<256x16xf16, #b2bgpu_shared, #b2bgpu_smem, mutable, 256x64> -> tensor<256x16xf16, #ttg.dot_op<{opIdx = 0, parent = #b2bgpu_mma, kWidth = 4}>>
+        scf.yield %v : tensor<256x16xf16, #ttg.dot_op<{opIdx = 0, parent = #b2bgpu_mma, kWidth = 4}>>
+      } {triton.warp_pipeline.stage = "lds_load"}
+
+      %st1 = scf.execute_region -> !ttg.memdesc<256x64xf16, #b2bgpu_shared, #b2bgpu_smem, mutable> no_inline {
+        %data = tt.load %ptr : tensor<256x64x!tt.ptr<f16>, #b2bgpu_blocked>
+        ttg.local_store %data, %s1 : tensor<256x64xf16, #b2bgpu_blocked> -> !ttg.memdesc<256x64xf16, #b2bgpu_shared, #b2bgpu_smem, mutable>
+        scf.yield %s1 : !ttg.memdesc<256x64xf16, #b2bgpu_shared, #b2bgpu_smem, mutable>
+      } {triton.warp_pipeline.stage = "global_load_and_store"}
+
+      scf.yield %a1, %st1 : tensor<256x256xf32, #b2bgpu_mma>, !ttg.memdesc<256x64xf16, #b2bgpu_shared, #b2bgpu_smem, mutable>
+    } {triton.warp_pipeline.pipelined_for}
+
+    // Loop 2: global-only ops
+    scf.for %j = %lb to %ub step %step : i32 {
+      scf.execute_region no_inline {
+        tt.store %gptr, %v0 : !tt.ptr<f32>
+        scf.yield
+      } {triton.warp_pipeline.stage = "global_store_0"}
+
+      scf.execute_region no_inline {
+        tt.store %gptr, %v1 : !tt.ptr<f32>
+        scf.yield
+      } {triton.warp_pipeline.stage = "global_store_1"}
+
+      scf.yield
+    } {triton.warp_pipeline.pipelined_for}
+
+    ttg.barrier gpu all
+
+    // Loop 3: global-only ops
+    scf.for %k = %lb to %ub step %step : i32 {
+      scf.execute_region no_inline {
+        tt.store %gptr, %v1 : !tt.ptr<f32>
+        scf.yield
+      } {triton.warp_pipeline.stage = "global_store_2"}
+
+      scf.execute_region no_inline {
+        tt.store %gptr, %v0 : !tt.ptr<f32>
+        scf.yield
+      } {triton.warp_pipeline.stage = "global_store_3"}
+
+      scf.yield
+    } {triton.warp_pipeline.pipelined_for}
+
+    ttg.local_dealloc %smem : !ttg.memdesc<256x64xf16, #b2bgpu_shared, #b2bgpu_smem, mutable>
+    tt.return
+  }
+}
+
+// CHECK-LABEL: tt.func @back_to_back_gpu_barrier_kept
+// Pre-barrier and phase shift for loop 1.
+// CHECK: ttg.barrier local
+// CHECK: amdg.cond_barrier
+// CHECK: scf.for
+// Wrap-around barrier inside loop 1.
+// CHECK: ttg.barrier local
+// CHECK: scf.yield
+// Loops 1 and 2: barriers eliminated, phase carries over.
+// CHECK-NOT: amdg.cond_barrier
+// CHECK-NOT: ttg.barrier local
+// CHECK: scf.for
+// Loops 2 and 3: the user barrier and the boundary barriers around it stay.
+// CHECK: amdg.cond_barrier
+// CHECK-NEXT: ttg.barrier gpu all
+// CHECK-NEXT: ttg.barrier local
+// CHECK: amdg.cond_barrier
+// CHECK: scf.for
+// Post-loop reconverge for loop 3.
+// CHECK: amdg.cond_barrier
+// CHECK: tt.return
+
+// -----
+
+// ---- Back-to-back: a GPU-scope barrier after another user barrier ----
+//
+// Two global-only pipelines with no cross-pipeline LDS dependency. The user put
+// a CTA barrier and then a GPU-scope barrier between them, so the op right
+// after the post-loop cond_barrier is the CTA barrier, not the GPU-scope one.
+// The GPU-scope barrier still keeps the whole boundary: both cond_barriers and
+// both user barriers stay, so the warp groups reach it in the same phase.
+//
+// Expected:
+//   ttg.barrier local          (pre-barrier for loop 1)
+//   amdg.cond_barrier          (phase shift for loop 1)
+//   scf.for { loop 1 }
+//   amdg.cond_barrier          (reconverge for loop 1)
+//   ttg.barrier all            (user barrier)
+//   ttg.barrier gpu all        (user barrier)
+//   ttg.barrier local          (pre-barrier for loop 2)
+//   amdg.cond_barrier          (phase shift for loop 2)
+//   scf.for { loop 2 }
+//   amdg.cond_barrier          (reconverge for loop 2)
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @back_to_back_cta_then_gpu_barrier_kept(
+      %lb: i32, %ub: i32, %step: i32, %gptr: !tt.ptr<f32>) {
+    %v0 = arith.constant 0.0 : f32
+    %v1 = arith.constant 1.0 : f32
+
+    // Loop 1: global-only ops
+    scf.for %i = %lb to %ub step %step : i32 {
+      scf.execute_region no_inline {
+        tt.store %gptr, %v0 : !tt.ptr<f32>
+        scf.yield
+      } {triton.warp_pipeline.stage = "global_store_0"}
+
+      scf.execute_region no_inline {
+        tt.store %gptr, %v1 : !tt.ptr<f32>
+        scf.yield
+      } {triton.warp_pipeline.stage = "global_store_1"}
+
+      scf.yield
+    } {triton.warp_pipeline.pipelined_for}
+
+    ttg.barrier all
+    ttg.barrier gpu all
+
+    // Loop 2: global-only ops
+    scf.for %j = %lb to %ub step %step : i32 {
+      scf.execute_region no_inline {
+        tt.store %gptr, %v1 : !tt.ptr<f32>
+        scf.yield
+      } {triton.warp_pipeline.stage = "global_store_2"}
+
+      scf.execute_region no_inline {
+        tt.store %gptr, %v0 : !tt.ptr<f32>
+        scf.yield
+      } {triton.warp_pipeline.stage = "global_store_3"}
+
+      scf.yield
+    } {triton.warp_pipeline.pipelined_for}
+
+    tt.return
+  }
+}
+
+// CHECK-LABEL: tt.func @back_to_back_cta_then_gpu_barrier_kept
+// Pre-barrier and phase shift for loop 1.
+// CHECK: ttg.barrier local
+// CHECK: amdg.cond_barrier
+// CHECK: scf.for
+// The boundary stays: reconverge for loop 1, both user barriers, and the
+// pre-barrier and phase shift for loop 2.
+// CHECK: amdg.cond_barrier
+// CHECK-NEXT: ttg.barrier all
+// CHECK-NEXT: ttg.barrier gpu all
+// CHECK-NEXT: ttg.barrier local
+// CHECK: amdg.cond_barrier
 // CHECK: scf.for
 // Post-loop reconverge for loop 2.
 // CHECK: amdg.cond_barrier

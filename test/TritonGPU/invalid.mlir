@@ -1398,3 +1398,36 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     tt.return
   }
 }
+
+// -----
+
+tt.func @barrier_warp_all() {
+  // expected-error @+1 {{warp scope supports only the local address space}}
+  ttg.barrier warp all
+  tt.return
+}
+
+// -----
+
+// Shared memory is CTA-local, so GPU scope needs a global address space.
+tt.func @barrier_gpu_local() {
+  // expected-error @+1 {{gpu scope requires the global_read or global_write address space}}
+  ttg.barrier gpu local
+  tt.return
+}
+
+// -----
+
+tt.func @barrier_gpu_none() {
+  // expected-error @+1 {{gpu scope requires the global_read or global_write address space}}
+  ttg.barrier gpu none
+  tt.return
+}
+
+// -----
+
+tt.func @barrier_gpu_tensor() {
+  // expected-error @+1 {{gpu scope requires the global_read or global_write address space}}
+  ttg.barrier gpu tensor_read|tensor_write
+  tt.return
+}

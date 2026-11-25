@@ -336,6 +336,16 @@ struct BarrierOpConversion : public ConvertOpToLLVMPattern<BarrierOp> {
   LogicalResult
   matchAndRewrite(BarrierOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    // A program runs on a single thread, so the rendezvous itself is a no-op.
+    // Programs run concurrently on other threads, though, so a GPU-scope
+    // barrier keeps a fence that orders the program's memory operations
+    // before it against those after it.
+    if (op.isGPU()) {
+      LLVM::FenceOp::create(rewriter, op.getLoc(),
+                            LLVM::AtomicOrdering::acq_rel, StringRef());
+      rewriter.eraseOp(op);
+      return success();
+    }
     // Just make it a no-op for now
     rewriter.eraseOp(op);
     return success();

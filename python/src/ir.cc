@@ -2286,10 +2286,25 @@ void init_triton_ir(py::module_ &m) {
            [](TritonOpBuilder &self) {
              self.create<GridDependencyLaunchDependentsOp>();
            })
-      .def("create_barrier",
-           [](TritonOpBuilder &self) {
-             self.create<triton::gpu::BarrierOp>(triton::gpu::AddrSpace::All);
-           })
+      .def(
+          "create_barrier",
+          [](TritonOpBuilder &self, MemSyncScope scope) {
+            triton::gpu::BarrierScope barrierScope;
+            switch (scope) {
+            case MemSyncScope::CTA:
+              barrierScope = triton::gpu::BarrierScope::CTA;
+              break;
+            case MemSyncScope::GPU:
+              barrierScope = triton::gpu::BarrierScope::GPU;
+              break;
+            default:
+              throw py::value_error(
+                  "create_barrier supports only the CTA and GPU scopes");
+            }
+            self.create<triton::gpu::BarrierOp>(triton::gpu::AddrSpace::All,
+                                                barrierScope);
+          },
+          py::arg("scope") = MemSyncScope::CTA)
       // Warp pipeline border marker (AMD)
       .def("create_warp_pipeline_begin",
            [](TritonOpBuilder &self, const std::string &label) {

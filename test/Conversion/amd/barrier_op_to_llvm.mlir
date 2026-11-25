@@ -8,6 +8,7 @@
 
 // RDNA CTA barriers use tagged lowering only in CU mode, where waves share one L0.
 // COMMON-DAG: [[$LOCAL_MMRA_TAG:#[A-Za-z0-9_]+]] = #llvm.mmra_tag<"amdgpu-synchronize-as":"local">
+// COMMON-DAG: [[$GLOBAL_MMRA_TAG:#[A-Za-z0-9_]+]] = #llvm.mmra_tag<"amdgpu-synchronize-as":"global">
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // TAGGED-LABEL: llvm.func @lower_barrier
@@ -39,6 +40,33 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     // COMMON-NOT: rocdl.s.barrier
     // COMMON: llvm.return
     ttg.barrier warp local
+    tt.return
+  }
+
+  // GPU scope takes the agent-scope path on every target, including RDNA in
+  // WGP mode, whose CTA barriers fall back to the generic lowering above.
+  // COMMON-LABEL: llvm.func @lower_gpu_barrier
+  tt.func @lower_gpu_barrier() {
+    // COMMON-NOT: syncscope("workgroup")
+    // COMMON: llvm.fence syncscope("agent") release{{$}}
+    // COMMON-NEXT: rocdl.s.barrier{{$}}
+    // COMMON-NEXT: llvm.fence syncscope("agent") acquire{{$}}
+    // COMMON-NOT: llvm.fence
+    // COMMON: llvm.return
+    ttg.barrier gpu all
+    tt.return
+  }
+
+  // A global-only GPU barrier is tagged so the legalizer can skip LDS waits.
+  // COMMON-LABEL: llvm.func @lower_gpu_global_barrier
+  tt.func @lower_gpu_global_barrier() {
+    // COMMON-NOT: syncscope("workgroup")
+    // COMMON: llvm.fence syncscope("agent") release {llvm.mmra = [[$GLOBAL_MMRA_TAG]]}
+    // COMMON-NEXT: rocdl.s.barrier{{$}}
+    // COMMON-NEXT: llvm.fence syncscope("agent") acquire {llvm.mmra = [[$GLOBAL_MMRA_TAG]]}
+    // COMMON-NOT: llvm.fence
+    // COMMON: llvm.return
+    ttg.barrier gpu global_read|global_write
     tt.return
   }
 }

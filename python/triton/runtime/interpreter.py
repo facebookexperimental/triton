@@ -1010,8 +1010,9 @@ class InterpreterBuilder:
     def create_assume(self, condition):
         assert condition, "Assume failed"
 
-    def create_barrier(self):
-        # Triton's barrier applies to each program in a grid, so it's a no-op in the interpreter
+    def create_barrier(self, scope=None):
+        # Triton's barrier applies to each program in a grid, so it's a no-op in the interpreter. Programs run one
+        # at a time, so a GPU-scope barrier needs no fence either.
         pass
 
     def create_tensor_descriptor_type(self, block_type, is_signed, fp6_format=None):

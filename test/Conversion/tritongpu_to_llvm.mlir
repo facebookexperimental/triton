@@ -4316,6 +4316,34 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 
 // -----
 
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // A GPU-scope barrier is a CTA barrier between two device-scope fences.
+  // CHECK-LABEL: @gpu_scope_barrier
+  tt.func @gpu_scope_barrier() {
+    // CHECK-NOT: llvm.fence
+    // CHECK: llvm.fence syncscope("device") acq_rel
+    // CHECK-NEXT: nvvm.barrier
+    // CHECK-NEXT: llvm.fence syncscope("device") acq_rel
+    // CHECK-NOT: llvm.fence
+    // CHECK: llvm.return
+    ttg.barrier gpu all
+    tt.return
+  }
+
+  // The default CTA barrier has no fence.
+  // CHECK-LABEL: @cta_scope_barrier
+  tt.func @cta_scope_barrier() {
+    // CHECK-NOT: llvm.fence
+    // CHECK: nvvm.barrier
+    // CHECK-NOT: llvm.fence
+    // CHECK: llvm.return
+    ttg.barrier all
+    tt.return
+  }
+}
+
+// -----
+
 //--- masked-store-barrier.mlir
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 4 : i32, ttg.shared = 0 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32} {

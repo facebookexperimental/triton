@@ -30,11 +30,10 @@ using ::mlir::triton::gpu::MemDescType;
 
 namespace {
 
-static LLVM::FenceOp createAMDGPUMemoryFence(OpBuilder &builder, Location loc,
-                                             LLVM::AtomicOrdering ordering,
-                                             StringRef synchronizeAddrSpace) {
-  auto fence =
-      LLVM::FenceOp::create(builder, loc, ordering, /*syncscope=*/"workgroup");
+static LLVM::FenceOp createAMDGPUMemoryFence(
+    OpBuilder &builder, Location loc, LLVM::AtomicOrdering ordering,
+    StringRef synchronizeAddrSpace, StringRef syncscope = "workgroup") {
+  auto fence = LLVM::FenceOp::create(builder, loc, ordering, syncscope);
   if (!synchronizeAddrSpace.empty()) {
     Attribute mmra = builder.getAttr<LLVM::MMRATagAttr>("amdgpu-synchronize-as",
                                                         synchronizeAddrSpace);
@@ -2340,6 +2339,12 @@ public:
   LogicalResult
   matchAndRewrite(triton::gpu::BarrierOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    // GPU scope is lowered here on every target, before the CTA bail-out
+    // below, so that it can never fall back to the common lowering and quietly
+    // become a workgroup-scope barrier.
+    if (op.isGPU())
+      return lowerGPUScopeBarrier(op, rewriter);
+
     // A local-only fence omits the vector cache invalidate. This is safe only
     // when all waves share one L0, so an acquire in one wave covers the others.
     auto isaFamily = targetInfo.getISAFamily();
@@ -2384,6 +2389,36 @@ public:
   }
 
 private:
+  // Agent-scope release and acquire fences around the workgroup barrier: every
+  // wave's earlier global memory operations become visible device-wide before
+  // any wave continues, and later operations see what was visible device-wide
+  // before the barrier. Each wave runs the release fence itself, so its own
+  // stores are complete, and written back where the L2 is not coherent, before
+  // any wave passes the barrier. That per-wave drain is what makes a relaxed
+  // or volatile flag access next to the barrier work. Under the LLVM memory
+  // model alone, only release and acquire flag atomics carry the other waves'
+  // accesses. The common lowering uses acq_rel fences on both sides instead,
+  // which here would add a second L2 writeback and invalidate in every wave.
+  // The verifier guarantees a global address space. A global-only barrier is
+  // tagged so the memory legalizer can skip the LDS waits; any mix with local
+  // stays untagged. A "local" tag is never used at agent scope, since it would
+  // drop the global synchronization.
+  LogicalResult
+  lowerGPUScopeBarrier(triton::gpu::BarrierOp op,
+                       ConversionPatternRewriter &rewriter) const {
+    Location loc = op.getLoc();
+    StringRef syncscope =
+        targetInfo.getAtomicSyncScope(triton::MemSyncScope::GPU);
+    StringRef mmraAddrSpace = op.hasLocal() ? "" : "global";
+    createAMDGPUMemoryFence(rewriter, loc, LLVM::AtomicOrdering::release,
+                            mmraAddrSpace, syncscope);
+    ROCDL::SBarrierOp::create(rewriter, loc);
+    createAMDGPUMemoryFence(rewriter, loc, LLVM::AtomicOrdering::acquire,
+                            mmraAddrSpace, syncscope);
+    rewriter.eraseOp(op);
+    return success();
+  }
+
   const AMD::TargetInfo &targetInfo;
 };
 
