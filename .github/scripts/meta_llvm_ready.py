@@ -130,7 +130,7 @@ def existing_issue(repo, marker):
 
 
 def claim_issue_creation(repo, kind, sha, build, marker):
-    # INVARIANT: the caller holds the readiness-issue workflow lock.
+    # INVARIANT: the caller holds the candidate handoff workflow lock.
     name = ready_name(kind, sha, build).replace('.ready.json', '.issue-request.json')
     intent = {'schema_version': 1, 'candidate': marker}
     _, raw = release_assets(repo, 'meta-llvm')
@@ -300,14 +300,26 @@ def untouched(repo, kind, base, number):
     return bot_head(repo, kind, base, pull['head']['sha'])
 
 
+def open_candidates(repo, kind):
+    """Open candidate PRs of one kind, found by branch name or label so an unlabelled one is never missed."""
+    pages = github_json(f'repos/{repo}/pulls?state=open&per_page=100', paginate=True)
+    found = []
+    for pull in (pull for page in pages for pull in page):
+        match = CANDIDATE.search(pull.get('body') or '')
+        if ((pull['head']['ref'].startswith(f'scratch/llvm-candidate/{kind}-')
+             or CANDIDATE_LABEL in {l['name']
+                                    for l in pull['labels']}) and match and match.group(1) == kind):
+            found.append((pull, match.groups()))
+    return found
+
+
 def close_superseded(repo, kind, sha, build, replacement):
     """Close older untouched draft candidates of one kind, and readiness issues no open candidate PR still tracks."""
     note = {'body': f'Superseded by #{replacement}, which proposes a newer bundle.'}
-    proposals = labeled(repo, CANDIDATE_LABEL, 'all', CANDIDATE, True)
+    proposals = open_candidates(repo, kind)
     closed, kept = [], []
     for item, (k, old_sha, old_build, base) in proposals:
-        if (k != kind or item['number'] == replacement or item['state'] != 'open'
-                or not newer(sha, build, old_sha, old_build)):
+        if item['number'] == replacement or not newer(sha, build, old_sha, old_build):
             continue
         if not untouched(repo, kind, base, item['number']):
             kept.append(item['number'])
@@ -315,7 +327,7 @@ def close_superseded(repo, kind, sha, build, replacement):
         github_json(f"repos/{repo}/issues/{item['number']}/comments", method='POST', payload=note)
         github_json(f"repos/{repo}/pulls/{item['number']}", method='PATCH', payload={'state': 'closed'})
         closed.append(item['number'])
-    tracked = {groups[:3] for item, groups in proposals if item['state'] == 'open' and item['number'] not in closed}
+    tracked = {groups[:3] for item, groups in proposals if item['number'] not in closed}
     for issue, groups in labeled(repo, LABEL, 'open', READY, False):
         if groups[0] == kind and newer(sha, build, groups[1], groups[2]) and groups not in tracked:
             github_json(f"repos/{repo}/issues/{issue['number']}/comments", method='POST', payload=note)
@@ -353,10 +365,14 @@ def ensure_candidate_pr(repo, candidate, platforms, base=''):
     branch = f'scratch/llvm-candidate/{kind}-{sha[:8]}-{build}'
     # INVARIANT: one proposal per kind, LLVM commit and packaging revision, whatever Triton base it started from.
     proposals = labeled(repo, CANDIDATE_LABEL, 'all', CANDIDATE, True)
-    refs = github_json(f'repos/{repo}/git/matching-refs/heads/scratch/llvm-candidate/{kind}-{sha[:8]}-')
-    builds = [int(b) for _, (k, other, b, _) in proposals if (k, other) == (kind, sha)]
-    builds += [int(ref['ref'].rsplit('-', 1)[1]) for ref in refs if ref['ref'].rsplit('-', 1)[1].isdigit()]
-    if any(b > build for b in builds):
+    higher = any(k == kind and other == sha and int(b) > build for _, (k, other, b, _) in proposals)
+    for ref in github_json(f'repos/{repo}/git/matching-refs/heads/scratch/llvm-candidate/{kind}-{sha[:8]}-'):
+        other = ref['ref'].removeprefix('refs/heads/')
+        if not higher and other.rsplit('-', 1)[1].isdigit() and int(other.rsplit('-', 1)[1]) > build:
+            pages = github_json(f'repos/{repo}/pulls?state=all&head=facebookexperimental:{quote(other, safe="")}',
+                                paginate=True)
+            higher = any(page for page in pages)
+    if higher:
         return dict(result, status='superseded')
     numbers = {item['number'] for item, groups in proposals if groups[:3] == (kind, sha, str(build))}
     pages = github_json(f'repos/{repo}/pulls?state=all&head=facebookexperimental:{quote(branch, safe="")}&per_page=100',
@@ -413,7 +429,7 @@ def ensure_candidate_pr(repo, candidate, platforms, base=''):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('action', choices=['publish', 'issue', 'pr'])
+    parser.add_argument('action', choices=['publish', 'handoff'])
     args = parser.parse_args()
     repo = os.environ['GITHUB_REPOSITORY']
     if repo != REPOSITORY:
@@ -424,31 +440,34 @@ def main():
                         f"https://github.com/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
                         int(os.environ['GITHUB_RUN_ATTEMPT']), os.environ['GITHUB_SHA'])
         return
+    # INVARIANT: the caller holds the candidate handoff workflow lock, so supersession and issue filing never
+    # interleave with another run's.
     candidates = json.loads(os.environ['CANDIDATES'])
-    prs = {pr['kind']: pr for pr in json.loads(os.environ.get('CANDIDATE_RESULTS') or '[]')}
-    results, failures = [], []
+    create = os.environ.get('CREATE_CANDIDATE_PR', 'true') != 'false'
+    failures = []
     for candidate in candidates:
         try:
-            if args.action == 'issue':
-                print(ensure_issue(repo, candidate, platforms, prs.get(candidate['kind'])), flush=True)
-            else:
-                results.append(ensure_candidate_pr(repo, candidate, platforms, os.environ.get('CANDIDATE_BASE_SHA',
-                                                                                              '')))
-                print(json.dumps(results[-1]), flush=True)
-                if results[-1].get('error'):
+            pr = None
+            if create:
+                try:
+                    pr = ensure_candidate_pr(repo, candidate, platforms, os.environ.get('CANDIDATE_BASE_SHA', ''))
+                except BundleNotReady:
+                    raise
+                except Exception as error:
+                    detail = error.stderr if isinstance(error, subprocess.CalledProcessError) else str(error)
+                    pr = {'kind': candidate['kind'], 'status': 'failed', 'error': detail}
+                print(json.dumps(pr), flush=True)
+                if pr.get('error'):
                     failures.append(candidate['kind'])
+            print(ensure_issue(repo, candidate, platforms, pr), flush=True)
         except BundleNotReady as error:
             print(error, flush=True)
         except Exception as error:
             detail = error.stderr if isinstance(error, subprocess.CalledProcessError) else str(error)
             print(f"{candidate['kind']} handoff failed: {detail}", flush=True)
             failures.append(candidate['kind'])
-            results.append({'kind': candidate['kind'], 'status': 'failed'})
-    if args.action == 'pr' and os.environ.get('GITHUB_OUTPUT'):
-        with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-            output.write('results=' + json.dumps(results) + '\n')
     if failures:
-        raise RuntimeError('Readiness handoff failed for ' + ', '.join(failures))
+        raise RuntimeError('Readiness handoff failed for ' + ', '.join(dict.fromkeys(failures)))
 
 
 if __name__ == '__main__':

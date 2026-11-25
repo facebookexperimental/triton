@@ -511,22 +511,19 @@ def test_handled_candidate_is_not_reproposed_from_a_newer_base(monkeypatch):
 def test_superseding_closes_only_untouched_drafts(monkeypatch):
     import meta_llvm_ready as ready
     base, head = 'a' * 40, 'c' * 40
-    # 1 untouched, 2 renamed by a maintainer, 3 amended by a maintainer, 4 a newer build of the proposed commit,
-    # 5 description edited by a maintainer.
-    shas = {1: '1' * 40, 2: '2' * 40, 3: '3' * 40, 4: NEW, 5: '5' * 40}
-    builds = {1: 1, 2: 1, 3: 1, 4: 2, 5: 1}
+    # 1 untouched, 2 renamed, 3 amended, 4 a newer build of the proposed commit, 5 description edited,
+    # 8 reviewed and left unlabelled by a crash: only 1 may close.
+    shas = {1: '1' * 40, 2: '2' * 40, 3: '3' * 40, 4: NEW, 5: '5' * 40, 8: '8' * 40}
+    builds = {1: 1, 2: 1, 3: 1, 4: 2, 5: 1, 8: 1}
     pulls = [{
-        'number': n, 'state': 'open', 'pull_request': {}, 'body':
-        f'<!-- llvm-candidate beta/amd/{shas[n]}/{builds[n]}/{base} -->'
+        'number': n, 'body': f'<!-- llvm-candidate beta/amd/{shas[n]}/{builds[n]}/{base} -->', 'head':
+        {'ref': f'scratch/llvm-candidate/amd-{shas[n][:8]}-{builds[n]}'}, 'labels':
+        [] if n == 8 else [{'name': ready.CANDIDATE_LABEL}]
     } for n in shas]
-    # Issue 20 has no PR, and issue 21 belongs to an earlier proposal that was already closed.
+    # Issue 20 never had a PR, and 21 belongs to a candidate whose PR already closed.
     issues = [{'number': 10 + n, 'body': ready.issue_marker('amd', shas[n], builds[n])} for n in shas]
     issues += [{'number': 20, 'body': ready.issue_marker('amd', '6' * 40, 1)},
                {'number': 21, 'body': ready.issue_marker('amd', '7' * 40, 1)}]
-    pulls.append({
-        'number': 7, 'state': 'closed', 'pull_request': {}, 'body':
-        f'<!-- llvm-candidate beta/amd/{"7" * 40}/1/{base} -->'
-    })
     bot = {'email': ready.BOT_EMAIL}
     writes = []
 
@@ -537,7 +534,7 @@ def test_superseding_closes_only_untouched_drafts(monkeypatch):
         if method:
             writes.append((path, method))
             return {}
-        if 'labels=llvm-candidate' in path:
+        if '/pulls?state=open' in path:
             return [pulls]
         if 'labels=llvm-bundle-ready' in path:
             return [issues]
@@ -547,12 +544,13 @@ def test_superseding_closes_only_untouched_drafts(monkeypatch):
                 'sha': head, 'commit': {'author': bot, 'committer': committer, 'verification': {'verified': True}}
             }]]
         if '/timeline?' in path:
-            renamed = [{'event': 'renamed', 'actor': {'type': 'User'}}] if '/issues/2/' in path else []
-            return [[{'event': 'cross-referenced', 'actor': {'type': 'User'}}, *renamed]]
+            human = {'/issues/2/': 'renamed', '/issues/8/': 'reviewed'}
+            events = [{'event': e, 'actor': {'type': 'User'}} for k, e in human.items() if k in path]
+            return [[{'event': 'cross-referenced', 'actor': {'type': 'User'}}, *events]]
         return {'draft': True, 'base': {'ref': 'main'}, 'head': {'sha': head}}
 
     monkeypatch.setattr(ready, 'github_json', api)
     monkeypatch.setattr(ready, 'bot_head', lambda *args: True)
-    assert ready.close_superseded(ready.REPOSITORY, 'amd', NEW, 1, 9) == ([1], [2, 3, 5])
+    assert ready.close_superseded(ready.REPOSITORY, 'amd', NEW, 1, 9) == ([1], [2, 3, 5, 8])
     closed = {path.rsplit('/', 1)[1] for path, method in writes if method == 'PATCH'}
     assert closed == {'1', '11', '20', '21'}
