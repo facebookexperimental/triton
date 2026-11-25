@@ -47,11 +47,6 @@ def main():
     event = os.environ.get('EVENT_NAME', 'workflow_dispatch')
     kind = os.environ.get('KIND') or 'all'
     kinds = BRANCHES if kind == 'all' else {kind: BRANCHES[kind]}
-    if os.environ.get('CREATE_CANDIDATE_PR') == 'true':
-        if re.fullmatch(r'[0-9a-f]{40}', os.environ.get('CANDIDATE_BASE_SHA', '')) is None:
-            raise ValueError('Candidate PR creation requires a full Triton base SHA')
-        if os.environ.get('PUBLISH') == 'false':
-            raise ValueError('Candidate PR creation requires published bundles')
     manifests = event == 'push' or os.environ.get('REQUEST_SOURCE') == 'manifests'
     if manifests:
         if event == 'push':

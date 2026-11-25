@@ -353,7 +353,7 @@ def test_ready_issue_requires_complete_validated_publication(monkeypatch, kind):
     monkeypatch.setattr(ready.subprocess, 'run', lambda *args, **kwargs: writes.append(args))
     monkeypatch.setattr(ready, 'release_assets', lambda *args: ({'id': 1}, assets))
     assert pending_builds(ready.REPOSITORY, [candidate], assets, BRANCH_PLATFORMS) == []
-    assert ready.ensure_issue(ready.REPOSITORY, candidate, BRANCH_PLATFORMS) == existing_url
+    assert ready.ensure_issue(ready.REPOSITORY, candidate, BRANCH_PLATFORMS, {'url': None}) == existing_url
 
     for missing in assets:
         partial = [a for a in assets if a is not missing]
@@ -365,7 +365,7 @@ def test_ready_issue_requires_complete_validated_publication(monkeypatch, kind):
             assert pending_builds(ready.REPOSITORY, [candidate], incomplete, BRANCH_PLATFORMS) == expected
             monkeypatch.setattr(ready, 'release_assets', lambda *args: ({'id': 1}, incomplete))
             with pytest.raises(ready.BundleNotReady):
-                ready.ensure_issue(ready.REPOSITORY, candidate, BRANCH_PLATFORMS)
+                ready.ensure_issue(ready.REPOSITORY, candidate, BRANCH_PLATFORMS, {'url': None})
     assert writes == []
 
 
@@ -401,8 +401,8 @@ def test_readiness_issue_reuses_candidate_after_timeout_or_close(monkeypatch, cl
     monkeypatch.setattr(ready, 'release_assets', lambda *args: ({'id': 1}, assets))
     monkeypatch.setattr(ready.subprocess, 'run', create)
     monkeypatch.setattr(ready, 'claim_issue_creation', lambda *args: ('request.json', {'candidate': marker}))
-    assert ready.ensure_issue(ready.REPOSITORY, candidate, BRANCH_PLATFORMS) == saved['html_url']
-    assert ready.ensure_issue(ready.REPOSITORY, candidate, BRANCH_PLATFORMS) == saved['html_url']
+    assert ready.ensure_issue(ready.REPOSITORY, candidate, BRANCH_PLATFORMS, {'url': None}) == saved['html_url']
+    assert ready.ensure_issue(ready.REPOSITORY, candidate, BRANCH_PLATFORMS, {'url': None}) == saved['html_url']
     assert len(calls) == 1
 
 
@@ -426,7 +426,7 @@ def test_unresolved_issue_creation_does_not_submit_again(monkeypatch):
     monkeypatch.setattr(ready.subprocess, 'run', lambda *args, **kwargs: writes.append(args))
     for _ in range(2):
         with pytest.raises(RuntimeError, match='unresolved'):
-            ready.ensure_issue(ready.REPOSITORY, candidate, BRANCH_PLATFORMS)
+            ready.ensure_issue(ready.REPOSITORY, candidate, BRANCH_PLATFORMS, {'url': None})
     assert writes == []
 
 
@@ -483,26 +483,44 @@ def test_explicit_validation_is_not_skipped_for_a_complete_bundle(monkeypatch):
                           validate_existing=True) == [{'kind': 'amd', 'llvm_sha': NEW, 'build_number': '1'}]
 
 
-def test_closed_candidate_is_not_recreated_on_retry(monkeypatch):
+def test_closed_candidate_is_not_recreated(monkeypatch):
     import meta_llvm_ready as ready
     assets, receipt, candidate = _ready_fixture('amd')
-    base = 'b' * 40
     monkeypatch.setattr(ready, 'validated_candidate', lambda *args: ({a['name']: a for a in assets}, receipt))
     monkeypatch.setattr(ready, 'read_manifest', lambda *args: dict(META))
     calls = []
 
     def api(path, **kwargs):
         calls.append(kwargs)
-        if '/compare/' in path:
-            return {'status': 'ahead'}
-        if '/contents/.github/workflows/' in path:
-            return {}
-        if '/git/ref/' in path:
-            return None
-        assert '/pulls?' in path
-        return [[{'state': 'closed', 'draft': True}]]
+        if path.endswith('/commits/main'):
+            return {'sha': 'b' * 40}
+        if 'state=open' in path:
+            return [[]]
+        assert 'state=closed' in path
+        return [[{'number': 7, 'state': 'closed'}]]
 
     monkeypatch.setattr(ready, 'github_json', api)
-    with pytest.raises(ValueError, match='closed or changed'):
-        ready.ensure_candidate_pr(ready.REPOSITORY, candidate, BRANCH_PLATFORMS, base)
+    assert ready.ensure_candidate_pr(ready.REPOSITORY, candidate, BRANCH_PLATFORMS) is None
     assert all('method' not in call for call in calls)
+
+
+def test_newer_candidate_closes_only_older_drafts(monkeypatch):
+    import meta_llvm_ready as ready
+    old, kept = '1' * 40, '2' * 40
+    pulls = [{
+        'number': n, 'draft': draft, 'head': {'ref': f'scratch/llvm-canary/amd-{sha[:8]}-1'}, 'body':
+        f'<!-- llvm-candidate beta/amd/{sha}/1/{"a" * 40} -->'
+    } for n, sha, draft in ((1, old, True), (2, kept, False))]
+    issues = [{'number': 10 + n, 'body': ready.issue_marker('amd', sha, 1)} for n, sha in ((1, old), (2, kept))]
+    closed = []
+
+    def api(path, method=None, payload=None, **kwargs):
+        if method == 'PATCH':
+            closed.append(int(path.rsplit('/', 1)[1]))
+        if method:
+            return {}
+        return [issues] if 'labels=' in path else [pulls]
+
+    monkeypatch.setattr(ready, 'github_json', api)
+    ready.close_older_drafts(ready.REPOSITORY, 'amd', f'scratch/llvm-canary/amd-{NEW[:8]}-1', 9)
+    assert closed == [1, 11]

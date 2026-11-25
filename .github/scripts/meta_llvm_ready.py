@@ -128,7 +128,7 @@ def existing_issue(repo, marker):
 
 
 def claim_issue_creation(repo, kind, sha, build, marker):
-    # INVARIANT: the caller holds the readiness-issue workflow lock.
+    # INVARIANT: the caller holds the candidate handoff workflow lock.
     name = ready_name(kind, sha, build).replace('.ready.json', '.issue-request.json')
     intent = {'schema_version': 1, 'candidate': marker}
     _, raw = release_assets(repo, 'meta-llvm')
@@ -153,7 +153,7 @@ def clear_rejected_issue_intent(repo, name, intent):
         github_json(f"repos/{repo}/releases/assets/{asset['id']}", method='DELETE')
 
 
-def ensure_issue(repo, candidate, platforms):
+def ensure_issue(repo, candidate, platforms, pr):
     validated = validated_candidate(repo, candidate, platforms)
     if validated is None:
         return 'Candidate superseded before readiness notification'
@@ -166,13 +166,13 @@ def ensure_issue(repo, candidate, platforms):
     if github_json(f'repos/{repo}/labels/{LABEL}', missing_ok=True) is None:
         github_json(
             f'repos/{repo}/labels', method='POST', payload={
-                'name': LABEL, 'color': '5319e7', 'description':
-                'Validated LLVM bundle ready for a manifest-update review diff'
+                'name': LABEL, 'color': '5319e7', 'description': 'Validated LLVM bundle with a draft candidate PR'
             })
     prefix = 'llvm' if kind == 'core' else 'amd-llvm'
     body = readiness_text(kind, sha, candidate['llvm_tree'], build, BRANCHES[kind],
                           assets[f'{prefix}-{sha[:8]}-{build}.source.json']['browser_download_url'],
-                          assets[ready_name(kind, sha, build)]['browser_download_url'], marker)
+                          assets[ready_name(kind, sha, build)]['browser_download_url'], marker, pr,
+                          os.environ.get('RUN_URL', ''))
     name, intent = claim_issue_creation(repo, kind, sha, build, marker)
     try:
         return github_json(
@@ -196,69 +196,77 @@ def read_manifest(repo, path, ref):
     return manifest
 
 
-def dispatch_consumer_tests(repo, kind, branch, head, pr):
+def dispatch_consumer_tests(repo, kind, branch, pr):
     # The AMD SDK only builds the AMD codegen library, so NVIDIA GPU tests cannot observe it.
     workflows = {
         'gpu-tests.yml': {'platforms': 'mi350'} if kind == 'amd' else {}, 'tlx-ops-perf-smoke.yml': {'pr': str(pr)}
     }
     for workflow, inputs in workflows.items():
-        runs = github_json(f'repos/{repo}/actions/workflows/{workflow}/runs?head_sha={head}&per_page=100')
-        if any(run['conclusion'] != 'action_required' for run in runs['workflow_runs']):
-            print(f'{workflow} already has a run for {head}', flush=True)
-            continue
         github_json(f'repos/{repo}/actions/workflows/{workflow}/dispatches', method='POST',
                     payload={'ref': branch, 'inputs': inputs})
-        print(f'Dispatched {workflow} on {branch} at {head}', flush=True)
+        print(f'Dispatched {workflow} on {branch}', flush=True)
 
 
-def ensure_candidate_pr(repo, candidate, platforms, base):
+CANDIDATE = re.compile(r'<!-- llvm-candidate beta/(core|amd)/([0-9a-f]{40})/([0-9]+)/')
+
+
+def close_older_drafts(repo, kind, branch, replacement):
+    """Close the kind's other draft candidates and their readiness issues; a PR marked ready for review stays."""
+    pages = github_json(f'repos/{repo}/pulls?state=open&per_page=100', paginate=True)
+    pulls = [pull for page in pages for pull in page]
+    issues = [
+        issue for page in github_json(f'repos/{repo}/issues?labels={LABEL}&state=open&per_page=100', paginate=True)
+        for issue in page
+    ]
+    note = {'body': f'Superseded by #{replacement}, which proposes a newer bundle.'}
+    for pull in pulls:
+        match = CANDIDATE.search(pull.get('body') or '')
+        if (not pull['draft'] or match is None or match.group(1) != kind or pull['head']['ref'] == branch
+                or not pull['head']['ref'].startswith('scratch/llvm-canary/')):
+            continue
+        marker = issue_marker(*match.groups())
+        for item in [pull] + [issue for issue in issues if marker in (issue.get('body') or '')]:
+            github_json(f"repos/{repo}/issues/{item['number']}/comments", method='POST', payload=note)
+            github_json(f"repos/{repo}/issues/{item['number']}", method='PATCH', payload={'state': 'closed'})
+        print(f"Closed superseded candidate #{pull['number']}", flush=True)
+
+
+def ensure_candidate_pr(repo, candidate, platforms):
+    """Create the candidate's draft PR; return {'url', 'old'}, or None when there is nothing to hand off."""
     validated = validated_candidate(repo, candidate, platforms)
     if validated is None:
-        return 'Candidate superseded before draft PR creation'
+        print('Candidate superseded before draft PR creation', flush=True)
+        return None
     assets, receipt = validated
-    if re.fullmatch(r'[0-9a-f]{40}', base) is None:
-        raise ValueError('Candidate PR requires a full Triton base SHA')
-    if github_json(f'repos/{repo}/compare/{base}...main')['status'] not in ('ahead', 'identical'):
-        raise ValueError('Candidate baseline is not on main history')
-    for workflow in ('gpu-tests.yml', 'tlx-ops-perf-smoke.yml'):
-        if github_json(f'repos/{repo}/contents/.github/workflows/{workflow}?ref={base}', missing_ok=True) is None:
-            raise ValueError(f'Candidate baseline has no {workflow} to test the PR')
     kind, sha, build = candidate['kind'], candidate['llvm_sha'], int(candidate['build_number'])
     path = 'cmake/meta-amd-llvm-info.json' if kind == 'amd' else 'cmake/meta-llvm-info.json'
+    base = github_json(f'repos/{repo}/commits/main')['sha']
     old = read_manifest(repo, path, base)
-    if old['llvm_hash'] == sha and int(old['build_number']) > build:
-        return 'The baseline selects a newer packaging revision of this LLVM source'
+    if old['llvm_hash'] == sha and old['build_number'] >= build:
+        print('Main already selects this bundle', flush=True)
+        return None
+    # Branches created before proposals were keyed this way also end in the base commit.
+    branch = f'scratch/llvm-canary/{kind}-{sha[:8]}-{build}'
+    pages = github_json(f'repos/{repo}/pulls?state=open&per_page=100', paginate=True)
+    for pull in (pull for page in pages for pull in page):
+        if pull['head']['ref'] == branch or pull['head']['ref'].startswith(branch + '-'):
+            return {'url': pull['html_url'], 'old': old['llvm_hash']}
+    pages = github_json(f'repos/{repo}/pulls?state=closed&head=facebookexperimental:{quote(branch, safe="")}',
+                        paginate=True)
+    if any(page for page in pages):
+        print(f'The candidate PR for {branch} was closed; it will not be recreated', flush=True)
+        return None
     new = dict(old, llvm_hash=sha, build_number=build,
                release_base_url=f'https://github.com/{repo}/releases/download/meta-llvm',
                sha256sum=receipt['sha256sum'])
     new.pop('based_on_oai_llvm_hash', None)
-    if new == old:
-        return 'The baseline already selects this bundle'
-    content = json.dumps(new, indent=2) + '\n'
-    branch = f'scratch/llvm-canary/{kind}-{sha[:8]}-{build}-{base[:8]}'
     title, message, body = candidate_text(kind, old, receipt['source'],
                                           assets[ready_name(kind, sha, build)]['browser_download_url'], base)
-    marker = f'<!-- llvm-candidate beta/{kind}/{sha}/{build}/{base} -->'
-    pages = github_json(f'repos/{repo}/pulls?state=all&head=facebookexperimental:{quote(branch, safe="")}&per_page=100',
-                        paginate=True)
-    pulls = [pull for page in pages for pull in page]
-    for pull in pulls:
-        if (pull['state'] != 'open' or not pull['draft'] or pull['base']['ref'] != 'main'
-                or marker not in (pull.get('body') or '')):
-            raise ValueError('Existing candidate PR was closed or changed; it will not be recreated')
     existing = github_json(f'repos/{repo}/git/ref/heads/{branch}', missing_ok=True)
-    if pulls and existing is None:
-        raise ValueError('Existing candidate PR has no branch; it will not be recreated')
-    if existing:
-        head = existing['object']['sha']
-        commit = github_json(f'repos/{repo}/git/commits/{head}')
-        changed = github_json(f'repos/{repo}/compare/{base}...{head}')['files']
-        if ([p['sha'] for p in commit['parents']] != [base] or read_manifest(repo, path, head) != new
-                or [f['filename'] for f in changed] != [path]):
-            raise ValueError('Existing candidate branch differs from the expected one-file update')
-    else:
+    if existing is None:
         parent = github_json(f'repos/{repo}/git/commits/{base}')
-        blob = github_json(f'repos/{repo}/git/blobs', method='POST', payload={'content': content, 'encoding': 'utf-8'})
+        blob = github_json(f'repos/{repo}/git/blobs', method='POST',
+                           payload={'content': json.dumps(new, indent=2) + '\n', 'encoding': 'utf-8'})
         tree = github_json(
             f'repos/{repo}/git/trees', method='POST', payload={
                 'base_tree': parent['tree']['sha'], 'tree':
@@ -266,26 +274,19 @@ def ensure_candidate_pr(repo, candidate, platforms, base):
             })
         commit = github_json(f'repos/{repo}/git/commits', method='POST',
                              payload={'message': message, 'tree': tree['sha'], 'parents': [base]})
-        head = commit['sha']
-        github_json(f'repos/{repo}/git/refs', method='POST', payload={'ref': 'refs/heads/' + branch, 'sha': head})
-    print(f'Candidate branch: {branch} at {head}. Main was not changed.', flush=True)
-    if pulls:
-        if any(pull['head']['sha'] != head for pull in pulls):
-            raise ValueError('Existing candidate PR head changed; it will not be overwritten')
-        dispatch_consumer_tests(repo, kind, branch, head, pulls[0]['number'])
-        return pulls[0]['html_url']
+        github_json(f'repos/{repo}/git/refs', method='POST',
+                    payload={'ref': 'refs/heads/' + branch, 'sha': commit['sha']})
     pull = github_json(f'repos/{repo}/pulls', method='POST',
                        payload={'title': title, 'body': body, 'head': branch, 'base': 'main', 'draft': True})
-    if (not pull['draft'] or pull['head']['sha'] != head or pull['base']['ref'] != 'main' or pull['state'] != 'open'):
-        raise ValueError('Created candidate PR does not match the prepared head, base or draft state')
-    print('PR author: ' + pull['user']['login'], flush=True)
-    dispatch_consumer_tests(repo, kind, branch, head, pull['number'])
-    return pull['html_url']
+    print('Created ' + pull['html_url'], flush=True)
+    dispatch_consumer_tests(repo, kind, branch, pull['number'])
+    close_older_drafts(repo, kind, branch, pull['number'])
+    return {'url': pull['html_url'], 'old': old['llvm_hash']}
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('action', choices=['publish', 'issue', 'pr'])
+    parser.add_argument('action', choices=['publish', 'handoff'])
     args = parser.parse_args()
     repo = os.environ['GITHUB_REPOSITORY']
     if repo != REPOSITORY:
@@ -300,10 +301,17 @@ def main():
     failures = []
     for candidate in candidates:
         try:
-            if args.action == 'issue':
-                print(ensure_issue(repo, candidate, platforms), flush=True)
-            else:
-                print(ensure_candidate_pr(repo, candidate, platforms, os.environ['CANDIDATE_BASE_SHA']), flush=True)
+            try:
+                pr = ensure_candidate_pr(repo, candidate, platforms)
+            except BundleNotReady:
+                raise
+            except Exception as error:
+                detail = error.stderr if isinstance(error, subprocess.CalledProcessError) else str(error)
+                print(f"{candidate['kind']} candidate PR failed: {detail}", flush=True)
+                failures.append(candidate['kind'])
+                pr = {'url': None}
+            if pr is not None:
+                print(ensure_issue(repo, candidate, platforms, pr), flush=True)
         except BundleNotReady as error:
             print(error, flush=True)
         except Exception as error:

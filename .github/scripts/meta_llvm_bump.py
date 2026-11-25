@@ -223,22 +223,25 @@ def verdict(latest):
     return "ready" if all(run["conclusion"] == "success" for run in latest.values()) else "failed"
 
 
-def readiness_text(kind, sha, tree, build, branch, source_url, ready_url, marker):
+def readiness_text(kind, sha, tree, build, branch, source_url, ready_url, marker, pr, run_url):
+    sdk = 'AMD codegen' if kind == 'amd' else 'core'
+    fork = 'facebookexperimental/llvm-project'
+    if pr['url']:
+        link = (f"- Draft PR: {pr['url']}, updating the {sdk} pin from `{pr['old'][:8]}` to `{sha[:8]}` "
+                f"([LLVM changes]({compare_url(fork, pr['old'], sha)})).")
+    else:
+        link = f'- Draft PR: not created; see the [failed run]({run_url}), fix the cause and rerun the workflow.'
     return '\n'.join([
-        marker,
-        '',
-        f'The beta {kind} LLVM bundle is published and all required SDK validations passed.',
-        '',
-        f'- LLVM source: [`{sha[:12]}`](https://github.com/facebookexperimental/llvm-project/commit/{sha}) on `{branch}`.',
-        f'- Source tree: `{tree}`. Packaging revision: `{build}`.',
-        f'- [Source record]({source_url}) and [SDK validation record]({ready_url}).',
-        '',
-        'Triton correctness and A/B performance have not been verified by this SDK build. '
-        'Use a candidate PR to validate the consumer before adoption.',
-        '',
-        'Keep this issue open until the manifest update lands and the exported consumer pin is verified. '
-        'This issue does not authorize landing.',
-        '',
+        marker, '', f'A validated {sdk} LLVM SDK is ready for Triton adoption.', '', link,
+        f'- LLVM source: [`{sha[:12]}`](https://github.com/{fork}/commit/{sha}) on `{branch}`, tree `{tree}`, '
+        f'packaging revision `{build}`.', f'- [Source record]({source_url}) and [SDK validation record]({ready_url}).',
+        '', '## Action items', '', '- [ ] Review the Triton GPU tests in the draft PR checks.',
+        '- [ ] Review the TLX.ops perf smoke comment on the draft PR.',
+        '- [ ] If both are acceptable, mark the PR ready for review, then import and land it.',
+        '- [ ] If Triton does not build or pass with this pin, prepare a combined source and pin change instead of '
+        'landing the pin-only PR.', '- [ ] After landing, confirm the exported pin selects this bundle, then close '
+        'this issue.', '', 'A newer bundle closes this issue and its PR while the PR is still a draft. Mark the PR '
+        'ready for review to keep it. This issue does not authorize landing.', ''
     ])
 
 
@@ -274,7 +277,8 @@ def candidate_text(kind, old, source, ready_url, base_sha):
         *_job_block([('Triton GPU tests', 'Starts after this PR is created; results appear in the PR checks'),
                      ('TLX.ops perf smoke', 'Starts after this PR is created; results are posted as a PR comment')]),
         '',
-        'Keep this PR in draft until the Triton GPU tests and perf smoke results are reviewed.',
+        'Keep this PR in draft until the Triton GPU tests and perf smoke results are reviewed. A newer bundle '
+        'closes it while it is a draft; mark it ready for review to keep it.',
         '',
         'Source comparison: ' + compare_url('facebookexperimental/llvm-project', old['llvm_hash'], sha) + '.',
         '',
