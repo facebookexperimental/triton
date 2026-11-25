@@ -233,9 +233,8 @@ def close_older_drafts(repo, kind, branch, replacement):
 
 def describe_candidate(repo, kind, old, receipt, assets, base):
     sha, build = receipt['source']['llvm_sha'], receipt['source']['build_number']
-    # A base move adds thousands of upstream commits before the Meta changes; one compare call returns only 250.
-    pages = github_json(f"repos/{FORK}/compare/{old['llvm_hash']}...{sha}?per_page=100", paginate=True)
-    compare = dict(pages[0], commits=[commit for page in pages for commit in page['commits']])
+    # One compare call lists only the newest 250 commits, which still holds every Meta change after a base move.
+    compare = github_json(f"repos/{FORK}/compare/{old['llvm_hash']}...{sha}")
     return candidate_text(kind, BRANCHES[kind], old, receipt['source'],
                           assets[ready_name(kind, sha, build)]['browser_download_url'], base, compare)
 
