@@ -246,9 +246,14 @@ def readiness_text(kind, sha, tree, build, branch, source_url, ready_url, marker
 
 
 def llvm_change_lines(fork, old_sha, new_sha, compare):
-    """The new commits when the branch keeps its LLVM base, else the Meta changes carried onto the new base."""
-    commits = [(c['sha'], c['commit']['message'].split('\n')[0].strip()) for c in compare['commits']]
+    """The LLVM change from the current pin: new commits on the same base, a rollback, or the Meta changes carried onto
+    a new base."""
+    if compare['status'] == 'identical':
+        return ['The LLVM source is unchanged; only the packaging revision changes.']
     link = f'[LLVM changes since the current pin]({compare_url(fork, old_sha, new_sha)})'
+    if compare['status'] == 'behind':
+        return [f"{link} roll back {compare['behind_by']} commits."]
+    commits = [(c['sha'], c['commit']['message'].split('\n')[0].strip()) for c in compare['commits']]
     if compare['status'] == 'ahead':
         head = f'{link}, on the same LLVM base:'
     else:
