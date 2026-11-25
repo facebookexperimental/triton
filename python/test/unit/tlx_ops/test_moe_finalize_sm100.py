@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+import triton
 
 from triton._internal_testing import is_blackwell
 from triton.tlx.ops import InvalidInput, UnsupportedBackward, moe_finalize
@@ -333,6 +334,52 @@ def test_backward_layouts_are_bitwise_identical(input_scale, has_weight):
     if has_weight:
         # The weight gradient sums per-program partials whose split follows the slot loop of each layout.
         torch.testing.assert_close(g_masked[2].float(), g_rows[2].float(), rtol=1e-2, atol=1e-2)
+
+
+def _sms():
+    return torch.cuda.get_device_properties("cuda").multi_processor_count
+
+
+@requires_sm100
+@pytest.mark.parametrize("input_scale,has_weight", NORMS)
+def test_dense_forward_with_several_tokens_per_program(input_scale, has_weight):
+    # More tokens than forward programs (16 per SM), so each program loops over several tokens.
+    case = inputs(MoeFinalizeShape(2 * 16 * _sms() + 37, 1536, 8, 64, 64), seed=4)
+    norm = _norm(case, input_scale, has_weight)
+    dense = unpermute(case["expert_out"], case["row_index"])
+    want = unfused_finalize(dense, case["topk_weights"], norm["norm_weight"], input_scale)
+    assert torch.equal(moe_finalize(dense, case["topk_weights"], **norm), want)
+
+
+@requires_sm100
+@pytest.mark.parametrize("H", [2048, 3072])
+@pytest.mark.parametrize("input_scale,has_weight", NORMS)
+def test_backward_dense_layout_matches_row_index(H, input_scale, has_weight):
+    # Every expert local, so the dense (T, K, H) layout needs no topk_ids; 2048 and 3072 sit on both sides of the
+    # backward pipelining threshold. Each backward program loops over at least five slot blocks.
+    K = 8
+    block_s = max(1, min(4, sm100._BWD_TILE // triton.next_power_of_2(H)))
+    T = 5 * sm100._BWD_PER_SM * _sms() * block_s // K + 37
+    case = inputs(MoeFinalizeShape(T, H, K, 64, 64), seed=3)
+    gout = _gout(T, H)
+    norm = dict(input_scale=input_scale, eps=EPS)
+    y, w, gamma, leaves = _leaves(case, has_weight)
+    g_rows = _grads(lambda: moe_finalize(y, w, row_index=case["row_index"], norm_weight=gamma, **norm), leaves, gout)
+    dense = unpermute(case["expert_out"], case["row_index"]).requires_grad_()
+    w2 = case["topk_weights"].clone().requires_grad_()
+    gamma2 = case["norm_weight"].clone().requires_grad_() if has_weight else None
+    leaves2 = [t for t in (dense, w2, gamma2) if t is not None]
+    g_dense = _grads(lambda: moe_finalize(dense, w2, norm_weight=gamma2, **norm), leaves2, gout)
+    got, ref = g_dense[0].view(-1, H), g_rows[0][case["row_index"].view(-1).long()]
+    if H == 3072 and has_weight and not input_scale:
+        # This dense kernel variant contracts the row gradient differently from the row_index one: a few elements
+        # differ by at most 2 BF16 ulp.
+        assert (got.view(torch.int16).int() - ref.view(torch.int16).int()).abs().max() <= 2
+    else:
+        assert torch.equal(got, ref)
+    assert torch.equal(g_dense[1], g_rows[1])
+    if has_weight:
+        torch.testing.assert_close(g_dense[2].float(), g_rows[2].float(), rtol=1e-2, atol=1e-2)
 
 
 @requires_sm100

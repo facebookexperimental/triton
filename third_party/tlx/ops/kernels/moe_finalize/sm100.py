@@ -28,6 +28,15 @@ _BWD_TILE = 8192
 # Four warps per slot block: 408 vs 655 us (H = 1536) and 918 vs 1330 us (H = 4096) at 16384 tokens, top-8.
 _BWD_WARPS = 4
 _BWD_PER_SM = 8
+# Software-pipelined loads of the next tokens or slot blocks (num_stages of the persistent loops), for the dense
+# (T, K, H) layout without topk_ids only: with topk_ids/expert_mask the extra registers spill or halve occupancy
+# (forward 226 vs 157 us, backward 392 vs 328 us at 16384 tokens, H = 1536, 32 of 256 experts local), and with
+# row_index the backward was slower (354 vs 324 us at H = 1536). The forward pipelines only when a program has
+# more than one token (12.4 vs 10.3 us at 1024 tokens), the backward only up to 2048 columns (632 vs 602 us at
+# H = 3072) and when each program has at least two slot blocks (37.6 vs 35.2 us at 1024 tokens, H = 1536).
+_FWD_STAGES = 3
+_BWD_STAGES = 4
+_BWD_PIPELINED_MAX_H = 2048
 
 
 def num_warps(block_h):
@@ -75,6 +84,7 @@ def _fwd_kernel(
     HAS_WEIGHT: tl.constexpr,
     HAS_GAIN: tl.constexpr,
     INPUT_SCALE: tl.constexpr,
+    STAGES: tl.constexpr,
 ):
     cols = tl.arange(0, BLOCK_H)
     cmask = cols < H
@@ -84,7 +94,7 @@ def _fwd_kernel(
         if HAS_GAIN:
             w = w.to(tl.float32) + gain_center
         w = w.to(tl.bfloat16)
-    for token in tl.range(tl.program_id(0), T, tl.num_programs(0)):
+    for token in tl.range(tl.program_id(0), T, tl.num_programs(0), num_stages=STAGES):
         slot = token.to(tl.int64) * K + slots
         row, live = _live_slots(slot, slots < K, ROW_INDEX, TOPK_IDS, EXPERT_MASK, num_experts, 0, MODE)
         x = tl.load(Y + row[:, None] * H + cols[None, :], mask=live[:, None] & cmask[None, :], other=0.0)
@@ -205,6 +215,7 @@ def _bwd_kernel(
     HAS_WEIGHT: tl.constexpr,
     HAS_GAIN: tl.constexpr,
     INPUT_SCALE: tl.constexpr,
+    STAGES: tl.constexpr,
 ):
     pid = tl.program_id(0)
     cols = tl.arange(0, BLOCK_H)
@@ -217,7 +228,7 @@ def _bwd_kernel(
         w = w.to(tl.bfloat16)
         wf = w.to(tl.float32)
     dw = tl.zeros([BLOCK_H], dtype=tl.float32)
-    for block in tl.range(pid, tl.cdiv(num_slots, BLOCK_S), tl.num_programs(0)):
+    for block in tl.range(pid, tl.cdiv(num_slots, BLOCK_S), tl.num_programs(0), num_stages=STAGES):
         slot = block.to(tl.int64) * BLOCK_S + offs
         valid = slot < num_slots
         row, live = _live_slots(slot, valid, ROW_INDEX, TOPK_IDS, EXPERT_MASK, num_experts, num_rows, MODE)
@@ -323,7 +334,9 @@ def finalize_forward(expert_out, topk_weights, row_index, topk_ids, expert_mask,
             num_warps=num_warps(BLOCK_H),
         )
         return out
-    _fwd_kernel[(_programs(expert_out.device, 16, T), )](
+    mode = _mode(None, topk_ids)
+    grid = _programs(expert_out.device, 16, T)
+    _fwd_kernel[(grid, )](
         expert_out,
         topk_weights,
         topk_ids if topk_ids is not None else topk_weights,
@@ -339,10 +352,11 @@ def finalize_forward(expert_out, topk_weights, row_index, topk_ids, expert_mask,
         K=K,
         K_POW2=K_POW2,
         BLOCK_H=BLOCK_H,
-        MODE=_mode(None, topk_ids),
+        MODE=mode,
         HAS_WEIGHT=norm_weight is not None,
         HAS_GAIN=gain_center != 0,
         INPUT_SCALE=bool(input_scale),
+        STAGES=_FWD_STAGES if mode == 0 and T > grid else 1,
         num_warps=num_warps(BLOCK_H),
     )
     return out
@@ -367,6 +381,7 @@ def finalize_backward(grad_out, expert_out, topk_weights, row_index, topk_ids, e
     BLOCK_S = max(1, min(4, _BWD_TILE // BLOCK_H))
     nprog = _programs(expert_out.device, _BWD_PER_SM, triton.cdiv(T * K, BLOCK_S))
     has_weight = norm_weight is not None
+    pipelined = mode == 0 and BLOCK_H <= _BWD_PIPELINED_MAX_H and triton.cdiv(T * K, BLOCK_S) >= 2 * nprog
     dw_part = torch.empty((nprog, H) if has_weight else (1, ), device=expert_out.device, dtype=torch.float32)
     if T:
         _bwd_kernel[(nprog, )](
@@ -394,6 +409,7 @@ def finalize_backward(grad_out, expert_out, topk_weights, row_index, topk_ids, e
             HAS_WEIGHT=has_weight,
             HAS_GAIN=gain_center != 0,
             INPUT_SCALE=bool(input_scale),
+            STAGES=_BWD_STAGES if pipelined else 1,
             num_warps=_BWD_WARPS,
         )
     elif has_weight:
