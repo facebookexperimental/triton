@@ -106,3 +106,16 @@ def test_fp6_tma_descriptor_alignment(misalignment):
         data = torch.empty((128, 112), device="cuda", dtype=torch.uint8)[:, :96]
     with pytest.raises(AssertionError, match="32-byte aligned"):
         TensorDescriptor.from_tensor(data, [128, 128], layout)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
+@pytest.mark.parametrize("pitch", [48, 112])
+@pytest.mark.parametrize("packing", ["b6p2x16", "b6x16_p32"])
+def test_fp6_host_box64_alignment(pitch, packing):
+    storage = torch.empty(16 + 4 * pitch, device="cuda", dtype=torch.uint8)
+    data = storage[16:].view(4, pitch)[:, :48]
+    layout = ttgl.NVMMASharedLayout(0, 8, padding=packing)
+    desc = TensorDescriptor.from_tensor(data, [2, 64], layout)
+    assert desc.shape == [4, 64]
+    assert tuple(desc.strides) == (pitch, 1)
+    assert desc.__mangle__().startswith("tensordesc<u8[2,64],")

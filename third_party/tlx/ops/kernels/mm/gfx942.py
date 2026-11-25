@@ -2069,7 +2069,7 @@ def _gemm(a, b, bias=None, *, out=None, space="heuristic", invariance=None):
     return out
 
 
-def mm(a, b, *, out=None, space="heuristic", invariance=None):
+def mm(a, b, *, out=None, space="heuristic", invariance=None, b_static=False):
     """Compute ``a @ b`` using the gfx942 direct-load GEMM kernel."""
     return _gemm(a, b, out=out, space=space, invariance=invariance)
 

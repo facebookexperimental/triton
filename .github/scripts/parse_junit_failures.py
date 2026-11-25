@@ -26,6 +26,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import sys
 import xml.etree.ElementTree as ET
 
@@ -141,6 +142,38 @@ def build_missing_junit_item(missing_paths, workflow, job):
         "summary": summary,
         "repro": "",
         # Job-level fallback: no per-test signal -> reconcile must not close.
+        "fallback": True,
+        "external_dep": is_external,
+        "external_dep_reason": reason,
+    }
+
+
+def crash_cause(exit_code):
+    """What ended pytest, from its exit status: the signal name for 128 + N, else the status itself."""
+    if exit_code is None:
+        return "crash"
+    if exit_code > 128:
+        try:
+            return signal.Signals(exit_code - 128).name
+        except ValueError:
+            pass
+    return f"exit {exit_code}"
+
+
+def build_crash_item(node_id, cause, workflow, job):
+    """The test that was running when pytest died, reported under its own identity."""
+    module, _, name = node_id.partition("::")
+    rid = f"{module.removesuffix('.py').replace('/', '.')}::{name}"
+    summary = f"pytest died ({cause}) while running {node_id}, before writing JUnit XML."
+    is_external, reason = classify(summary)
+    return {
+        "normalized_failure_id": rid,
+        "raw_failure_ids": rid,
+        "issue_title": f"[nightly] {workflow} / {job} / {cause} in {rid}",
+        "job_name": job,
+        "summary": summary,
+        "repro": f"python -m pytest '{node_id}' -v -s",
+        # No JUnit XML from this run -> reconcile must not close anything on it.
         "fallback": True,
         "external_dep": is_external,
         "external_dep_reason": reason,
@@ -314,6 +347,8 @@ def main():
         help=("Step timeout budget for a JUnit XML, e.g. /tmp/tlx-core.xml=30. "
               "Repeatable. Enables near-timeout reporting for that file."),
     )
+    parser.add_argument("--crashed-test", default="", help="node id pytest_plugins/running_test.py left set")
+    parser.add_argument("--exit-code", type=int, help="pytest's exit status, to name the signal that killed it")
     parser.add_argument(
         "--slow-threshold",
         type=float,
@@ -328,7 +363,10 @@ def main():
         failures, missing_paths = collect_failures(args.junit)
         items = build_items(failures, args.workflow, args.job)
         if not items and missing_paths:
-            items.append(build_missing_junit_item(missing_paths, args.workflow, args.job))
+            if args.crashed_test:
+                items.append(build_crash_item(args.crashed_test, crash_cause(args.exit_code), args.workflow, args.job))
+            else:
+                items.append(build_missing_junit_item(missing_paths, args.workflow, args.job))
         if not items and args.failed:
             items.append(build_bucket_item(args.bucket, args.workflow, args.job))
         # Appended after the fallback guards: a slow-step item must not suppress the

@@ -18,6 +18,9 @@ from pathlib import Path
 
 MAX_INT_32 = 2**31 - 1
 
+# Bump for local AMD LLVM changes that affect generated kernels.
+_AMD_CODEGEN_CACHE_VERSION = 1
+
 
 def get_amd_codegen_path() -> str:
     if knobs.amd.codegen_path is not None:
@@ -130,9 +133,7 @@ def _serialize_for_amd_codegen(src: str, enable_fp_fusion: bool) -> bytes:
         # whereas textual IR has no backwards-compatibility guarantee.
         # Express fusion permission in the IR because newer LLVM versions no
         # longer honor TargetOptions::AllowFPOpFusion during code generation.
-        # Adapt alias-scope domains to the format supported by the
-        # independently pinned AMD code generator.
-        return llvm.to_bitcode(src, enable_fp_fusion, legacy_alias_scopes=True)
+        return llvm.to_bitcode(src, enable_fp_fusion)
     # LLVM commit 5bf967cb132b changed named-barrier intrinsic operands from
     # address space 3 to 15. The bitcode reader rejects the legacy signature
     # before the standalone code generator can upgrade the module, so send
@@ -465,7 +466,7 @@ class HIPOptions:
     disable_packed_fp32_ops: bool = False
 
     # Experimental hint for how the AMD backend schedules a kernel's instructions. The only
-    # recognized value is "mfma-schedule" (gfx950 only): run the MFMA scheduler on the optimized
+    # recognized value is "mfma-schedule" (gfx942 and gfx950): run the MFMA scheduler on the optimized
     # LLVM IR. It interleaves the MFMAs of each hot loop with the memory operations that are
     # independent of them, keeping the matrix unit busy, and pins that order with
     # llvm.amdgcn.sched.barrier so LLVM's machine schedulers preserve it. Kernels without an
@@ -510,7 +511,7 @@ class HIPOptions:
     # This controls hardware behavior, independently of LLVM scheduling.
     enable_wmma_queuing: bool = False
 
-    # WGP/CU execution mode for gfx10, gfx11 and gfx120x; ignored on other targets.
+    # WGP/CU execution mode for gfx11 and gfx120x; ignored on other targets.
     wgp_cu_mode: str = "wgp"
 
     def __post_init__(self):
@@ -1005,6 +1006,7 @@ class HIPBackend(BaseBackend):
             options.arch,
             __HIP_FTZ,
             options.enable_tree_reduction,
+            options.wgp_cu_mode == "cu",
         )
         # Lower Proton segment values before warp specialization captures partition operands.
         instrument(pm, point="llvmir-to-llvm", context=mod.context)
@@ -1046,7 +1048,7 @@ class HIPBackend(BaseBackend):
             # insert dbg intrinsic with several DI Attribute including source
             # var name and type info note: unknown reason for now, but this
             # pass and add_di_scope has to be run separately, otherwise if we
-            # put them into previous pipline, it trigger a segmentfault without
+            # put them into previous pipeline, it trigger a segmentfault without
             # any error message; could be due to a bug in mlir or pybind11
             pm = ir.pass_manager(mod.context)
             pm.enable_debug()
@@ -1172,12 +1174,9 @@ class HIPBackend(BaseBackend):
             kernel_fn.remove_fn_attr("amdgpu-no-workgroup-id-y")
             kernel_fn.remove_fn_attr("amdgpu-no-workgroup-id-z")
 
-        if knobs.amd.scalarize_packed_fops:
-            amd.add_scalarize_packed_fops_llvm_pass(kernel_fn)
-
         # Opt-in MFMA scheduler, see the schedule_hint option (validated in parse_options).
-        if options.schedule_hint == "mfma-schedule" and options.arch == "gfx950":
-            amd.add_mfma_schedule_pass(kernel_fn)
+        if options.schedule_hint == "mfma-schedule" and options.arch in ("gfx942", "gfx950"):
+            amd.add_mfma_schedule_pass(kernel_fn, options.arch)
 
         # Get some metadata
         metadata["num_warps"] = total_warps_num
@@ -1282,4 +1281,4 @@ class HIPBackend(BaseBackend):
 
     @functools.lru_cache()
     def hash(self):
-        return f"{self.target}-{get_amd_codegen_revision()}"
+        return f"{self.target}-{get_amd_codegen_revision()}-v{_AMD_CODEGEN_CACHE_VERSION}"

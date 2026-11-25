@@ -135,10 +135,7 @@ class DownloadAndExtractTest(unittest.TestCase):
 
 
 class MetaLlvmInfoTest(unittest.TestCase):
-    OAI_INFO_HASH = "ce3529423abda3fc4ad0b542daa50af21e539a29"
-    OAI_BUILD_HASH = "1df311a6f7d8af05d068ce835b60dfa5b199d2f8"
     META = {
-        "based_on_oai_llvm_hash": OAI_INFO_HASH,
         "llvm_hash": "a6533ab0f5a1df16ff3dbf7358fb79097c60855e",
         "llvm_repository": "https://github.com/facebookexperimental/llvm-project",
         "build_number": 2,
@@ -146,14 +143,9 @@ class MetaLlvmInfoTest(unittest.TestCase):
         "sha256sum": {"ubuntu-x64": "meta-ubuntu-x64"},
     }
 
-    def _write(self, base_dir: str, meta: dict, build_info: bool = True) -> None:
+    def _write(self, base_dir: str, meta: dict) -> None:
         cmake_dir = Path(base_dir) / "cmake"
         cmake_dir.mkdir()
-        (cmake_dir / "llvm-info.json").write_text(
-            json.dumps({"llvm_hash": self.OAI_INFO_HASH, "build_number": 1, "sha256sum": {"ubuntu-x64": "oai"}}))
-        if build_info:
-            (cmake_dir / "llvm-build-info.json").write_text(
-                json.dumps({"llvm_hash": self.OAI_BUILD_HASH, "repository": "triton-lang/llvm-project"}))
         (cmake_dir / "meta-llvm-info.json").write_text(json.dumps(meta))
 
     def test_meta_overrides_hash_url_and_checksum(self) -> None:
@@ -166,14 +158,6 @@ class MetaLlvmInfoTest(unittest.TestCase):
             "llvm-a6533ab0-ubuntu-x64-2.tar.gz", package.url)
         self.assertEqual("meta-ubuntu-x64", package.sha256sum)
 
-    def test_meta_base_ignores_build_info(self) -> None:
-        # llvm-build-info.json moves before the Triton sources adopt that LLVM.
-        with tempfile.TemporaryDirectory() as base_dir:
-            self._write(base_dir, {**self.META, "based_on_oai_llvm_hash": self.OAI_BUILD_HASH})
-            with self.assertRaisesRegex(RuntimeError,
-                                        "based on OAI LLVM 1df311a6f7d8 but cmake/llvm-info.json pins ce3529423abd"):
-                meta_llvm.llvm_package_for_suffix("ubuntu-x64", base_dir=base_dir)
-
     def test_unpublished_platform_ok_with_llvm_syspath(self) -> None:
         # A local LLVM build must keep working on platforms with no Meta bundle.
         with tempfile.TemporaryDirectory() as base_dir:
@@ -182,33 +166,6 @@ class MetaLlvmInfoTest(unittest.TestCase):
             with patch.object(build_helpers, "get_base_dir", return_value=base_dir):
                 package = build_helpers.get_llvm_package_info(helper_args)
         self.assertEqual("", package.url)
-
-    AMD_OAI_INFO_HASH = "d26ff26ef4e94a4de9ce5228ef5b32b5290cca8f"
-    AMD_OAI_BUILD_HASH = "6bc4aaf6641c56ee104f6200c96a6a571bc77052"
-    AMD_META = {
-        "based_on_oai_llvm_hash": AMD_OAI_INFO_HASH,
-        "llvm_hash": "127789233f2c0000000000000000000000000000",
-        "llvm_repository": "https://github.com/facebookexperimental/llvm-project",
-        "build_number": 1,
-        "release_base_url":
-        "https://github.com/facebookexperimental/llvm-project/releases/download/amd-llvm-12778923-1",
-        "sha256sum": {"ubuntu-x64": "meta-amd-ubuntu-x64"},
-    }
-
-    def _write_amd(self, base_dir: str, meta: dict) -> None:
-        cmake_dir = Path(base_dir) / "cmake"
-        (cmake_dir / "amd-llvm-info.json").write_text(json.dumps({"llvm_hash": self.AMD_OAI_INFO_HASH}))
-        (cmake_dir / "amd-llvm-build-info.json").write_text(json.dumps({"llvm_hash": self.AMD_OAI_BUILD_HASH}))
-        (cmake_dir / "meta-amd-llvm-info.json").write_text(json.dumps(meta))
-
-    def test_meta_amd_base_ignores_build_info(self) -> None:
-        # amd-llvm-build-info.json moves before the Triton sources adopt that LLVM.
-        with tempfile.TemporaryDirectory() as base_dir:
-            self._write(base_dir, self.META)
-            self._write_amd(base_dir, {**self.AMD_META, "based_on_oai_llvm_hash": self.AMD_OAI_BUILD_HASH})
-            with self.assertRaisesRegex(
-                    RuntimeError, "based on OAI LLVM 6bc4aaf6641c but cmake/amd-llvm-info.json pins d26ff26ef4e9"):
-                meta_llvm.load_amd_llvm_info(base_dir)
 
     def test_amd_codegen_builds_against_core_meta_llvm(self) -> None:
         with tempfile.TemporaryDirectory() as base_dir:

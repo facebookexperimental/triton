@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from job_summary import render
 from sample_logs import SYNCCHECK_CLEAN, SYNCCHECK_ERROR
 from sanitize import main
 
@@ -204,3 +205,16 @@ def test_a_tool_that_did_not_finish_the_tests_checks_no_kernel(fake_env, monkeyp
         "[CUTracer][B200] synccheck incomplete",
         "[CUTracer][B200] memcheck incomplete",
     ]
+
+
+def test_step_summary_names_the_function_of_a_sass_site_once():
+    accesses = [
+        {"role": "primary", "type": "Read", "function": "kernel_a", "location": "kernel_a+0x5960"},
+        {"role": "conflict", "type": "Write", "function": "kernel_a", "location": "kernels.py:42"},
+    ]
+    result = {
+        "tool": "racecheck", "outcome": "findings", "count": 1, "timed_out": False, "returncode": 0, "report": [],
+        "findings": [{"severity": "error", "in_kernel": True, "accesses": accesses}]
+    }
+    text = render([result], "kernel_a", ["python", "-c", "pass"])
+    assert "- error (in kernel): primary Read kernel_a+0x5960; conflict Write kernel_a kernels.py:42" in text

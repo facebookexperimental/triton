@@ -394,9 +394,10 @@ bool isConstantTrue(Value v) {
 }
 
 // Split a memdesc shape into the `num` and `shape` arguments of
-// tlx.local_alloc. A buffer is up to 2-D, so only a rank above that is
-// multi-buffering; this is the same rule analyzeLocalAlloc applies, and the two
-// must agree or an alias and its base describe different buffer counts.
+// tlx.local_alloc by rank: only a rank above 2 is multi-buffering. Used where
+// there is only a type to go on (aliases, TMEM); analyzeLocalAlloc applies it
+// to the base of an alias too, or the two would describe different buffer
+// counts over the same storage.
 static void splitAllocShape(ArrayRef<int64_t> shape, int64_t &count,
                             SmallVectorImpl<int64_t> &tileShape) {
   if (shape.size() > 2) {
@@ -902,7 +903,52 @@ struct LocalAllocInfo {
   SmallVector<int64_t> shape;
   Type elementType;
   int64_t bufferCount = 1;
+  // Used directly rather than through memdesc_index, so it is emitted as a
+  // view of slot 0 and every use sees the buffer's own shape.
+  bool singleBuffer = false;
+  // The base of a memdesc_reinterpret alias with rank <= 2: it keeps the rank
+  // rule, so it is emitted as a bare one-slot allocation (the alias's
+  // `reuse=` needs the allocation, not a view) and each op that uses it as a
+  // tile takes slot 0 itself (viewOfBareSlot).
+  bool bareSlot = false;
 };
+
+// Spell a buffer operand as the tile an op expects: a bare one-slot base
+// (LocalAllocInfo::bareSlot) carries a leading slot dim that a direct
+// local_store, TMA load or TMA store must not see.
+static std::string
+viewOfBareSlot(Value v, std::string name,
+               const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
+               const DenseMap<Value, Value> *argSubstitutionMap) {
+  if (argSubstitutionMap) {
+    auto it = argSubstitutionMap->find(v);
+    if (it != argSubstitutionMap->end())
+      v = it->second;
+  }
+  if (Operation *def = v.getDefiningOp()) {
+    auto it = allocInfoMap.find(def);
+    if (it != allocInfoMap.end() && it->second.bareSlot)
+      return "tlx.local_view(" + name + ", 0)";
+  }
+  return name;
+}
+
+// Whether a buffer is indexed by memdesc_index, directly or after being
+// captured into warp-specialize partitions.
+static bool isIndexedBuffer(Value buffer) {
+  for (OpOperand &use : buffer.getUses()) {
+    Operation *user = use.getOwner();
+    if (isa<ttg::MemDescIndexOp>(user))
+      return true;
+    if (auto partitions = dyn_cast<ttg::WarpSpecializePartitionsOp>(user)) {
+      for (Region &region : partitions->getRegions())
+        if (!region.empty() &&
+            isIndexedBuffer(region.getArgument(use.getOperandNumber())))
+          return true;
+    }
+  }
+  return false;
+}
 
 // Analyze if a local_alloc is used for barriers
 // Returns true if it's a barrier alloc, and counts the number of barriers
@@ -972,26 +1018,26 @@ LocalAllocInfo analyzeLocalAlloc(Operation *localAllocOp) {
         // If shape is like <3x1xi64>, it's 3 barriers
       }
     } else {
-      // Regular buffer allocation
+      // Regular buffer allocation. It is multi-buffered exactly when it is
+      // indexed: the leading dim is then the buffer count, whatever the rank,
+      // so <1x4096xf32> is one 1-D slot. An allocation used directly is a
+      // single buffer of its full shape, which TLX spells as slot 0 of a
+      // one-slot allocation. A memdesc_reinterpret alias splits its shape by
+      // rank (splitAllocShape), so its base keeps that rule to agree with it.
       info.isBarrierAlloc = false;
-      // Shape format: for 3D+ shapes, first dim is buffer count,
-      // rest is actual shape.
-      // E.g., <2x128x128xbf16> -> count=2, shape=(128,128)
-      // E.g., <3x128x64xf32> -> count=3, shape=(128,64)
-      // For 2D shapes, it's a single buffer (count=1).
-      // E.g., <128x128xbf16> -> count=1, shape=(128,128)
-      if (shape.size() >= 3) {
+      bool aliased = llvm::any_of(allocResult.getUsers(), [](Operation *user) {
+        return isa<ttg::MemDescReinterpretOp>(user);
+      });
+      if (aliased) {
+        splitAllocShape(shape, info.bufferCount, info.shape);
+        info.bareSlot = shape.size() <= 2;
+      } else if (isIndexedBuffer(allocResult) && shape.size() >= 2) {
         info.bufferCount = shape[0];
-        for (size_t i = 1; i < shape.size(); ++i) {
-          info.shape.push_back(shape[i]);
-        }
-      } else if (shape.size() == 2) {
+        info.shape.assign(shape.begin() + 1, shape.end());
+      } else {
         info.bufferCount = 1;
-        info.shape.push_back(shape[0]);
-        info.shape.push_back(shape[1]);
-      } else if (shape.size() == 1) {
-        info.bufferCount = 1;
-        info.shape.push_back(shape[0]);
+        info.shape.assign(shape.begin(), shape.end());
+        info.singleBuffer = true;
       }
     }
   }
@@ -2057,6 +2103,8 @@ void printSimplifiedOp(
         if (op->getNumResults() > 0) {
           os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
         }
+        if (info.singleBuffer)
+          os << "tlx.local_view(";
         os << "tlx.local_alloc((";
         for (size_t i = 0; i < info.shape.size(); ++i) {
           if (i > 0)
@@ -2067,6 +2115,8 @@ void printSimplifiedOp(
           os << ","; // trailing comma for single-element tuple
         os << "), " << getElementTypeName(info.elementType) << ", "
            << info.bufferCount << ")";
+        if (info.singleBuffer)
+          os << ", 0)";
         printLocComment(op, os);
         return;
       }
@@ -2218,20 +2268,9 @@ void printSimplifiedOp(
     Value src = op->getOperand(0);
     Value dst = op->getOperand(1);
     std::string srcName = getValueName(src, argSubstitutionMap);
-    std::string dstName = getValueName(dst, argSubstitutionMap);
-
-    // Check if destination is a 2D local_alloc (emitted as count=1 in Python)
-    // which needs local_view(buf, 0) to drop the count prefix
-    if (auto dstMemType = dyn_cast<ttg::MemDescType>(dst.getType())) {
-      if (dstMemType.getRank() == 2) {
-        // Check if dst is defined by local_alloc (not memdesc_index)
-        if (Operation *defOp = dst.getDefiningOp()) {
-          if (defOp->getName().getStringRef() == "ttg.local_alloc") {
-            dstName = "tlx.local_view(" + dstName + ", 0)";
-          }
-        }
-      }
-    }
+    std::string dstName =
+        viewOfBareSlot(dst, getValueName(dst, argSubstitutionMap), allocInfoMap,
+                       argSubstitutionMap);
 
     // Check if transparent ops resolve the source name to a different-dtype
     // value. Resolve through casts to find the actual Python-level type.
@@ -2373,7 +2412,10 @@ void printSimplifiedOp(
       }
     }
     os << "tlx.async_descriptor_load(" << getValueName(desc, argSubstitutionMap)
-       << ", " << getValueName(result, argSubstitutionMap) << ", [";
+       << ", "
+       << viewOfBareSlot(result, getValueName(result, argSubstitutionMap),
+                         allocInfoMap, argSubstitutionMap)
+       << ", [";
     for (size_t i = 0; i < coords.size(); ++i) {
       if (i > 0)
         os << ", ";
@@ -2397,7 +2439,6 @@ void printSimplifiedOp(
   }
 
   // ttng.async_tma_copy_local_to_global: reorder args for Python API
-  // Also wrap 2D local_alloc sources with local_view to match shape
   if (opName == "ttng.async_tma_copy_local_to_global") {
     Value desc = op->getOperand(0);
     SmallVector<Value> coords;
@@ -2409,24 +2450,9 @@ void printSimplifiedOp(
       else
         coords.push_back(v);
     }
-    // Check if source is a 2D local_alloc (emitted as count=1 in Python,
-    // needs local_view to drop the count prefix for TMA descriptor)
-    std::string srcName = getValueName(src, argSubstitutionMap);
-    if (auto srcMemType = dyn_cast<ttg::MemDescType>(src.getType())) {
-      if (srcMemType.getRank() == 2) {
-        Value resolved = src;
-        if (argSubstitutionMap) {
-          auto it = argSubstitutionMap->find(resolved);
-          if (it != argSubstitutionMap->end())
-            resolved = it->second;
-        }
-        if (Operation *defOp = resolved.getDefiningOp()) {
-          if (defOp->getName().getStringRef() == "ttg.local_alloc") {
-            srcName = "tlx.local_view(" + srcName + ", 0)";
-          }
-        }
-      }
-    }
+    std::string srcName =
+        viewOfBareSlot(src, getValueName(src, argSubstitutionMap), allocInfoMap,
+                       argSubstitutionMap);
     os << "tlx.async_descriptor_store("
        << getValueName(desc, argSubstitutionMap) << ", " << srcName << ", [";
     for (size_t i = 0; i < coords.size(); ++i) {

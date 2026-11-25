@@ -1117,10 +1117,10 @@ static LogicalResult verifyTMAEncoding(Operation *op, TensorDescInterface desc,
   if (nvmma.getRank() != memDesc.getRank())
     return op->emitOpError("TMA shared memory and layout ranks must match");
   auto descBlockEnc = desc.getSharedLayout();
+  auto descEnc = dyn_cast_if_present<NVMMASharedEncodingAttr>(descBlockEnc);
   // If the descriptor has no encoding yet (e.g., before
   // optimize-descriptor-encoding pass), skip the match check.
   if (descBlockEnc) {
-    auto descEnc = dyn_cast<NVMMASharedEncodingAttr>(descBlockEnc);
     // NOTE: Cannot do descEnc != enc as the encodings may differ in rank for
     // rank-reducing loads
     if (!descEnc || descEnc.getTransposed() != nvmma.getTransposed() ||
@@ -1146,8 +1146,15 @@ static LogicalResult verifyTMAEncoding(Operation *op, TensorDescInterface desc,
       return op->emitOpError(
           "FP6 only supports tiled TMA loads and stores with byte storage");
     auto swizzle = nvmma.getSwizzlingByteWidth();
-    auto width = gpu::getShapePerCTA(nvmma, desc.getShape()).back();
-    if (width < 128 || (swizzle ? swizzle : width) != 128)
+    auto shape = desc.getShape();
+    auto width = gpu::getShapePerCTA(nvmma, shape).back();
+    if (width == 64) {
+      if (!store || swizzle || shape.size() < 2 || shape.size() > 5 ||
+          shape.back() != width || memDesc.getShape() != shape ||
+          nvmma != descEnc)
+        return op->emitOpError("64-value FP6 TMA requires a matching "
+                               "unswizzled rank-2 to rank-5 store");
+    } else if (width < 128 || (swizzle ? swizzle : width) != 128)
       return op->emitOpError("FP6 TMA requires a 128-value box");
   }
   if (nvmma.getTransposed())
@@ -2317,7 +2324,7 @@ static LogicalResult verifyScaledLHSOperand(Operation *op, Type elementType,
   }
 
   if (aType == ScaleDotElemType::E2M1) {
-    if (!elementType.isInteger(8))
+    if (!elementType.isInteger(8) && !isa<PackedFloat4E2M1Type>(elementType))
       return op->emitOpError("expected e2m1 LHS operand to have i8 storage");
     if (encoding.getFp4Padded() &&
         !llvm::is_contained({ScaleDotElemType::E4M3, ScaleDotElemType::E5M2},
@@ -2951,7 +2958,7 @@ LogicalResult TMEMCopyOp::verify() {
       return emitOpError("Source layout should be swizzled.");
     }
     // When we lift this, we should make sure we handle unpacked cleanly
-    if (srcTy.getElementType().getIntOrFloatBitWidth() != 32) {
+    if (getIntOrFloatOrPtrBitWidth(srcTy.getElementType()) != 32) {
       return emitOpError("Source element type should be 32-bit.");
     }
     auto tmemLl = toLinearLayout(dstTy);

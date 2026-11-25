@@ -26,6 +26,7 @@ using namespace mlir::triton::gpu;
 using ::mlir::LLVM::AMD::getVectorSize;
 using ::mlir::LLVM::AMD::llLoad;
 using ::mlir::LLVM::AMD::llStore;
+using ::mlir::triton::AMD::TargetInfo;
 using ::mlir::triton::gpu::getTotalElemsPerThread;
 using triton::amdgpu::ISAFamily;
 
@@ -827,7 +828,7 @@ struct BufferLoadOpConversion
 
     // Get the `other` value (if any)
     SmallVector<Value> otherElems;
-    bool isOtherAllBitsZero = llOther && isZeroConst(op.getOther());
+    bool isOtherAllBitsZero = llOther && isZeroFillConst(op.getOther());
     if (isOtherAllBitsZero) {
       auto constantOp = op.getOther().getDefiningOp<arith::ConstantOp>();
       if (auto denseAttr =
@@ -915,6 +916,7 @@ struct BufferLoadToLocalOpConversion
 
     RankedTensorType ptrType =
         cast<RankedTensorType>(getPointerTypeWithShape(ptr, offset));
+    unsigned numElems = getTotalElemsPerThread(ptrType);
 
     // We can load N elements at a time if:
     //  1. Every group of N source pointers are contiguous.  For example, if
@@ -934,7 +936,7 @@ struct BufferLoadToLocalOpConversion
     if (llOther) {
       otherElems =
           unpackTensorElements(loc, llOther, rewriter, op.getOther().getType());
-      isOtherZeroConst = isZeroConst(op.getOther());
+      isOtherZeroConst = isZeroFillConst(op.getOther());
     }
     bool hasMask = llMask != nullptr;
 
@@ -948,6 +950,32 @@ struct BufferLoadToLocalOpConversion
     if (failed(checkCanLoadDirectToLDS(op, ptrType, dstEnc,
                                        dstTy.getAllocShape(), vec, vecInfo)))
       return failure();
+
+    unsigned elemBitWidth = dstTy.getElementTypeBitWidth();
+    unsigned targetMaxVec = std::max(1u, 128u / elemBitWidth);
+    auto order = triton::gpu::getOrder(ptrType);
+    auto contigPerThread = triton::gpu::getContigPerThread(ptrType);
+    assert(!order.empty() && order.front() < contigPerThread.size());
+    unsigned layoutMaxVec = contigPerThread[order.front()];
+    unsigned usefulMaxVec = std::min({numElems, targetMaxVec, layoutMaxVec});
+    usefulMaxVec = triton::AMD::fitToValidDirectToLdsVecSize(
+        usefulMaxVec, elemBitWidth, targetInfo);
+    if (usefulMaxVec > 0 && vec < usefulMaxVec) {
+      StringRef limiter = "destination LDS layout";
+      if (vecInfo.fromPtr < usefulMaxVec && op.getContiguity() < usefulMaxVec)
+        limiter = "pointer or offset contiguity/alignment proof";
+      else if (mask &&
+               vecInfo.fromMask < std::min(vecInfo.fromPtr, usefulMaxVec))
+        limiter = "mask uniformity";
+      op.emitRemark()
+          << "direct-to-LDS load selected " << vec * elemBitWidth
+          << "-bit transactions; widest useful target-supported width is "
+          << usefulMaxVec * elemBitWidth << " bits; likely limiter: " << limiter
+          << " (pointer/offset=" << vecInfo.fromPtr
+          << " element(s), mask=" << vecInfo.fromMask
+          << ", explicit contiguity=" << op.getContiguity()
+          << ", contiguous elements/thread=" << layoutMaxVec << ")";
+    }
 
     // For swizzled layouts we need to use the non swizzled layout to compute
     // the LDS addresses since we gather into LDS
@@ -1255,7 +1283,7 @@ struct AsyncCopyGlobalToLocalOpConversion
           nullptr, nullptr, nullptr);
       if (targetInfo.requiresAliasInfoForAsyncOps())
         AMD::addAsyncCopyAliasScope(asyncLoadOp);
-    } else if (targetInfo.getISAFamily() == ISAFamily::GFX1250) {
+    } else if (targetInfo.getISAFamily() == ISAFamily::CDNA5) {
       switch (vecBits) {
       case 32:
         if (multicastMask)
@@ -1319,10 +1347,10 @@ struct AsyncCopyLocalToGlobalOpConversion
               dyn_cast<triton::CachePolicyAttr>(op.getCachePolicyAttr()))
         evict = policyAttr.getEvictionPolicy();
 
-    // Only supported on GFX1250
-    if (targetInfo.getISAFamily() != ISAFamily::GFX1250) {
+    // Only supported on CDNA5
+    if (targetInfo.getISAFamily() != ISAFamily::CDNA5) {
       return rewriter.notifyMatchFailure(
-          op, "async_copy_local_to_global only supported on GFX1250");
+          op, "async_copy_local_to_global only supported on CDNA5");
     }
 
     auto loc = op.getLoc();
@@ -1746,11 +1774,6 @@ struct AsyncTDMScatterOpConversion
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
-
-    // Multi-CTA not supported for scatter
-    if (lookupNumCTAs(op) > 1) {
-      return op.emitError("TDM scatter does not support multi-CTA");
-    }
 
     auto tensorDescTy = op.getDesc().getType();
     auto smemTy = op.getSrc().getType();
@@ -2615,9 +2638,9 @@ struct AtomicRMWOpConversion
         // llvm.atomic_rmw, and we set the ordering for each to aql_rel (the
         // default if no sem value is explicitly set in the DSL level
         // tl.atomic_add. The llvm backend will insert extra buffer invalidates
-        // and L2 write backs causing a perforance degration. To avoid this we
-        // set the ordering to release for the first, acquire for the last, and
-        // relaxed for anything in between so that only a single set of
+        // and L2 write backs causing a performance degradation. To avoid this
+        // we set the ordering to release for the first, acquire for the last,
+        // and relaxed for anything in between so that only a single set of
         // buffer_inv and buffer_wbl2 instructions are inserted by the backend
         // for any "cluster" of atomic ops.
         if ((vec > 1 || elemsPerThread > 1) &&
@@ -2698,7 +2721,7 @@ struct AsyncWaitOpConversion
     auto loc = op->getLoc();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
 
-    if (targetInfo.getISAFamily() == ISAFamily::GFX1250) {
+    if (targetInfo.getISAFamily() == ISAFamily::CDNA5) {
       // Clamp asyncCnt to 6bits(hw limit); lower means conservative
       unsigned asyncCnt = std::min(63u, op.getNumInst());
       LLVM::createLLVMIntrinsicCallOp(rewriter, loc,

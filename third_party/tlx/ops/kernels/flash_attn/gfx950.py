@@ -3389,8 +3389,10 @@ def flash_attn_cluster_pipeline(
     use_short_causal_defaults = (causal and D == 128 and N_CTX <= 1024 and N_CTX % 128 == 0 and "BLOCK_M" not in kw
                                  and "BLOCK_N" not in kw and kw.get("num_warps", 4) == 4
                                  and kw.get("num_stages", 3) == 3)
+    use_short_ragged_defaults = (not causal and q.dtype == torch.bfloat16 and D == 128 and 0 < N_CTX <= 512
+                                 and N_CTX % 256 != 0 and not _return_lse and not kw)
     mfma_m = 32
-    block_m = kw.pop("BLOCK_M", 128 if use_short_causal_defaults else 256)
+    block_m = kw.pop("BLOCK_M", 128 if use_short_causal_defaults or use_short_ragged_defaults else 256)
     block_n = kw.pop(
         "BLOCK_N",
         64 if use_short_causal_defaults and block_m == 128 else _cluster_default_block_n(causal),

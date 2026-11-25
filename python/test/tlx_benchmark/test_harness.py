@@ -191,11 +191,10 @@ def test_status_vocabulary_is_exactly_the_four_documented():
     assert {s.value for s in Status} == {"ok", "pip", "noisy", "error"}
 
 
-def test_noisy_is_not_a_failure_but_pip_and_error_are():
+def test_only_a_broken_or_wrong_kernel_fails_the_run():
     from _harness.report import FAILING
 
-    assert Status.NOISY not in FAILING
-    assert set(FAILING) == {Status.PIP, Status.ERROR}
+    assert set(FAILING) == {Status.ERROR}
 
 
 def test_diagnostic_reference_reports_speedup_without_enforcing_the_floor():
@@ -591,6 +590,77 @@ def test_amd_identity_and_least_used_selection_survive_missing_management_tools(
     assert os.environ["ROCR_VISIBLE_DEVICES"] == selected.uuid
 
 
+class _FakeNvml:
+    """NVML with one H100: what a container without nvidia-smi still has."""
+
+    TEXT = {
+        "nvmlDeviceGetName": "NVIDIA H100", "nvmlDeviceGetUUID": "GPU-nvml-0", "nvmlSystemGetDriverVersion": "580.1"
+    }
+    UINT = {
+        "nvmlDeviceGetIndex": 0, "nvmlDeviceGetMaxClockInfo": 1980, "nvmlDeviceGetPowerUsage": 120000,
+        "nvmlDeviceGetPowerManagementLimit": 650000, "nvmlDeviceGetTemperature": 40, "nvmlDeviceGetPersistenceMode": 1
+    }
+
+    def __init__(self):
+        self.lib = self
+
+    def count(self):
+        return 1
+
+    def by_index(self, index):
+        return "h0" if index == 0 else None
+
+    def handle(self, uuid):
+        return "h0" if uuid == "GPU-nvml-0" else None
+
+    def text(self, fn, *args):
+        return self.TEXT.get(fn)
+
+    def uint(self, fn, *args):
+        return self.UINT.get(fn)
+
+    def sample(self, handle):
+        return 1755, 0x4
+
+    def nvmlDeviceGetMemoryInfo(self, handle, mem):
+        mem._obj.used = 518 * 2**20
+        return 0
+
+    def nvmlDeviceGetPciInfo_v3(self, handle, pci):
+        pci._obj.bus_id = b"00000000:18:00.0"
+        return 0
+
+    def nvmlDeviceGetPowerManagementLimitConstraints(self, handle, lo, hi):
+        hi._obj.value = 700000
+        return 0
+
+
+def test_nvidia_inventory_falls_back_to_nvml_without_nvidia_smi(monkeypatch, tmp_path):
+    # MAST containers mount the driver's libnvidia-ml but not nvidia-smi.
+    from _harness import denoise
+
+    monkeypatch.setattr(denoise.shutil, "which", lambda name: None)
+    monkeypatch.setattr(denoise, "_nvml", _FakeNvml())
+    (tmp_path / "0000:18:00.0").mkdir()
+    (tmp_path / "0000:18:00.0" / "numa_node").write_text("1\n")
+    monkeypatch.setattr(denoise, "_PCI_DEVICES", str(tmp_path))
+    monkeypatch.setattr(denoise, "numa_bound", lambda node: True)
+    assert denoise.vendor() == denoise.NVIDIA
+    (device, ) = denoise.list_devices()
+    assert (device.index, device.name, device.uuid) == (0, "NVIDIA H100", "GPU-nvml-0")
+    assert device.memory_used_mib == pytest.approx(518)
+    assert denoise.select_device().uuid == "GPU-nvml-0"
+    assert denoise.gpu_uuid(0) == "GPU-nvml-0"
+    state = denoise.gpu_state("GPU-nvml-0")
+    assert state.available and state.index == 0 and state.driver == "580.1"
+    assert (state.sm_clock_mhz, state.max_sm_clock_mhz, state.event_reason_names) == (1755, 1980, ["sw_power_cap"])
+    assert (state.power_draw_w, state.power_limit_w, state.max_power_limit_w) == (120, 650, 700)
+    assert (state.temperature_c, state.persistence_mode) == (40, "Enabled")
+    assert denoise.numa_node("GPU-nvml-0") == 1
+    # Other processes on the GPU are visible only to nvidia-smi.
+    assert denoise.check(0) == ["nvidia-smi unavailable: cannot verify tenancy"]
+
+
 def test_required_benchmark_gpu_cannot_be_an_empty_success(monkeypatch):
     from _harness import denoise
 
@@ -830,6 +900,8 @@ def test_focus_suite_can_union_other_suites():
     "module_name",
     [
         "triton.tlx.ops.kernels.addmm._shapes",
+        "triton.tlx.ops.kernels.collectives.all_reduce._shapes",
+        "triton.tlx.ops.kernels.collectives.fused.all_reduce_norm_residual_norm._shapes",
         "triton.tlx.ops.kernels.fused.addmm_mul_add._shapes",
         "triton.tlx.ops.kernels.bmm._shapes",
         "triton.tlx.ops.kernels.flash_attn._shapes",
@@ -842,15 +914,19 @@ def test_focus_suite_can_union_other_suites():
         "triton.tlx.ops.kernels.kda._decode_shapes",
         "triton.tlx.ops.kernels.fused.linear_rowscale._shapes",
         "triton.tlx.ops.kernels.fused.moe_router_topk_align._shapes",
+        "triton.tlx.ops.kernels.fused.moe_mxfp4_sort_quant._shapes",
         "triton.tlx.ops.kernels.fused.norm_residual_norm._shapes",
         "triton.tlx.ops.kernels.fused.rmsnorm_gate._shapes",
         "triton.tlx.ops.kernels.mla_window_attn._shapes",
         "triton.tlx.ops.kernels.mm._shapes",
         "triton.tlx.ops.kernels.moe._routing_shapes",
+        "triton.tlx.ops.kernels.moe_finalize._shapes",
+        "triton.tlx.ops.kernels.moe_mxfp._shapes",
         "triton.tlx.ops.kernels.norm._shapes",
         "triton.tlx.ops.kernels.fused.qk_norm_rope_kv_cache._shapes",
         "triton.tlx.ops.kernels.router_gemm._shapes",
         "triton.tlx.ops.kernels.swiglu_ffn._shapes",
+        "triton.tlx.ops.kernels.window_attn_varlen._shapes",
     ],
 )
 def test_operator_shape_modules_expose_the_l1_union(module_name):
@@ -871,6 +947,8 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
             "gfx942": ("gfx942_all", ),
             "gfx950": ("gfx950_all", ),
         },
+        "triton.tlx.ops.kernels.collectives.all_reduce._shapes": {"gfx950": ("gfx950_all", )},
+        "triton.tlx.ops.kernels.collectives.fused.all_reduce_norm_residual_norm._shapes": {"gfx950": ("gfx950_all", )},
         "triton.tlx.ops.kernels.fused.addmm_mul_add._shapes": {"sm90": ("sm90_1", )},
         "triton.tlx.ops.kernels.bmm._shapes": {"gfx950": ("gfx950_all", )},
         "triton.tlx.ops.kernels.flash_attn._shapes": {
@@ -913,10 +991,14 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
             "gfx942": ("gfx942_all", ),
         },
         "triton.tlx.ops.kernels.fused.moe_router_topk_align._shapes": {"gfx950": ("gfx950_all", )},
+        "triton.tlx.ops.kernels.fused.moe_mxfp4_sort_quant._shapes": {"gfx950": ("gfx950_all", )},
         "triton.tlx.ops.kernels.moe._routing_shapes": {"gfx950": ("gfx950_all", )},
+        "triton.tlx.ops.kernels.moe_finalize._shapes": {"sm100": ("sm100_all", )},
+        "triton.tlx.ops.kernels.moe_mxfp._shapes": {"gfx1250": ("gfx1250_all", )},
         "triton.tlx.ops.kernels.fused.qk_norm_rope_kv_cache._shapes": {"gfx950": ("gfx950_all", )},
         "triton.tlx.ops.kernels.router_gemm._shapes": {"gfx950": ("gfx950_all", )},
         "triton.tlx.ops.kernels.swiglu_ffn._shapes": {"sm90": ("sm90_1", )},
+        "triton.tlx.ops.kernels.window_attn_varlen._shapes": {"sm90": ("sm90_1", )},
     }
     pattern = re.compile(r"^(?:sm|gfx)\d+_(?:[1-9]\d*|all)$")
     for module_name, defaults in expected.items():
@@ -1001,6 +1083,8 @@ def test_focus_suite_op_mismatch_is_rejected_explicitly():
 BENCH_MODULES = (
     "bench_addmm",
     "bench_addmm_mul_add",
+    "bench_all_reduce",
+    "bench_all_reduce_norm_residual_norm",
     "bench_flash_attn",
     "bench_flash_attn_mxfp8",
     "bench_flash_attn_varlen",
@@ -1013,9 +1097,11 @@ BENCH_MODULES = (
     "bench_linear_rowscale",
     "bench_mla_window_attn",
     "bench_mm",
-    "bench_mm_mxfp8",
+    "bench_mm_mxfp",
     "bench_moe_router_topk_align",
+    "bench_moe_mxfp4_sort_quant",
     "bench_moe_routing",
+    "bench_moe_finalize",
     "bench_norm_residual_norm",
     "bench_norm",
     "bench_qk_norm_rope_kv_cache",
@@ -1023,6 +1109,7 @@ BENCH_MODULES = (
     "bench_rmsnorm_cat",
     "bench_rmsnorm_gate",
     "bench_swiglu_ffn",
+    "bench_window_attn_varlen",
 )
 
 
@@ -1053,10 +1140,10 @@ def test_synthetic_cases_are_well_formed_without_a_gpu(module_name):
         assert case.key.count("/") >= 3
 
 
-def test_mm_mxfp8_benchmark_covers_both_public_scale_layouts(monkeypatch):
+def test_mm_mxfp_benchmark_covers_both_public_scale_layouts(monkeypatch):
     import importlib
 
-    bench = importlib.import_module("bench_mm_mxfp8")
+    bench = importlib.import_module("bench_mm_mxfp")
     monkeypatch.setattr(bench.driver, "arch", lambda: "gfx950")
     cases = bench.cases(synthetic=True)
     assert {case.shape[-1] for case in cases} == {"natural", "cublas_blocked"}
@@ -1065,8 +1152,8 @@ def test_mm_mxfp8_benchmark_covers_both_public_scale_layouts(monkeypatch):
     assert all("'sf_layout':" in case.label for case in cases)
 
 
-def test_mm_mxfp8_benchmark_reports_logical_k_for_padded_shapes():
-    from triton.tlx.ops.kernels.mm_mxfp8._shapes import flops, label
+def test_mm_mxfp_benchmark_reports_logical_k_for_padded_shapes():
+    from triton.tlx.ops.kernels.mm_mxfp._shapes import flops, label
 
     rendered = label(85, 3584, 25600, "natural")
     assert "'K': '25536'" in rendered
@@ -1074,10 +1161,10 @@ def test_mm_mxfp8_benchmark_reports_logical_k_for_padded_shapes():
     assert flops(85, 3584, 25600) == 2 * 85 * 3584 * 25536
 
 
-def test_mm_mxfp8_default_uses_preshuffled_contract_where_supported(monkeypatch):
+def test_mm_mxfp_default_uses_preshuffled_contract_where_supported(monkeypatch):
     import importlib
 
-    bench = importlib.import_module("bench_mm_mxfp8")
+    bench = importlib.import_module("bench_mm_mxfp")
     monkeypatch.setattr(bench.driver, "arch", lambda: "gfx950")
     model_cases = [case for case in bench.cases() if case.shape[:3] in bench.MODEL_LINEAR_SHAPE_SET]
     assert len(model_cases) == 30
@@ -1239,6 +1326,186 @@ def test_every_autotuned_kernel_a_case_launches_is_recorded(monkeypatch):
                                                                             num_stages=2)))
     assert Autotuner.run is stub, "the patch must not outlive the launch"
     assert driver._render_configs(captured) == "attn_fwd: BM=64 w4 s2 | attn_bwd: BM=64 w8 s2"
+
+
+def test_autotune_records_keep_the_tuning_origin_without_reusing_old_timings(monkeypatch):
+    from triton import knobs
+    from triton.runtime.autotuner import Autotuner
+    from _harness import driver
+
+    class Tuner:
+
+        def kernel():
+            pass
+
+        base_fn = staticmethod(kernel)
+        configs = [triton.Config({"BLOCK_M": 128}, num_ctas=2, maxnreg=96), triton.Config({"BLOCK_M": 64})]
+
+        def __init__(self):
+            self.cache = {(8, ): self.configs[1]}
+            self.configs_timings = None
+
+    previous_events = []
+
+    def previous_listener(**event):
+        previous_events.append(event)
+
+    monkeypatch.setattr(knobs.autotuning, "listener", previous_listener)
+
+    def launch(self, key, winner):
+        self._last_key = (key, )
+        if self._last_key not in self.cache:
+            self.cache[self._last_key] = self.configs[winner]
+            self.configs_timings = ({self.configs[0]: [0.03, 0.029, 0.031], self.configs[1]: float("inf")}
+                                    if winner == 0 else {self.configs[0]: float("inf"), self.configs[1]: [0.029]})
+            knobs.autotuning.listener(fn=self.base_fn, key=self._last_key, best_config=self.cache[self._last_key],
+                                      configs_timings=self.configs_timings, cache_hit=False, duration=1.0)
+        self.best_config = self.cache[self._last_key]
+
+    monkeypatch.setattr(Autotuner, "run", launch)
+    tuner = Tuner()
+    records = {}
+    with driver._record_configs({}, case_key="Z37", decisions=records):
+        Autotuner.run(tuner, 64, 0)
+    tuned = next(iter(records.values()))
+    assert tuned["selection"] == "tuned" and tuned["selected_by_case"] == "Z37"
+    assert tuned["config"]["num_ctas"] == 2 and tuned["config"]["maxnreg"] == 96
+    assert tuned["candidates"][1]["timings_ms"] == [None]
+    assert len(previous_events) == 1
+
+    inherited = {}
+    with driver._record_configs({}, case_key="Z40", decisions=inherited):
+        Autotuner.run(tuner, 64, 1)
+    cached = next(iter(inherited.values()))
+    assert cached["key"] == ["64"] and cached["selection"] == "cached"
+    assert cached["config"] == tuned["config"] and cached["selected_by_case"] == "Z37"
+    assert cached["candidates"] == []
+    assert len(previous_events) == 1
+
+    tuner.cache.clear()
+    retuned = {}
+    with driver._record_configs({}, case_key="Z43", decisions=retuned):
+        Autotuner.run(tuner, 64, 1)
+    assert next(iter(retuned.values()))["selected_by_case"] == "Z43"
+    assert Autotuner.run is launch and knobs.autotuning.listener is previous_listener
+    result = Result(case=_case(), autotune=list(inherited.values()))
+    assert json.loads(json.dumps(result.to_dict(), allow_nan=False))["autotune"] == list(inherited.values())
+
+
+@pytest.mark.parametrize("single_config", [False, True])
+def test_unobserved_autotune_choices_do_not_invent_a_tuning_origin(monkeypatch, single_config):
+    from triton.runtime.autotuner import Autotuner
+    from _harness import driver
+
+    class Tuner:
+
+        def kernel():
+            pass
+
+        base_fn = staticmethod(kernel)
+        configs = [triton.Config({"BLOCK_M": 64})] * (1 if single_config else 2)
+        best_config = configs[0]
+        cache = {(64, ): best_config}
+        _last_key = (64, )
+        configs_timings = {best_config: [99.0]}
+
+    monkeypatch.setattr(Autotuner, "run", lambda self: None)
+    records = {}
+    with driver._record_configs({}, case_key="Z40", decisions=records):
+        Autotuner.run(Tuner())
+    row = next(iter(records.values()))
+    assert row["selection"] == ("fixed" if single_config else "cached")
+    assert row["selected_by_case"] is None and row["candidates"] == []
+    assert row["key"] == (None if single_config else ["64"])
+
+
+def test_autotune_observers_are_restored_when_warmup_raises(monkeypatch):
+    from triton import knobs
+    from triton.runtime.autotuner import Autotuner
+    from _harness import driver
+
+    previous = knobs.autotuning.listener
+
+    def failed(self):
+        raise RuntimeError("warmup failed")
+
+    monkeypatch.setattr(Autotuner, "run", failed)
+    with pytest.raises(RuntimeError, match="warmup failed"):
+        with driver._record_configs({}, case_key="Z37", decisions={}):
+            Autotuner.run(type("Tuner", (), {"cache": {}})())
+    assert Autotuner.run is failed and knobs.autotuning.listener is previous
+
+
+@pytest.mark.parametrize("recording_fails", [False, True])
+def test_autotune_recording_preserves_measurement_and_best_config(monkeypatch, recording_fails):
+    import types
+    import torch
+    from triton import knobs
+    from triton.runtime.autotuner import Autotuner
+    from _harness import driver
+
+    class Tuner:
+
+        def kernel():
+            pass
+
+        base_fn = staticmethod(kernel)
+
+        def __init__(self, tile):
+            self.cache = {}
+            self.configs = [triton.Config({"BLOCK_M": tile})]
+            self.best_config = self.configs[0]
+
+    prepare_tuner, tlx_tuner, ref_tuner = (Tuner(tile) for tile in (32, 64, 128))
+
+    def prepare_kernel():
+        pass
+
+    def tlx_kernel():
+        pass
+
+    def reference_kernel():
+        pass
+
+    prepare_tuner.base_fn, tlx_tuner.base_fn, ref_tuner.base_fn = prepare_kernel, tlx_kernel, reference_kernel
+
+    def launch(self):
+        return None
+
+    monkeypatch.setattr(Autotuner, "run", launch)
+    previous_listener = knobs.autotuning.listener
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(driver, "host_overhead_us", lambda fn: 0.0)
+    measured = []
+
+    def measure(fn, **kwargs):
+        assert Autotuner.run is launch and knobs.autotuning.listener is previous_listener
+        fn()
+        measured.append(fn)
+        return summarize([10.0])
+
+    monkeypatch.setattr(driver, "measure", measure)
+    if recording_fails:
+
+        def fail(config):
+            raise TypeError("unsupported recording value")
+
+        monkeypatch.setattr(driver, "_config_spec", fail)
+
+    def prepare(case, space):
+        Autotuner.run(prepare_tuner)
+        return driver.Prepared(tlx_fn=lambda: Autotuner.run(tlx_tuner), ref_fn=lambda: Autotuner.run(ref_tuner),
+                               flop_count=1)
+
+    result = driver.run_case(types.SimpleNamespace(prepare=prepare), _case(), space="full", cold=False)
+    assert result.status == Status.OK and result.tlx.mean == 10.0 and len(measured) == 2
+    assert result.best_config == driver._fmt_config(tlx_tuner.best_config)
+    assert {row["phase"] for row in result.autotune} == {"prepare", "warmup", "reference"}
+    if recording_fails:
+        assert all(row.get("recording_error") == "TypeError" for row in result.autotune)
+    else:
+        assert all(row["selection"] == "fixed" for row in result.autotune)
 
 
 def test_an_op_whose_kernels_are_not_autotuned_reports_no_config():

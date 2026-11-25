@@ -426,6 +426,14 @@ std::string getCollectorModifier(CollectorAction reuse, StringRef operand) {
   return ".collector::" + operand.str() + "::" + action.str();
 }
 
+CollectorAction parseCollectorAction(StringAttr attr) {
+  return llvm::StringSwitch<CollectorAction>(attr.getValue())
+      .Case("fill", CollectorAction::Fill)
+      .Case("use", CollectorAction::Use)
+      .Case("lastuse", CollectorAction::Lastuse)
+      .Default(CollectorAction::None);
+}
+
 void createGen5MMA(ConversionPatternRewriter &rewriter, Location loc,
                    StringRef kind, MemDescOperand a, Value b, MemDescOperand d,
                    Value pred, const MMAInstOperands &inst, Value useInitAcc,
@@ -542,15 +550,14 @@ struct DotConversion {
   GetInstOperandsFn getInstOperands;
 };
 
-LogicalResult
-convertDotImpl(const LLVMTypeConverter &typeConverter,
-               ConversionPatternRewriter &rewriter, Location loc, Value a,
-               Value b, Value loadedA, Value loadedB, MemDescType dTensorTy,
-               Value loadedD, Value useDFlag, Value pred, ValueRange barriers,
-               ValueRange barrierPreds, bool twoCTAs, bool tlxPairedMMA,
-               ValueRange commitDescs, bool lessRegMMA,
-               const ttng::TargetFeatures &targetFeatures,
-               const DotConversion &op, StringAttr collectorA = {}) {
+LogicalResult convertDotImpl(
+    const LLVMTypeConverter &typeConverter, ConversionPatternRewriter &rewriter,
+    Location loc, Value a, Value b, Value loadedA, Value loadedB,
+    MemDescType dTensorTy, Value loadedD, Value useDFlag, Value pred,
+    ValueRange barriers, ValueRange barrierPreds, bool twoCTAs,
+    bool tlxPairedMMA, ValueRange commitDescs, bool lessRegMMA,
+    const ttng::TargetFeatures &targetFeatures, const DotConversion &op,
+    StringAttr collectorA = {}, StringAttr collectorB = {}) {
   auto tb = TritonLLVMOpBuilder(loc, rewriter);
   auto dLoader = DotOpMmaV5TmemLoader::build(
       loc, rewriter, dTensorTy, loadedD, dTensorTy.getElementTypeBitWidth());
@@ -642,13 +649,22 @@ convertDotImpl(const LLVMTypeConverter &typeConverter,
 
   CollectorAction explicitReuseA = CollectorAction::None;
   if (collectorA) {
-    explicitReuseA = llvm::StringSwitch<CollectorAction>(collectorA.getValue())
-                         .Case("fill", CollectorAction::Fill)
-                         .Case("use", CollectorAction::Use)
-                         .Case("lastuse", CollectorAction::Lastuse)
-                         .Default(CollectorAction::None);
+    explicitReuseA = parseCollectorAction(collectorA);
     if (explicitReuseA == CollectorAction::None)
       return mlir::emitError(loc, "unsupported A-collector reuse action");
+  }
+
+  // Explicit B reuse pairs exactly one full-datapath instruction per op, so
+  // the automatic B-collector path below (numRepM == 2) cannot also apply.
+  if (collectorB && (numRepM != 1 || numRepN != 1 || numRepK != 1 ||
+                     mmaSizeM != 128 || !targetFeatures.supportsReuseB()))
+    return mlir::emitError(loc, "B-collector reuse requires a single M=128 MMA "
+                                "instruction on a target with B reuse");
+  CollectorAction explicitReuseB = CollectorAction::None;
+  if (collectorB) {
+    explicitReuseB = parseCollectorAction(collectorB);
+    if (explicitReuseB == CollectorAction::None)
+      return mlir::emitError(loc, "unsupported B-collector reuse action");
   }
 
   // In A * B = C
@@ -781,6 +797,8 @@ convertDotImpl(const LLVMTypeConverter &typeConverter,
     OperandReuse reuse{getReuse(reuseA, 0), getReuse(reuseB, 1)};
     if (collectorA)
       reuse.a = explicitReuseA;
+    if (collectorB)
+      reuse.b = explicitReuseB;
     auto [m, n, k] = indices;
     auto accAddress =
         dLoader.tmemLoad(m * mmaSizeM, n * mmaSizeN, rewriter, loc);
@@ -863,7 +881,8 @@ LogicalResult convertDot(const LLVMTypeConverter &typeConverter,
       adaptor.getPred(), adaptor.getBarriers(), adaptor.getBarrierPreds(),
       twoCTAs, tlx::tlxEnablePairedMMA(op), commitDescs, hasLessRegMMA(op),
       targetFeatures, dot,
-      op->getAttrOfType<StringAttr>(ttng::kCollectorAAttrName));
+      op->getAttrOfType<StringAttr>(ttng::kCollectorAAttrName),
+      op->getAttrOfType<StringAttr>(ttng::kCollectorBAttrName));
 }
 
 int64_t getFormatBitSize(ScaleDotElemType type) {

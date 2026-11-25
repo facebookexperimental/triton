@@ -587,6 +587,26 @@ void reorderEpilogOps(const SmallVector<Channel *> &channels,
       return false;
     };
 
+    // A TMA staging write has no memdesc operand, so hoistsAcrossMemoryOp
+    // misses it. The staging allocs later share a ring of K copies, so a write
+    // hoisted above an earlier TMA op can overwrite a slot that op still reads.
+    auto isTMAStoreLike = [](Operation *op) {
+      return isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(op);
+    };
+    auto hoistsStagingWriteAcrossTMAOp = [&](Operation *op,
+                                             Operation *insertAfter) {
+      auto alloc = dyn_cast<ttg::LocalAllocOp>(op);
+      if (!alloc || !alloc.getSrc() || !insertAfter->isBeforeInBlock(op))
+        return false;
+      if (llvm::none_of(op->getUsers(), isTMAStoreLike))
+        return false;
+      for (Operation *cur = insertAfter->getNextNode(); cur && cur != op;
+           cur = cur->getNextNode())
+        if (isTMAStoreLike(cur))
+          return true;
+      return false;
+    };
+
     // Streamline ops on a channel chain.
     // Starting with producers with smaller task ids, moving forward
     // dependencies of the consumer ops close to the them.
@@ -599,7 +619,8 @@ void reorderEpilogOps(const SmallVector<Channel *> &channels,
             continue;
           // push depOp to be right after its operands
           auto lastOpndOp = lastInBlockOperand(depOp);
-          if (lastOpndOp && !hoistsAcrossMemoryOp(depOp, lastOpndOp))
+          if (lastOpndOp && !hoistsAcrossMemoryOp(depOp, lastOpndOp) &&
+              !hoistsStagingWriteAcrossTMAOp(depOp, lastOpndOp))
             depOp->moveAfter(lastOpndOp);
         }
       }
@@ -5773,6 +5794,33 @@ static void foldDescriptorLoadMmaBridge(triton::FuncOp funcOp) {
   }
 }
 
+// Returns a register value feeding consumers in different partitions through
+// separate channels in one block; createBuffer cannot reload it in each
+// partition. createBuffer groups channels by source value and consumer block,
+// so channels in different blocks get separate buffers and are fine. Channel
+// topology does not depend on numBuffers (it only sets the buffer depth), so
+// collecting with 1 finds the same channels as doBufferAllocation.
+Value findTensorChannelWithMixedConsumerTasks(triton::FuncOp funcOp) {
+  SmallVector<std::unique_ptr<Channel>> channelsOrigin;
+  collectAsyncChannels(channelsOrigin, funcOp, 1 /*numBuffers*/);
+  DenseMap<std::pair<Value, Block *>, Channel *> firstChannel;
+  for (const auto &channel : channelsOrigin) {
+    Value src = channel->getSrcOperand();
+    if (!isa<RankedTensorType>(src.getType()))
+      continue;
+    // doConvertDescriptorLoadsToNVWS turns a register-consumed descriptor load
+    // into a local_load tagged with every consumer partition, which forms no
+    // register channel, so createBuffer never sees it.
+    if (src.getDefiningOp<tt::DescriptorLoadOp>())
+      continue;
+    auto [it, inserted] = firstChannel.try_emplace(
+        {src, channel->getDstOp()->getBlock()}, channel.get());
+    if (!inserted && it->second->relation.second != channel->relation.second)
+      return src;
+  }
+  return Value();
+}
+
 LogicalResult doBufferAllocation(triton::FuncOp funcOp) {
   // Step 0: Swap transposed local_alloc + memdesc_trans patterns so that
   // allocs that share the same source value can also share a buffer.
@@ -5800,6 +5848,12 @@ LogicalResult doBufferAllocation(triton::FuncOp funcOp) {
     channels.push_back(c.get());
   }
   if (!channels.empty()) {
+    if (Value src = findTensorChannelWithMixedConsumerTasks(funcOp)) {
+      return emitError(
+          src.getLoc(),
+          "meta autoWS does not support a register value used by consumers "
+          "in different partitions");
+    }
     // Step 2: Reorder ops based on channel information.
     reorderEpilogOps(channels, funcOp);
 

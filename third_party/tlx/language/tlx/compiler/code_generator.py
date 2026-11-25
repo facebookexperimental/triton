@@ -266,10 +266,20 @@ def visit_withAsyncTasks(self, node):
 
             num_default = 0
             default_num_regs = None
+            # Partition indices (-1 for the default region) of the tasks that set
+            # nvptx_cmp_sink_workaround, in partition-region order.
+            cmp_sink_workaround_regions = []
+            partition_index = 0
             for stmt in stmts:
                 task = _get_async_task(self, stmt)
                 assert task.is_explict
                 assert task.replicate is not None, "Replicate must be non-None task"
+                num_partitions = task.replicate - 1 if task.is_default else task.replicate
+                if task.nvptx_cmp_sink_workaround:
+                    if task.is_default:
+                        cmp_sink_workaround_regions.append(-1)
+                    cmp_sink_workaround_regions.extend(range(partition_index, partition_index + num_partitions))
+                partition_index += num_partitions
                 if task.is_default:
                     num_default += 1
                     default_num_regs = task.num_regs
@@ -336,6 +346,10 @@ def visit_withAsyncTasks(self, node):
             ws_op.set_attr("tlx.less_reg_mma", self.builder.get_unit_attr())
         if no_ws_header_tid_reuse:
             ws_op.set_attr("tlx.no_ws_header_tid_reuse", self.builder.get_unit_attr())
+        if cmp_sink_workaround_regions:
+            # Read by the NVIDIA barrier-arrive lowering; see async_task.nvptx_cmp_sink_workaround.
+            ws_op.set_attr("tlx.nvptx_cmp_sink_workaround",
+                           self.builder.get_dense_i32_array_attr(cmp_sink_workaround_regions))
 
         # dry visit async task body to calculate captures
         index = 0

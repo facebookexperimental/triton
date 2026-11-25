@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --split-input-file --convert-triton-amdgpu-to-llvm=gfx-arch=gfx950 | FileCheck %s
+// RUN: triton-opt %s --split-input-file --convert-triton-amdgpu-to-llvm=gfx-arch=gfx950 --verify-diagnostics | FileCheck %s
 //
 // Stochastic rounding (rounding = rs) on CDNA4 lowers f32 to OCP fp8
 // (V_CVT_SR_FP8/BF8_F32 via rocdl.cvt.sr.*) and to f16/bf16
@@ -48,6 +48,19 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     // CHECK-NOT: llvm.amdgcn.cvt.sr.
     // CHECK: llvm.return
     %1 = tt.fp_to_fp %arg0, rbits = %rbits : tensor<1024xi32, #blocked2>, rounding = rs : tensor<1024xf32, #blocked2> -> tensor<1024xbf16, #blocked2>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @sr_store_unsupported(%arg0: tensor<1024xf32, #blocked>,
+                               %rbits: tensor<1024xi32, #blocked>) {
+    // expected-error @+2 {{SR stores are not supported on AMD}}
+    // expected-error @+1 {{failed to legalize operation 'tt.fp_to_fp'}}
+    %0 = tt.fp_to_fp %arg0, rbits = %rbits : tensor<1024xi32, #blocked>, rounding = rs {sr_ieee} : tensor<1024xf32, #blocked> -> tensor<1024xbf16, #blocked>
     tt.return
   }
 }

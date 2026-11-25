@@ -2,10 +2,10 @@
 
 import pytest
 import torch
-from triton._internal_testing import is_hip_gfx1250
+from triton._internal_testing import is_hip_cdna5
 from triton.tlx.ops.kernels.flash_attn_mxfp8._shapes import CORRECTNESS_SHAPES
 
-pytestmark = pytest.mark.skipif(not is_hip_gfx1250(), reason="tlx.ops.flash_attn_mxfp8 on gfx1250 requires gfx1250")
+pytestmark = pytest.mark.skipif(not is_hip_cdna5(), reason="tlx.ops.flash_attn_mxfp8 on CDNA5 requires CDNA5")
 
 MULTI_WAVE_SHAPE = (1, 64, 1024, 128)
 

@@ -237,6 +237,14 @@ def _check_reg_auto_ws_alignment(name: str, value: Optional[int]) -> None:
 
 @dataclass(frozen=True)
 class CUDAOptions:
+    sr_launch: tuple = ()
+    sr_grid: int = 0
+    sr_mode: str = ""
+    sr_ownership: str = "checked"
+    sr_overflow: str = "satfinite"
+    sr_entropy: str = "element"
+    sr_site: str = ""
+    sr_rounds: int = 10
     num_warps: int = 4
     num_ctas: int = 1
     num_stages: int = 3
@@ -262,6 +270,10 @@ class CUDAOptions:
     )
     enable_fp_fusion: bool = True
     sched4reg: bool = False
+    # Run LLVM SLP instead of the target-aware NVPTX vectorizer for this kernel.
+    use_slp_vectorizer: bool = False
+    # Disable LLVM loop strength reduction for this kernel's code generation.
+    disable_lsr: bool = False
     enable_reflect_ftz: bool = True  # ftz in libdevice
     launch_cooperative_grid: bool = False
     launch_cluster: bool = False  # Blackwell cluster launcher
@@ -413,6 +425,7 @@ class CUDABackend(BaseBackend):
 
         args = {"arch": knobs.runtime.override_arch or f"sm{self.target.arch}"}
         args.update({k: opts[k] for k in CUDAOptions.__dataclass_fields__.keys() if k in opts if opts[k] is not None})
+        args["sr_launch"] = tuple(tuple(item) for item in args.get("sr_launch", ()))
         if args.get("instrumentation_mode", ""):
             # Instrumentation can require more registers than the user-specified limit.
             args["maxnreg"] = None
@@ -429,8 +442,8 @@ class CUDABackend(BaseBackend):
         if args.get("clc", False) and capability < 100:
             raise ValueError(f"clc=True requires NVIDIA SM100+ (Blackwell); current target is sm_{capability}; "
                              "use tl.clc_tile_scheduler() for the fbtriton CLC path")
-        if args.get("clc", False) and knobs.nvidia.use_meta_ws:
-            raise ValueError("clc=True does not support Meta AutoWS; use tl.clc_tile_scheduler()")
+        # clc=True with Meta AutoWS is rejected in make_ttgir, once the module
+        # is known to request warp specialization.
 
         if args.get("num_ctas", 1) > 1 and capability < 90:
             raise ValueError((f"num_ctas > 1 requires NVIDIA SM90+ (Hopper). "
@@ -872,6 +885,8 @@ class CUDABackend(BaseBackend):
             min_dot_size(self.target),
             "post_ast_lowering":
             post_ast_lowering,
+            "get_ptx_version":
+            functools.partial(get_ptx_version_from_options, options, self.target.arch),
         }
         return codegen_fns
 
@@ -893,6 +908,8 @@ class CUDABackend(BaseBackend):
 
             warnings.warn(warning_msg, stacklevel=2)
 
+        if opt.sr_mode == "enabled":
+            mod.set_attr("tt.sr_grid", ir.builder(mod.context).get_int32_attr(opt.sr_grid))
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         passes.common.add_inliner(pm)
@@ -913,6 +930,9 @@ class CUDABackend(BaseBackend):
         passes.ttir.add_combine(pm)
         passes.ttir.add_reorder_broadcast(pm)
         passes.common.add_cse(pm)
+        passes.ttir.add_materialize_stochastic_rounding(pm, opt.sr_mode, opt.sr_site, opt.sr_rounds, capability,
+                                                        get_ptx_version_from_options(opt, capability), opt.sr_ownership,
+                                                        opt.sr_entropy)
         passes.ttir.add_triton_licm(pm)
         passes.ttir.add_uplift_while_to_for(pm)
         passes.common.add_canonicalizer(pm)
@@ -923,10 +943,24 @@ class CUDABackend(BaseBackend):
 
     @staticmethod
     def make_ttgir(mod, metadata, opt, capability):
+        # Meta AutoWS pipeline choices assume the loop gets partitioned, so a
+        # module with no warp-specialization request compiles as with the knob
+        # off. The modulo / joint / LLM schedulers add partitions themselves.
+        # The decision is per module: a module that requests warp
+        # specialization still gets Meta-WS choices on its non-WS loops.
+        use_meta_ws = knobs.nvidia.use_meta_ws and (nvidia.requests_warp_specialization(mod)
+                                                    or knobs.nvidia.use_modulo_schedule is not None
+                                                    or knobs.nvidia.use_joint_schedule or knobs.nvidia.use_llm_schedule)
+        return CUDABackend._make_ttgir(mod, metadata, opt, capability, use_meta_ws)
+
+    @staticmethod
+    def _make_ttgir(mod, metadata, opt, capability, use_meta_ws):
+        # Read by passes in place of TRITON_USE_META_WS.
+        mod.set_attr(nvidia.USE_META_WS_ATTR_NAME, ir.builder(mod.context).get_bool_attr(use_meta_ws))
         if opt.clc and capability < 100:
             raise ValueError("clc=True requires NVIDIA SM100+ (Blackwell); "
                              "use tl.clc_tile_scheduler() for the fbtriton CLC path")
-        if opt.clc and knobs.nvidia.use_meta_ws:
+        if opt.clc and use_meta_ws:
             raise ValueError("clc=True does not support Meta AutoWS; use tl.clc_tile_scheduler()")
 
         # Set maxnreg on all kernels, if it was provided.
@@ -972,7 +1006,7 @@ class CUDABackend(BaseBackend):
             passes.ttir.add_npot_pad(pm, opt.num_warps, 32, opt.num_ctas, f"cuda:{capability}", 0, opt.num_stages,
                                      False)
         passes.ttir.add_convert_to_ttgpuir(pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas)
-        nvidia.passes.hopper.add_form_multi_cta_collectives(pm, capability, knobs.nvidia.use_meta_ws)
+        nvidia.passes.hopper.add_form_multi_cta_collectives(pm, capability, use_meta_ws)
         nvidia.passes.hopper.add_lower_cluster_reduce_to_ttgir(pm)
         # Check user-visible tt.dot 2-CTA legality before lowering rewrites
         # dot dependencies into TMEM alloc/load/store chains.
@@ -1030,16 +1064,16 @@ class CUDABackend(BaseBackend):
             passes.ttir.add_triton_licm(pm)
             passes.common.add_canonicalizer(pm)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
-            if knobs.nvidia.use_meta_ws:
+            if use_meta_ws:
                 nvidia.passes.hopper.add_data_partitioning(pm, 1)
             # Support simplify trip while after data partitioning to
             # enable using this loop to data partition.
             passes.ttir.add_simplify_single_trip_while(pm)
-            if knobs.nvidia.use_meta_ws:
-                passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
-                passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
+            if use_meta_ws:
+                passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_ws)
+                passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, use_meta_ws)
             nvidia.passes.hopper.add_tma_store_lowering(pm)
-            if knobs.nvidia.use_meta_ws:
+            if use_meta_ws:
                 nvidia.passes.hopper.add_sink_broadcast(pm)
                 nvidia.passes.hopper.add_partition_scheduling_meta(pm)
             smem_budget = _max_shared_mem_for_capability(capability)
@@ -1056,9 +1090,9 @@ class CUDABackend(BaseBackend):
                 knobs.nvidia.ws_tile_prefetch_depth,
                 tma_store_pipelining,
             )
-            if not knobs.nvidia.use_meta_ws:
-                passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
-                passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
+            if not use_meta_ws:
+                passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_ws)
+                passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, use_meta_ws)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
         elif capability // 10 >= 10:
             # FPSan emulates floating-point MMA with integer arithmetic. Flattened
@@ -1110,8 +1144,8 @@ class CUDABackend(BaseBackend):
             uses_custom_schedule = (knobs.nvidia.use_llm_schedule or knobs.nvidia.use_modulo_schedule is not None
                                     or knobs.nvidia.use_list_schedule or knobs.nvidia.use_joint_schedule)
             if not uses_custom_schedule:
-                passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
-                passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
+                passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_ws)
+                passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, use_meta_ws)
             # The elif chain above gives the llm/joint/modulo schedulers
             # priority over the list scheduler, so gate the WS skip on the arm
             # that actually RAN, not on the raw knob — with e.g. joint+list both
@@ -1131,7 +1165,7 @@ class CUDABackend(BaseBackend):
                 # as a modulo schedule and demands partition attrs the list
                 # scheduler never emits). So skip WS entirely.
                 pass
-            elif not knobs.nvidia.use_meta_ws:
+            elif not use_meta_ws:
                 # clc=True can use upstream WS for a single CTA on SM100+.
                 # Meta AutoWS and physical clusters remain unsupported.
                 if opt.cluster_dims is None or max(opt.cluster_dims) < 2:
@@ -1164,7 +1198,7 @@ class CUDABackend(BaseBackend):
                 # overwrites it, which silently miscompiles kernels that have a
                 # separate epilogue-store partition.
                 if opt.cluster_dims is not None and max(opt.cluster_dims) >= 2:
-                    passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
+                    passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, use_meta_ws)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
             passes.ttgpuir.add_optimize_partition_warps(pm)
             if (opt.cluster_dims is not None and max(opt.cluster_dims) >= 2 and opt.allowDependentTwoCTA):
@@ -1180,7 +1214,7 @@ class CUDABackend(BaseBackend):
             # 2-CTA: Insert cross-CTA sync AFTER all WS passes.
             # Only for Meta WS path — non-WS 2-CTA sync is handled by
             # MMAv5.cpp's inline ClusterArriveOp.
-            if opt.cluster_dims is not None and max(opt.cluster_dims) >= 2 and knobs.nvidia.use_meta_ws:
+            if opt.cluster_dims is not None and max(opt.cluster_dims) >= 2 and use_meta_ws:
                 nvidia.passes.hopper.add_insert_2cta_sync(pm)
         else:
             passes.ttir.add_triton_licm(pm)
@@ -1211,7 +1245,7 @@ class CUDABackend(BaseBackend):
         passes.common.add_symbol_dce(pm)
         # Optimize the number of warps and registers after TMA lowering, so
         # that any local loads eliminated by TMA lowering do not inflate them.
-        if capability // 10 >= 9 and knobs.nvidia.use_meta_ws:
+        if capability // 10 >= 9 and use_meta_ws:
             passes.ttgpuir.add_optimize_partition_warps(pm)
         # Promote only after partition warps are final: the baked count is
         # derived from task sizes, which optimize-partition-warps shrinks.
@@ -1440,12 +1474,18 @@ class CUDABackend(BaseBackend):
             paths = [path for (name, path) in options.extern_libs]
             llvm.link_extern_libs(llvm_mod, paths)
 
-        # Work around ptxas rejecting PTX generated by the LLVM SLP vectorizer on sm_80.
+        # Opt in to LLVM SLP instead of the target-aware NVPTX vectorizer.
+        use_slp_vectorizer = knobs.nvidia.use_slp_vectorizer or options.use_slp_vectorizer
         llvm.optimize_module(
-            llvm_mod, llvm.OPTIMIZE_O3,
+            llvm_mod,
+            llvm.OPTIMIZE_O3,
             # Same LLVM flags as make_ptx: compilations sharing a process only
             # run in parallel while their flag sets are identical.
-            flags=flags, disable_slp_vectorizer=capability == 80, expand_masked_div_rem=True)
+            flags=flags,
+            disable_slp_vectorizer=(capability == 80) or (not use_slp_vectorizer),
+            expand_masked_div_rem=True,
+            nvptx_compute_capability=0 if use_slp_vectorizer else capability,
+        )
 
         # Get some metadata
         # warp-specialization mutates num_warps

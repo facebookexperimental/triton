@@ -6,7 +6,7 @@ import triton
 import triton.language as tl
 from triton._C.libtriton import ir
 from triton._filecheck import run_parser
-from triton._internal_testing import is_blackwell_ultra, is_hip, is_hip_gfx1250, is_hopper_or_newer
+from triton._internal_testing import is_blackwell_ultra, is_hip, is_hip_cdna5, is_hopper_or_newer
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 from triton.compiler.compiler import make_backend
@@ -167,7 +167,7 @@ def run_tlx_square(func, BLOCK_SIZE, device, expected_arrival_count=1):
 
 
 # Unit test for arrive/wait
-@pytest.mark.skipif(not (is_hip_gfx1250() or is_hopper_or_newer()), reason="Need Hopper or newer or AMD gfx1250")
+@pytest.mark.skipif(not (is_hip_cdna5() or is_hopper_or_newer()), reason="Need Hopper or newer or AMD CDNA5")
 @pytest.mark.parametrize("BLOCK_SIZE", [(1024)])
 def test_wait_arrive_non_ws(BLOCK_SIZE, device):
     expected_arrival_count = 4 if is_hip() else 1
@@ -405,11 +405,13 @@ def tlx_square_per_warp_arrive(
     BLOCK_SIZE: tl.constexpr,
     NUM_WARPS: tl.constexpr,
     CONSUMER_WARPS: tl.constexpr,
+    WORKAROUND: tl.constexpr = False,
 ):
     """
     Producer and consumer hand an SMEM buffer over with per-warp arrives: each warp
     syncs its own lanes and one of them arrives, so neither task syncs all its warps.
     The buffer is released by the consumer's warps and a 1-warp task's leader arrive.
+    WORKAROUND sets nvptx_cmp_sink_workaround on the two non-default tasks.
     """
     full = tlx.local_view(tlx.alloc_barriers(num_barriers=1, arrive_count=NUM_WARPS), 0)
     empty = tlx.local_view(tlx.alloc_barriers(num_barriers=1, arrive_count=CONSUMER_WARPS + 1), 0)
@@ -422,14 +424,14 @@ def tlx_square_per_warp_arrive(
             _arrive_per_warp(full)
             tlx.barrier_wait(empty, 0)
 
-        with tlx.async_task(num_warps=CONSUMER_WARPS):
+        with tlx.async_task(num_warps=CONSUMER_WARPS, nvptx_cmp_sink_workaround=WORKAROUND):
             tlx.barrier_wait(full, 0)
             offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
             data = tlx.local_load(smem)
             tl.store(z_ptr + offsets, data * data, mask=offsets < n_elements)
             _arrive_per_warp(empty)
 
-        with tlx.async_task(num_warps=1):
+        with tlx.async_task(num_warps=1, nvptx_cmp_sink_workaround=WORKAROUND):
             tlx.barrier_wait(full, 0)
             tlx.barrier_arrive(empty)
 
@@ -457,6 +459,29 @@ def test_barrier_arrive_per_warp(device):
         assert lines[i].startswith("@%p"), lines[i]
         sync = next(line for line in reversed(lines[:i]) if re.match(r"(bar|barrier)(\.cta)?\.(warp\.)?sync", line))
         assert sync.startswith("bar.warp.sync"), f"expected bar.warp.sync before {lines[i]}, got {sync}"
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_nvptx_cmp_sink_workaround(device):
+    # TEMPORARY NVPTX workaround: in the flagged tasks, per-warp arrives test %laneid in their own
+    # asm and leader arrives use a predicate built at the task entry. The default task is not flagged.
+    torch.manual_seed(0)
+    x = torch.rand(98432, device=device)
+    z = torch.empty_like(x)
+    BLOCK_SIZE, NUM_WARPS, CONSUMER_WARPS = 1024, 4, 2
+    grid = (triton.cdiv(x.numel(), BLOCK_SIZE), )
+    kernel = tlx_square_per_warp_arrive[grid](x, z, x.numel(), BLOCK_SIZE, NUM_WARPS, CONSUMER_WARPS, True,
+                                              num_warps=NUM_WARPS)
+    torch.testing.assert_close(z, x * x)
+
+    assert "tlx.nvptx_cmp_sink_workaround = array<i32: 0, 1>" in kernel.asm["ttgir"]
+    lines = [line.strip() for line in kernel.asm["ptx"].split("\n") if not re.match(r"\s*(\.loc\b|//|$)", line)]
+    arrives = [line for line in lines if "mbarrier.arrive" in line]
+    assert len(arrives) == 3, "\n".join(lines)
+    # The default task's per-warp arrive and the consumer's: only the consumer's tests %laneid itself.
+    assert sum("%laneid" in line for line in arrives) == 1, "\n".join(arrives)
+    # The 1-warp task's leader arrive uses the setp built at the task entry.
+    assert sum(line.startswith("setp.eq.u32 %p") for line in lines) == 1, "\n".join(lines)
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")

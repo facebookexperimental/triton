@@ -1,0 +1,142 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 900" role="img" aria-labelledby="title description" style="background:#ffffff" font-family="Helvetica, Arial, sans-serif">
+  <title id="title">(K, 1) convolution on H100: stock PT2 vs torchTLX conv1d_to_mm</title>
+  <desc id="description">Three panels. 1: when the lowering fires. 2: generated backward code for a dense (3, 1) conv at C = O = 96: stock PT2 calls one cuDNN convolution_backward for dx and dW; conv1d_to_mm materializes the padded grad and input as [N*Lp, C] matrices, runs three mm calls on row-shifted views (storage offsets 0, 96, 192), and keeps cuDNN only for dx. 3: depthwise codegen, where the extern conv disappears and the forward fuses with the following GELU, and the region-level result: backward 256.9 to 214.0 ms, forward 91.8 to 88.0 ms.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#5b6475"/></marker>
+  </defs>
+  <rect x="0" y="0" width="1000" height="900" fill="#ffffff"/>
+  <text x="16" y="28" font-size="17" font-weight="700" fill="#1d2330">(K, 1) convolution on H100 (bf16): stock PT2 vs torchTLX conv1d_to_mm</text>
+
+  <!-- 1. When it fires -->
+  <text x="16" y="60" font-size="15" font-weight="700" fill="#1d2330">1. When the lowering fires (per call, no autotuning)</text>
+  <rect x="16" y="72" width="170" height="54" rx="6" fill="#eef2f7" stroke="#9aa6b8"/>
+  <text x="101" y="95" font-size="12" fill="#1d2330" text-anchor="middle">tlx_mode set and</text>
+  <text x="101" y="112" font-size="12" fill="#1d2330" text-anchor="middle">conv1d_to_mm (default on)</text>
+  <rect x="206" y="72" width="170" height="54" rx="6" fill="#eef2f7" stroke="#9aa6b8"/>
+  <text x="291" y="95" font-size="12" fill="#1d2330" text-anchor="middle">stride 1, dilation 1,</text>
+  <text x="291" y="112" font-size="12" fill="#1d2330" text-anchor="middle">not transposed, static</text>
+  <rect x="396" y="72" width="170" height="54" rx="6" fill="#eef2f7" stroke="#9aa6b8"/>
+  <text x="481" y="95" font-size="12" fill="#1d2330" text-anchor="middle">CUDA device,</text>
+  <text x="481" y="112" font-size="12" fill="#1d2330" text-anchor="middle">bf16 / fp16</text>
+  <rect x="586" y="72" width="170" height="54" rx="6" fill="#eef2f7" stroke="#9aa6b8"/>
+  <text x="671" y="95" font-size="12" fill="#1d2330" text-anchor="middle">[N,C,L,1] input, (K,1)</text>
+  <text x="671" y="112" font-size="12" fill="#1d2330" text-anchor="middle">kernel, 0 &lt;= P &lt;= K-1</text>
+  <line x1="186" y1="99" x2="204" y2="99" stroke="#5b6475" marker-end="url(#arrow)"/>
+  <line x1="376" y1="99" x2="394" y2="99" stroke="#5b6475" marker-end="url(#arrow)"/>
+  <line x1="566" y1="99" x2="584" y2="99" stroke="#5b6475" marker-end="url(#arrow)"/>
+  <line x1="756" y1="90" x2="784" y2="80" stroke="#5b6475" marker-end="url(#arrow)"/>
+  <line x1="756" y1="108" x2="784" y2="118" stroke="#5b6475" marker-end="url(#arrow)"/>
+  <rect x="786" y="64" width="198" height="34" rx="6" fill="#e3ecfb" stroke="#2f6fd6"/>
+  <text x="885" y="86" font-size="12" fill="#1d2330" text-anchor="middle">dense: groups 1, C or O % 64</text>
+  <rect x="786" y="104" width="198" height="34" rx="6" fill="#f1e8fb" stroke="#7c3aed"/>
+  <text x="885" y="126" font-size="12" fill="#1d2330" text-anchor="middle">depthwise: groups = C = O</text>
+  <text x="16" y="156" font-size="12" fill="#5b6475">Any failed check calls the original lowering. The 64-channel rule is an H100 cuDNN measurement: at L = 100, GEMMs win 2.6x at C = 96 and lose 2.3x at C = 128.</text>
+
+  <!-- 2. Dense wgrad codegen -->
+  <text x="16" y="194" font-size="15" font-weight="700" fill="#1d2330">2. Generated backward, dense (3, 1) conv, N = 64, C = O = 96, L = 200, channels_last</text>
+  <text x="16" y="220" font-size="13" font-weight="700" fill="#1d2330">Stock PT2: dx and dW from one cuDNN call</text>
+  <rect x="16" y="230" width="150" height="40" rx="6" fill="#eef2f7" stroke="#9aa6b8"/>
+  <text x="91" y="255" font-size="12" fill="#1d2330" text-anchor="middle">gelu_backward</text>
+  <rect x="186" y="230" width="130" height="40" rx="6" fill="#eef2f7" stroke="#9aa6b8"/>
+  <text x="251" y="255" font-size="12" fill="#1d2330" text-anchor="middle">bias sum (2 red.)</text>
+  <rect x="336" y="230" width="460" height="40" rx="6" fill="#fde8e3" stroke="#c2412d"/>
+  <text x="566" y="248" font-size="12" fill="#1d2330" text-anchor="middle">aten.convolution_backward(..., [True, True, False])</text>
+  <text x="566" y="263" font-size="11" fill="#c2412d" text-anchor="middle">cuDNN; C = 96 wgrad runs sm80_xmma_wgrad_implicit_gemm_indexed</text>
+  <line x1="166" y1="250" x2="184" y2="250" stroke="#5b6475" marker-end="url(#arrow)"/>
+  <line x1="316" y1="250" x2="334" y2="250" stroke="#5b6475" marker-end="url(#arrow)"/>
+
+  <text x="16" y="302" font-size="13" font-weight="700" fill="#1d2330">conv1d_to_mm: dW as 3 GEMMs on row-shifted views; cuDNN keeps only dx</text>
+  <rect x="16" y="312" width="150" height="40" rx="6" fill="#eef2f7" stroke="#9aa6b8"/>
+  <text x="91" y="337" font-size="12" fill="#1d2330" text-anchor="middle">gelu_backward</text>
+  <rect x="186" y="312" width="130" height="40" rx="6" fill="#eef2f7" stroke="#9aa6b8"/>
+  <text x="251" y="337" font-size="12" fill="#1d2330" text-anchor="middle">bias sum (2 red.)</text>
+  <rect x="336" y="312" width="150" height="40" rx="6" fill="#f1e8fb" stroke="#7c3aed"/>
+  <text x="411" y="330" font-size="12" fill="#1d2330" text-anchor="middle">2 pointwise copies</text>
+  <text x="411" y="345" font-size="11" fill="#5b6475" text-anchor="middle">G~, X~ [64*200, 96]</text>
+  <rect x="506" y="312" width="200" height="40" rx="6" fill="#dff3e7" stroke="#1f8a4c"/>
+  <text x="606" y="330" font-size="12" fill="#1d2330" text-anchor="middle">3 x mm [96,12798] @ [12798,96]</text>
+  <text x="606" y="345" font-size="11" fill="#1f8a4c" text-anchor="middle">X~ storage offsets 0, 96, 192</text>
+  <rect x="726" y="312" width="110" height="40" rx="6" fill="#eef2f7" stroke="#9aa6b8"/>
+  <text x="781" y="330" font-size="12" fill="#1d2330" text-anchor="middle">3 copies</text>
+  <text x="781" y="345" font-size="11" fill="#5b6475" text-anchor="middle">into dW slices</text>
+  <rect x="856" y="312" width="128" height="40" rx="6" fill="#fde8e3" stroke="#c2412d"/>
+  <text x="920" y="330" font-size="12" fill="#1d2330" text-anchor="middle">cuDNN dx only</text>
+  <text x="920" y="345" font-size="11" fill="#c2412d" text-anchor="middle">[True, False, False]</text>
+  <line x1="166" y1="332" x2="184" y2="332" stroke="#5b6475" marker-end="url(#arrow)"/>
+  <line x1="316" y1="332" x2="334" y2="332" stroke="#5b6475" marker-end="url(#arrow)"/>
+  <line x1="486" y1="332" x2="504" y2="332" stroke="#5b6475" marker-end="url(#arrow)"/>
+  <line x1="706" y1="332" x2="724" y2="332" stroke="#5b6475" marker-end="url(#arrow)"/>
+  <line x1="836" y1="332" x2="854" y2="332" stroke="#5b6475" marker-end="url(#arrow)"/>
+
+  <text x="16" y="384" font-size="13" font-weight="700" fill="#1d2330">Why the shifted GEMMs are exact</text>
+  <text x="16" y="404" font-size="12" fill="#1d2330">dW[:, :, k] = G~[0:R]^T @ X~[k : k+R],  R = N*Lp - (K-1).  Row r of G~ pairs with row r+k of X~.</text>
+  <rect x="16" y="416" width="300" height="24" fill="#e3ecfb" stroke="#2f6fd6"/>
+  <text x="166" y="433" font-size="11" fill="#1d2330" text-anchor="middle">G~ sample 0: g[t], t &lt; L_out</text>
+  <rect x="316" y="416" width="50" height="24" fill="#eef2f7" stroke="#9aa6b8"/>
+  <text x="341" y="433" font-size="11" fill="#5b6475" text-anchor="middle">0 0</text>
+  <rect x="366" y="416" width="300" height="24" fill="#e3ecfb" stroke="#2f6fd6"/>
+  <text x="516" y="433" font-size="11" fill="#1d2330" text-anchor="middle">G~ sample 1</text>
+  <rect x="666" y="416" width="50" height="24" fill="#eef2f7" stroke="#9aa6b8"/>
+  <text x="691" y="433" font-size="11" fill="#5b6475" text-anchor="middle">0 0</text>
+  <rect x="16" y="448" width="350" height="24" fill="#dff3e7" stroke="#1f8a4c"/>
+  <text x="191" y="465" font-size="11" fill="#1d2330" text-anchor="middle">X~ sample 0: padded x, Lp rows</text>
+  <rect x="366" y="448" width="350" height="24" fill="#dff3e7" stroke="#1f8a4c"/>
+  <text x="541" y="465" font-size="11" fill="#1d2330" text-anchor="middle">X~ sample 1</text>
+  <text x="730" y="433" font-size="12" fill="#1d2330">G~ ends each sample</text>
+  <text x="730" y="449" font-size="12" fill="#1d2330">with K-1 zero rows, so</text>
+  <text x="730" y="465" font-size="12" fill="#1d2330">cross-sample pairs add 0.</text>
+  <text x="16" y="494" font-size="12" fill="#5b6475">Same FLOPs as cuDNN plus (K-1)/Lp zero rows. The shifted views are the nonzero-offset mm inputs that host-side TMA cannot describe.</text>
+
+  <!-- 3. Depthwise + result -->
+  <text x="16" y="532" font-size="15" font-weight="700" fill="#1d2330">3. Depthwise (3, 1) conv, C = 96, and the region result</text>
+  <text x="16" y="558" font-size="13" font-weight="700" fill="#1d2330">Forward</text>
+  <text x="16" y="580" font-size="12" fill="#1d2330">stock</text>
+  <rect x="80" y="566" width="110" height="22" rx="4" fill="#eef2f7" stroke="#9aa6b8"/>
+  <text x="135" y="581" font-size="11" fill="#1d2330" text-anchor="middle">layout copy</text>
+  <rect x="200" y="566" width="160" height="22" rx="4" fill="#fde8e3" stroke="#c2412d"/>
+  <text x="280" y="581" font-size="11" fill="#1d2330" text-anchor="middle">cuDNN convolution</text>
+  <rect x="370" y="566" width="110" height="22" rx="4" fill="#eef2f7" stroke="#9aa6b8"/>
+  <text x="425" y="581" font-size="11" fill="#1d2330" text-anchor="middle">gelu</text>
+  <text x="16" y="610" font-size="12" fill="#1d2330">routed</text>
+  <rect x="80" y="596" width="110" height="22" rx="4" fill="#eef2f7" stroke="#9aa6b8"/>
+  <text x="135" y="611" font-size="11" fill="#1d2330" text-anchor="middle">layout copy</text>
+  <rect x="200" y="596" width="280" height="22" rx="4" fill="#f1e8fb" stroke="#7c3aed"/>
+  <text x="340" y="611" font-size="11" fill="#1d2330" text-anchor="middle">one fused kernel: 3 shifted mul-adds + gelu</text>
+
+  <text x="520" y="558" font-size="13" font-weight="700" fill="#1d2330">Backward (after gelu_backward, bias sum)</text>
+  <text x="520" y="580" font-size="12" fill="#1d2330">stock</text>
+  <rect x="580" y="566" width="90" height="22" rx="4" fill="#eef2f7" stroke="#9aa6b8"/>
+  <text x="625" y="581" font-size="11" fill="#1d2330" text-anchor="middle">layout copy</text>
+  <rect x="680" y="566" width="200" height="22" rx="4" fill="#fde8e3" stroke="#c2412d"/>
+  <text x="780" y="581" font-size="11" fill="#1d2330" text-anchor="middle">cuDNN convolution_backward</text>
+  <rect x="890" y="566" width="94" height="22" rx="4" fill="#eef2f7" stroke="#9aa6b8"/>
+  <text x="937" y="581" font-size="11" fill="#1d2330" text-anchor="middle">layout copy</text>
+  <text x="520" y="610" font-size="12" fill="#1d2330">routed</text>
+  <rect x="580" y="596" width="180" height="22" rx="4" fill="#f1e8fb" stroke="#7c3aed"/>
+  <text x="670" y="611" font-size="11" fill="#1d2330" text-anchor="middle">1 reduction: 3 tap partials</text>
+  <rect x="770" y="596" width="110" height="22" rx="4" fill="#f1e8fb" stroke="#7c3aed"/>
+  <text x="825" y="611" font-size="11" fill="#1d2330" text-anchor="middle">3 finish + cat</text>
+  <rect x="890" y="596" width="94" height="22" rx="4" fill="#f1e8fb" stroke="#7c3aed"/>
+  <text x="937" y="611" font-size="11" fill="#1d2330" text-anchor="middle">dx pointwise</text>
+  <text x="16" y="646" font-size="12" fill="#5b6475">Depthwise has no contraction over C, so there is no GEMM: the extern conv disappears and Inductor fuses the taps with their neighbors.</text>
+
+  <text x="16" y="684" font-size="13" font-weight="700" fill="#1d2330">Production training region on H100, GPU ms per call (1 px = 1.2 ms)</text>
+  <text x="16" y="714" font-size="12" fill="#1d2330">bwd, stock</text>
+  <rect x="150" y="700" width="214.1" height="22" fill="#9aa6b8"/>
+  <text x="372" y="716" font-size="12" fill="#1d2330">256.9</text>
+  <text x="16" y="744" font-size="12" fill="#1d2330">bwd, conv1d_to_mm</text>
+  <rect x="150" y="730" width="178.3" height="22" fill="#1f8a4c"/>
+  <text x="336" y="746" font-size="12" font-weight="700" fill="#1f8a4c">214.0 (-16.7%)</text>
+  <text x="16" y="784" font-size="12" fill="#1d2330">fwd, stock</text>
+  <rect x="150" y="770" width="76.5" height="22" fill="#9aa6b8"/>
+  <text x="234" y="786" font-size="12" fill="#1d2330">91.8</text>
+  <text x="16" y="814" font-size="12" fill="#1d2330">fwd, conv1d_to_mm</text>
+  <rect x="150" y="800" width="73.3" height="22" fill="#1f8a4c"/>
+  <text x="231" y="816" font-size="12" font-weight="700" fill="#1f8a4c">88.0 (-4.2%)</text>
+  <text x="520" y="714" font-size="12" fill="#1d2330">Stock = Inductor with torchTLX off.</text>
+  <text x="520" y="734" font-size="12" fill="#1d2330">torchTLX on with conv1d_to_mm = 0 measures</text>
+  <text x="520" y="754" font-size="12" fill="#1d2330">256.9 / 91.6 ms, so the gain comes from this</text>
+  <text x="520" y="774" font-size="12" fill="#1d2330">lowering. Numerics gate: rel-L2 5.0e-3 (bwd),</text>
+  <text x="520" y="794" font-size="12" fill="#1d2330">1.9e-2 (fwd), both under tolerance.</text>
+  <text x="16" y="860" font-size="12" fill="#5b6475">Codegen: TORCH_LOGS=output_code from TestConv1dToMm on H100. In this test torchTLX allow mode picked cuBLAS for the mm/bmm calls.</text>
+</svg>

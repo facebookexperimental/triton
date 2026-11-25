@@ -51,7 +51,7 @@
 
 #include "TritonAMDGPUTransforms/Passes.h"
 #include "Utility.h" // AMD transforms: composePaddedLayout (+ TargetInfo)
-#include "amd/lib/TritonAMDGPUTransforms/PipelineUtility.h"
+#include "amd/lib/TritonAMDGPUTransforms/Pipeliner/PipelineUtility.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"

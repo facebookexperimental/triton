@@ -18,6 +18,8 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from ..._invariance import BitwiseInvarianceSpec, gemm_fixed_split_k
 from . import _sm100_core as _core
+from . import sm100_gemv as _gemv
+from . import sm100_skinny as _skinny
 
 _FIXED_SPEC = BitwiseInvarianceSpec.dims("K")
 
@@ -90,7 +92,7 @@ def get_heuristic_config(M, N, K, num_sms=148, *, invariance=None):
                 "BLOCK_SIZE_M": 256,
                 "BLOCK_SIZE_N": 128,
                 "BLOCK_SIZE_K": 128,
-                "GROUP_SIZE_M": _select_group_size_m(M, N, 256, num_ctas=2),
+                "GROUP_SIZE_M": select_group_size_m(M, N, 256, num_ctas=2),
                 "NUM_SMEM_BUFFERS": 2,
                 "NUM_TMEM_BUFFERS": 2,
                 "NUM_MMA_GROUPS": 2,
@@ -110,7 +112,7 @@ def get_heuristic_config(M, N, K, num_sms=148, *, invariance=None):
                     "BLOCK_SIZE_M": 256,
                     "BLOCK_SIZE_N": 256,
                     "BLOCK_SIZE_K": 128,
-                    "GROUP_SIZE_M": _select_group_size_m(M, N, 256, num_ctas=2),
+                    "GROUP_SIZE_M": select_group_size_m(M, N, 256, num_ctas=2),
                     "NUM_SMEM_BUFFERS": 2,
                     "NUM_TMEM_BUFFERS": 1,
                     "NUM_MMA_GROUPS": 2,
@@ -126,7 +128,7 @@ def get_heuristic_config(M, N, K, num_sms=148, *, invariance=None):
                     "BLOCK_SIZE_M": 256,
                     "BLOCK_SIZE_N": 256,
                     "BLOCK_SIZE_K": 64,
-                    "GROUP_SIZE_M": _select_group_size_m(M, N, 256, num_ctas=2),
+                    "GROUP_SIZE_M": select_group_size_m(M, N, 256, num_ctas=2),
                     "NUM_SMEM_BUFFERS": 4,
                     "NUM_TMEM_BUFFERS": 1,
                     "NUM_MMA_GROUPS": 2,
@@ -170,7 +172,7 @@ def get_heuristic_config(M, N, K, num_sms=148, *, invariance=None):
                     "BLOCK_SIZE_M": block_m,
                     "BLOCK_SIZE_N": block_n,
                     "BLOCK_SIZE_K": block_k,
-                    "GROUP_SIZE_M": _select_group_size_m(M, N, block_m),
+                    "GROUP_SIZE_M": select_group_size_m(M, N, block_m),
                     "NUM_SMEM_BUFFERS": 4,
                     "NUM_TMEM_BUFFERS": 2,
                     "NUM_MMA_GROUPS": 2,
@@ -187,7 +189,7 @@ def get_heuristic_config(M, N, K, num_sms=148, *, invariance=None):
                     "BLOCK_SIZE_M": block_m,
                     "BLOCK_SIZE_N": block_n,
                     "BLOCK_SIZE_K": block_k,
-                    "GROUP_SIZE_M": _select_group_size_m(M, N, block_m),
+                    "GROUP_SIZE_M": select_group_size_m(M, N, block_m),
                     "NUM_SMEM_BUFFERS": 4,
                     "NUM_TMEM_BUFFERS": 3,
                     "NUM_MMA_GROUPS": 2,
@@ -205,7 +207,7 @@ def get_heuristic_config(M, N, K, num_sms=148, *, invariance=None):
             "BLOCK_SIZE_M": 256,
             "BLOCK_SIZE_N": 256,
             "BLOCK_SIZE_K": 64,
-            "GROUP_SIZE_M": _select_group_size_m(M, N, 256),
+            "GROUP_SIZE_M": select_group_size_m(M, N, 256),
             "NUM_SMEM_BUFFERS": 3,
             "NUM_TMEM_BUFFERS": 1,
             "NUM_MMA_GROUPS": 2,
@@ -355,7 +357,7 @@ def get_heuristic_config(M, N, K, num_sms=148, *, invariance=None):
                 "BLOCK_SIZE_M": bm,
                 "BLOCK_SIZE_N": bn,
                 "BLOCK_SIZE_K": bk,
-                "GROUP_SIZE_M": _select_group_size_m(M, N, bm, num_ctas),
+                "GROUP_SIZE_M": select_group_size_m(M, N, bm, num_ctas),
                 "NUM_SMEM_BUFFERS": num_smem_buffers,
                 "NUM_TMEM_BUFFERS": num_tmem_buffers,
                 "NUM_MMA_GROUPS": num_mma_groups,
@@ -370,7 +372,7 @@ def get_heuristic_config(M, N, K, num_sms=148, *, invariance=None):
     return best_config
 
 
-def _select_group_size_m(M, N, block_m, num_ctas=1):
+def select_group_size_m(M, N, block_m, num_ctas=1):
     """
     Select GROUP_SIZE_M based on the golden rule for tile scheduling.
 
@@ -1039,6 +1041,33 @@ def matmul_kernel_tma_ws_blackwell(
     N_TAIL2: tl.constexpr = _n_piece(BLOCK_SIZE_N, 2)
     tl.static_assert(_n_piece(BLOCK_SIZE_N, 3) == 0)
     tl.static_assert(N_TAIL == 0 or not INTERLEAVE_EPILOGUE)
+    slice_size: tl.constexpr = BLOCK_N0 // EPILOGUE_SUBTILE
+
+    # Allocate all barriers before any TMEM allocation. With NUM_CTAS == 2 (paired MMA), entry-block barrier inits
+    # must precede the first TMEM alloc so a cluster sync fits between them; the compiler hoists them and errors if
+    # it cannot. Not required for NUM_CTAS == 1.
+    # Each subtile needs its own barriers: NUM_SMEM_BUFFERS barriers per subtile.
+    A_smem_full_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1)
+    A_smem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1)
+    if NUM_MMA_GROUPS == 1:
+        # A and B TMA loads share the same transaction-byte-counted barrier.
+        B_smem_full_bars = A_smem_full_bars
+    else:
+        B_smem_full_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
+    tmem_full_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1)
+    # NUM_TMEM_BUFFERS (overlaps MMA and epilogue)
+    # One arrival per stored slice, the N tail pieces' slices included.
+    tmem_empty_arrivals: tl.constexpr = BLOCK_SIZE_N // slice_size * NUM_CTAS
+    if USE_WARP_BARRIER:
+        tmem_empty_bars = tlx.alloc_warp_barrier(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS, num_warps=4,
+                                                 num_arrivals=tmem_empty_arrivals)
+    else:
+        tmem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS,
+                                             arrive_count=tmem_empty_arrivals)
+
+    # Each of the three async tasks consumes CLC responses on both cluster CTAs.
+    clc_context = tlx.clc_create_context(num_consumers=3 * NUM_CTAS, num_stages=NUM_CLC_STAGES)
+
     # allocate NUM_SMEM_BUFFERS buffers
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_SIZE_M // NUM_MMA_GROUPS
     if not A_ROW_MAJOR:
@@ -1101,7 +1130,6 @@ def matmul_kernel_tma_ws_blackwell(
     # Allocate SMEM buffers for epilogue TMA store (at least 2 for multi-buffering).
     # workspace_desc is fp32 for split-K and aliases c_desc otherwise.
     NUM_EPILOGUE_SMEM_BUFFERS: tl.constexpr = NUM_MMA_GROUPS if NUM_MMA_GROUPS > 2 else 2
-    slice_size: tl.constexpr = BLOCK_N0 // EPILOGUE_SUBTILE
     c_smem_buffers = tlx.local_alloc(
         (BLOCK_M_SPLIT, slice_size),
         tlx.dtype_of(workspace_desc),
@@ -1113,29 +1141,6 @@ def matmul_kernel_tma_ws_blackwell(
         cluster_cta_rank = tlx.cluster_cta_rank()
     else:
         cluster_cta_rank = 0
-
-    # allocate barriers - each subtile needs its own barriers
-    # NUM_SMEM_BUFFERS barriers per subtile for synchronization
-    A_smem_full_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1)
-    A_smem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1)
-    if NUM_MMA_GROUPS == 1:
-        # A and B TMA loads share the same transaction-byte-counted barrier.
-        B_smem_full_bars = A_smem_full_bars
-    else:
-        B_smem_full_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
-    tmem_full_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1)
-    # NUM_TMEM_BUFFERS (overlaps MMA and epilogue)
-    # One arrival per stored slice, the N tail pieces' slices included.
-    tmem_empty_arrivals: tl.constexpr = BLOCK_SIZE_N // slice_size * NUM_CTAS
-    if USE_WARP_BARRIER:
-        tmem_empty_bars = tlx.alloc_warp_barrier(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS, num_warps=4,
-                                                 num_arrivals=tmem_empty_arrivals)
-    else:
-        tmem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS,
-                                             arrive_count=tmem_empty_arrivals)
-
-    # Each of the three async tasks consumes CLC responses on both cluster CTAs.
-    clc_context = tlx.clc_create_context(num_consumers=3 * NUM_CTAS, num_stages=NUM_CLC_STAGES)
 
     with tlx.async_tasks(
             exclusive=True,
@@ -1468,13 +1473,15 @@ def _tuned_for_fixed(space, shape, fixed):
 _tuned.cache_clear = _tuned_for_fixed.cache_clear
 
 
-def mm(a, b, *, out=None, space="full", invariance=None):
+def mm(a, b, *, out=None, space="full", invariance=None, b_static=False):
     """Matrix multiply ``a @ b`` on Blackwell.
 
     `space` selects the search space -- "full" for perf, "heuristic" (one
     config) for correctness, "smoke" for path coverage. Not exposed on
     `tlx.ops.mm`. `invariance` is the resolved spec; a fixed schedule prunes
     split-K candidates from every space so the K reduction stays uniform.
+    `b_static` promises that no kernel that may still be running writes B; the
+    one-row GEMV then starts reading B before waiting on earlier kernels.
     """
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     M, K = a.shape
@@ -1485,6 +1492,14 @@ def mm(a, b, *, out=None, space="full", invariance=None):
         c = out
     else:
         c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+
+    # Decode-sized M only streams B, which the M-tiled schedule below cannot do at
+    # the HBM rate. Its split-K order varies with the shape, so it is not used
+    # under a fixed-schedule invariance spec.
+    if gemm_fixed_split_k(invariance) is None and _gemv.eligible(a, b, out):
+        return _gemv.mm(a, b, c, b_static=b_static)
+    if gemm_fixed_split_k(invariance) is None and _skinny.eligible(a, b, out):
+        return _skinny.mm(a, b, c, space=space)
 
     # A column-major operand's .T is a row-major view of the same memory, so the
     # descriptor flips and the MMA operand is recovered by a metadata-only

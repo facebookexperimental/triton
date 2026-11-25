@@ -6,7 +6,7 @@ import pytest
 import torch
 import triton
 from triton._internal_testing import is_hip_cdna4
-from triton.tlx.ops import InvalidInput, paged_attention_prefill
+from triton.tlx.ops import InvalidInput, UnsupportedBackward, paged_attention_prefill
 from triton.tlx.ops.kernels.paged_attn import gfx950_prefill as pf
 
 pytestmark = pytest.mark.skipif(not is_hip_cdna4(), reason="gfx950 paged prefill requires CDNA4")
@@ -239,3 +239,18 @@ def test_rejects_fp8_cache_spanning_int32():
     fits = cache(65536, 32768)
     with pytest.raises(InvalidInput, match="all tensors on one device"):
         _prefill(fp8, 8, k=fits, v=fits, k_descale=k_descale, v_descale=v_descale)
+
+
+def test_rejects_grad_tracked_out():
+    inputs = _inputs([130], [900], 64, 8, 16)
+    with pytest.raises(UnsupportedBackward):
+        _prefill(inputs, 130, out=torch.empty_like(inputs[0]).requires_grad_())
+
+
+@pytest.mark.parametrize("name", ["k_descale", "v_descale"])
+def test_rejects_grad_tracked_descales(name):
+    inputs = _inputs([130], [900], 64, 8, 16, kv_dtype=torch.float8_e4m3fn, k_scale=0.05, v_scale=0.2)
+    descales = dict(zip(("k_descale", "v_descale"), _descales(0.05, 0.2)))
+    descales[name].requires_grad_()
+    with pytest.raises(UnsupportedBackward):
+        _prefill(inputs, 130, **descales)

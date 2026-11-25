@@ -262,6 +262,12 @@ def barrier_arrive(
     """
     Perform the arrive operation on an mbarrier.
 
+    By default the arrive is task-collective on NVIDIA: one thread of the calling task arrives with
+    `arrive_count`, and the compiler orders every earlier shared- and tensor-memory access of the task's threads
+    before it (inserting a task-wide barrier and `tcgen05.wait` where needed). Code that reads TMEM or SMEM and then
+    releases the buffer with `barrier_arrive` needs no barrier of its own. Global-memory writes are not ordered for
+    other CTAs; use a GPU-scope fence or release atomic for those.
+
     Args:
         bar: The mbarrier to signal. Can be a local mbarrier or a remote view of mbarrier.
         arrive_count: The number of arrivals to signal: from the task, from each thread of a warp
