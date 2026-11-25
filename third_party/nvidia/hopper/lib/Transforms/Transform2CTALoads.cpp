@@ -24,6 +24,7 @@
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Pass/Pass.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
+#include "nvidia/hopper/lib/Transforms/WarpSpecialization/WarpSpecializationPipeline.h"
 #include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -214,6 +215,9 @@ struct Transform2CTALoads
   // B operands (local_alloc / memdesc_trans results) already split by an
   // earlier MMA that shares them.
   DenseSet<Value> splitBOperands;
+  // Half-width B allocs written from registers. Each CTA writes its own half,
+  // so the MMAs reading them need a cluster-scoped fence.
+  DenseSet<Operation *> registerSplitBAllocs;
 
   void runOnOperation() override {
     ModuleOp moduleOp = getOperation();
@@ -269,6 +273,25 @@ struct Transform2CTALoads
                     "with BLOCK_N / 2 >= 16)");
       signalPassFailure();
       return;
+    }
+
+    for (auto mma : twoCTAMMAOps) {
+      Value b = mma.getB();
+      while (Operation *def = b.getDefiningOp()) {
+        if (!def->hasTrait<OpTrait::MemDescViewTrait>())
+          break;
+        b = def->getOperand(0);
+      }
+      if (registerSplitBAllocs.contains(b.getDefiningOp()))
+        mma->setAttr(ttng::AttrTwoCTARegisterBName,
+                     UnitAttr::get(mma->getContext()));
+      // The leader also reads the peer CTA's A half. A descriptor-loaded A
+      // that is also read in registers (or that TMA cannot write in the MMA's
+      // layout) keeps a register to shared-memory copy, since the bridge fold
+      // is 1-CTA only, so each CTA writes its A half with generic stores.
+      if (isRegisterStagedMMAOperand(mma.getA()))
+        mma->setAttr(ttng::AttrTwoCTARegisterAName,
+                     UnitAttr::get(mma->getContext()));
     }
 
     // Host-side descriptor arguments are retyped to the half-width block in
@@ -640,6 +663,9 @@ struct Transform2CTALoads
     builder.setInsertionPoint(localAlloc);
     auto newLocalAlloc = ttg::LocalAllocOp::create(builder, localAlloc.getLoc(),
                                                    newMemDescType, allocSrc);
+    // A register transpose makes the alloc a generic write.
+    if (trans)
+      registerSplitBAllocs.insert(newLocalAlloc);
 
     // --- Step 5: Replace uses and clean up ---
     if (memDescTrans) {
