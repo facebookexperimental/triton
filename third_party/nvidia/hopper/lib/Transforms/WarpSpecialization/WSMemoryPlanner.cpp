@@ -156,6 +156,28 @@ static bool isInnermostLoop(scf::ForOp forOp) {
   return true;
 }
 
+/// Return the innermost loop that encloses `op`, or nullptr if there is none.
+/// This is the nearest enclosing scf.for when it is innermost (the original
+/// rule). In addition, a dynamic persistent (CLC) GEMM with a single K tile
+/// has no inner scf.for: its MMA operands live directly in the after-region of
+/// the persistent scf.while. Such a while, with no loop nested anywhere in its
+/// after-region, is the loop to multi-buffer across. Everything the original
+/// rule accepted is still accepted.
+static Operation *getInnermostEnclosingLoop(Operation *op) {
+  if (auto whileOp = op->getParentOfType<scf::WhileOp>();
+      whileOp && whileOp.getAfter().isAncestor(op->getParentRegion())) {
+    bool hasNestedLoop = false;
+    whileOp.getAfter().walk([&](Operation *nested) {
+      if (isa<scf::ForOp, scf::WhileOp>(nested))
+        hasNestedLoop = true;
+    });
+    if (!hasNestedLoop)
+      return whileOp;
+  }
+  auto forOp = op->getParentOfType<scf::ForOp>();
+  return forOp && isInnermostLoop(forOp) ? forOp.getOperation() : nullptr;
+}
+
 /// Given a value, walk backwards through the SSA def-use chain, passing
 /// through "transparent" ops that don't generate new data (split, reshape,
 /// trans, type casts, layout conversions), and return the root tmem_load
@@ -490,10 +512,7 @@ private:
       if (user->getBlock() != first->getBlock())
         return false;
     }
-    auto parentLoop = first->getParentOfType<scf::ForOp>();
-    if (!parentLoop)
-      return false;
-    return isInnermostLoop(parentLoop);
+    return getInnermostEnclosingLoop(first) != nullptr;
   }
 
   void getExplicitValueSize(Operation *op) {
@@ -1215,13 +1234,8 @@ static bool isInnermostSmemChannel(Operation *alloc,
       return false;
     }
   }
-  auto parentLoop = first->getParentOfType<scf::ForOp>();
-  if (!parentLoop) {
-    LDBG("isInnermostSmemChannel: user not in a loop");
-    return false;
-  }
-  if (!isInnermostLoop(parentLoop)) {
-    LDBG("isInnermostSmemChannel: user not in innermost loop");
+  if (!getInnermostEnclosingLoop(first)) {
+    LDBG("isInnermostSmemChannel: user not in an innermost loop");
     return false;
   }
 
