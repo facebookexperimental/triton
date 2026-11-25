@@ -231,6 +231,13 @@ def close_older_drafts(repo, kind, branch, replacement):
         print(f"Closed superseded candidate #{pull['number']}", flush=True)
 
 
+def describe_candidate(repo, kind, old, receipt, assets, base):
+    sha, build = receipt['source']['llvm_sha'], receipt['source']['build_number']
+    compare = github_json(f"repos/{FORK}/compare/{old['llvm_hash']}...{sha}")
+    return candidate_text(kind, BRANCHES[kind], old, receipt['source'],
+                          assets[ready_name(kind, sha, build)]['browser_download_url'], base, compare)
+
+
 def ensure_candidate_pr(repo, candidate, platforms):
     """Create the candidate's draft PR; return {'url', 'old'}, or None when there is nothing to hand off."""
     validated = validated_candidate(repo, candidate, platforms)
@@ -260,8 +267,7 @@ def ensure_candidate_pr(repo, candidate, platforms):
                release_base_url=f'https://github.com/{repo}/releases/download/meta-llvm',
                sha256sum=receipt['sha256sum'])
     new.pop('based_on_oai_llvm_hash', None)
-    title, message, body = candidate_text(kind, old, receipt['source'],
-                                          assets[ready_name(kind, sha, build)]['browser_download_url'], base)
+    title, message, body = describe_candidate(repo, kind, old, receipt, assets, base)
     existing = github_json(f'repos/{repo}/git/ref/heads/{branch}', missing_ok=True)
     if existing is None:
         parent = github_json(f'repos/{repo}/git/commits/{base}')

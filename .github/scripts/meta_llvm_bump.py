@@ -245,61 +245,47 @@ def readiness_text(kind, sha, tree, build, branch, source_url, ready_url, marker
     ])
 
 
-def candidate_text(kind, old, source, ready_url, base_sha):
+def llvm_change_lines(fork, old_sha, new_sha, compare):
+    """The new commits when the branch keeps its LLVM base, else the Meta changes carried onto the new base."""
+    commits = [(c['sha'], c['commit']['message'].split('\n')[0].strip()) for c in compare['commits']]
+    link = f'[LLVM changes since the current pin]({compare_url(fork, old_sha, new_sha)})'
+    if compare['status'] == 'ahead':
+        head = f'{link}, on the same LLVM base:'
+    else:
+        head = f'{link} move to a new LLVM base. Meta changes on the new branch:'
+        commits = [(sha, title)
+                   for sha, title in commits
+                   if title.lower().startswith('[triton') and 'Vendor LLVM' not in title and 'Prune' not in title]
+    return [head, '', *[_fork_change(fork, sha, title) for sha, title in commits]]
+
+
+def candidate_text(kind, branch, old, source, ready_url, base_sha, compare):
     """Draft-candidate text in the updater's Summary/Test Plan format."""
     sha, build = source['llvm_sha'], source['build_number']
+    fork = 'facebookexperimental/llvm-project'
     title = f'[Meta LLVM] {kind} bundle candidate: {old["llvm_hash"][:8]} to {sha[:8]}'
-    sdk = 'AMD codegen' if kind == 'amd' else 'core'
-    problem = (f'Triton at {base_sha[:12]} uses the {sdk} LLVM SDK at {old["llvm_hash"][:12]}. A validated bundle from '
-               f'LLVM {sha[:12]} is available but has not been tested with Triton.')
-    solution = (f'Update the {sdk} LLVM SDK pin to {sha[:12]}, packaging revision {build}, with its published archive '
-                'checksums. The other LLVM pin and the Triton sources are unchanged.')
-    test = ('All required SDKs passed relocation, compile, link and run checks. These checks do not build or test '
-            'Triton.')
+    sdk, other = ('AMD codegen', 'core LLVM') if kind == 'amd' else ('core', 'AMD codegen')
+    problem = (f'Triton uses the {sdk} LLVM SDK at `{old["llvm_hash"][:8]}`. The exported `{branch}` branch has '
+               f'moved to `{sha[:8]}`, which Triton has not been tested with.')
+    solution = (f'Update the {sdk} LLVM SDK pin to `{sha[:8]}`, packaging revision {build}, with its published archive '
+                f'checksums. The {other} pin and the Triton sources are unchanged.')
+    test = 'All required SDKs passed relocation, compile, link and run checks. These checks do not build or test Triton.'
+    checks = [('Triton GPU tests', 'Starts after this PR is created; results appear in the PR checks'),
+              ('TLX.ops perf smoke', 'Starts after this PR is created; results are posted as a PR comment')]
     marker = f'<!-- llvm-candidate beta/{kind}/{sha}/{build}/{base_sha} -->'
     body = '\n'.join([
-        '# Summary:',
-        '',
-        '**Problem**',
-        '',
-        problem,
-        '',
-        '**Solution**',
-        '',
-        solution,
-        '',
-        '# Test Plan:',
-        '',
-        test,
-        '',
-        f'SDK validation provenance: [completion record]({ready_url}).',
-        '',
-        *_job_block([('Triton GPU tests', 'Starts after this PR is created; results appear in the PR checks'),
-                     ('TLX.ops perf smoke', 'Starts after this PR is created; results are posted as a PR comment')]),
-        '',
-        'Keep this PR in draft until the Triton GPU tests and perf smoke results are reviewed. A newer bundle '
-        'closes it while it is a draft; mark it ready for review to keep it.',
-        '',
-        'Source comparison: ' + compare_url('facebookexperimental/llvm-project', old['llvm_hash'], sha) + '.',
-        '',
-        marker,
+        '# Summary:', '', '**Problem**', '', problem, '', '**Solution**', '', solution, '',
+        *llvm_change_lines(fork, old['llvm_hash'], sha, compare), '', '# Test Plan:', '',
+        f'All required SDKs passed relocation, compile, link and run checks ([SDK validation record]({ready_url})). '
+        'These checks do not build or test Triton.', '', *_job_block(checks), '',
+        'Keep this PR in draft until the Triton GPU tests and perf smoke results are reviewed. A newer bundle closes it '
+        'while it is a draft; mark it ready for review to keep it.', '', marker
     ])
     commit = '\n'.join([
-        title,
-        '',
-        'Summary:',
-        '**Problem**',
-        '',
-        textwrap.fill(problem, 72),
-        '',
-        '**Solution**',
-        '',
-        textwrap.fill(solution, 72),
-        '',
-        'Test Plan:',
-        '',
-        textwrap.fill(test, 72),
-        'Triton GPU tests and TLX.ops perf smoke run on the draft PR.',
+        title, '', 'Summary:', '**Problem**', '',
+        textwrap.fill(problem, 72), '', '**Solution**', '',
+        textwrap.fill(solution, 72), '', 'Test Plan:', '',
+        textwrap.fill(test, 72), 'Triton GPU tests and TLX.ops perf smoke run on the draft PR.'
     ])
     return title, commit, body
 
