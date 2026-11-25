@@ -100,13 +100,13 @@ read `allocation.reuseTarget` directly — it sees the staging alloc as
 a request for its own region. Realizing the reuse therefore requires
 an extra step in `doCodePartition` that rewrites the staging alloc
 into a reinterpret view of the host alloc (see
-[CodePartition: Realizing `allocation.reuseTarget`](#code-partition-realizing-allocationreuetarget)
+[CodePartition: Realizing `allocation.reuseTarget`](#code-partition-realizing-allocationreusetarget)
 below).
 
 ### Phase 3.7: Epilogue Group Copy Increase
 
-Each fused P2_Other group (including TMA staging groups) is treated as
-an epilogue group. `increaseFusedEpilogueCopies` iteratively bumps
+Each fused group in the `P2_InnerTMAStaging`, `P3_OuterTMAStaging`, or
+`P4_Other` tier is treated as an epilogue group, in that tier order. `increaseFusedEpilogueCopies` iteratively bumps
 `numCopies` from the current value up to `numBuffers`, accepting each
 bump as long as `computeTotalSmem ≤ smemBudget`.
 
@@ -140,6 +140,18 @@ increase look free even when reuse realization must reject the alias and
 materialize a separate allocation, which can make the final physical layout
 exceed the planner budget.
 
+#### Opt-in: operand ring before outer staging
+
+The warp-specialized loop (or an enclosing loop) can set `tt.smem_operand_ring_first` (`tl.range(...,
+smem_operand_ring_first=True)`). The planner then also builds a plan in which
+outer-loop staging (P4/P5 tiers) only grows from the budget left once the
+TMA-fed MMA operands reach `min(num_stages, K-loop trip count)` copies, and
+keeps it if it deepens the shallowest MMA operand ring. This helps when large
+staging slots (for example a fused fp32 cast) would leave the operand ring at
+1-2 copies; small bf16 slots usually overlap their stores cheaply and are
+better left at the default. Inner-loop staging keeps first claim. Blackwell
+(MMAv5) only.
+
 #### `K | S` cap for same-partition (wait_group-drained) staging
 
 A staging group holds **S** subtiles (`S = indices.size()`, the fused
@@ -161,27 +173,84 @@ are *correct* — depends on the channel's producer/consumer topology:
 Phase 3.7 therefore detects same-partition staging via
 `getAsyncTaskIds(ch->getSrcOp()) == getAsyncTaskIds(ch->getDstOp())` and, for
 those groups, only accepts a `tryCopies` that divides S (others are skipped).
-This is a **defensive backstop**: in all shipped configs `num_stages = 2` and
-`S ∈ {2,4}`, so `K | S` already holds and the cap is a no-op — it exists to
-keep a future `num_stages`/subtile combination from silently violating the
-rotation invariant. The cross-stage floor (`WSBuffer::minCopies`) is a hard
+The check matters whenever the bump target exceeds a divisor of S: for
+example, with `num_stages = 3` and `S = 4`, depth 3 is skipped and the group
+stays at its largest accepted divisor. The cross-stage floor (`WSBuffer::minCopies`) is a hard
 correctness floor and is never reduced; if it itself violates `K | S` for a
 wait_group ring the pass emits an `LDBG` warning rather than dropping below it.
 
 `computeTotalSmem` accounts for the active `buffer.id` groups using
 `max(size) × copies` per ID. For TMA store staging groups this matches the
-planner's reuse model, but the downstream physical allocation still leaves
-each staging alloc as a separate op.
+physical result: see [Combined SMEM Cost](#combined-smem-cost).
+
+#### `TRITON_WS_STAGING_COPIES`: capping the Phase 3.7 target
+
+**Read by**: `getStagingCopiesCap` in `WSMemoryPlanner.cpp`, applied once at
+the top of `increaseFusedEpilogueCopies`.
+
+`TRITON_WS_STAGING_COPIES=K` lowers the copy target that Phase 3.7 bumps
+groups toward. Without it, the target is `numBuffers`, which is the
+`nvgpu-warp-specialization` pass option `num-stages`, i.e. the kernel's
+`num_stages` compile option. With it, the target is `min(num_stages, K)`.
+
+| Property | Behavior |
+|---|---|
+| How it is set | Process environment variable. There is no per-kernel or per-config equivalent; it applies to every kernel compiled while it is set. |
+| Legal values | A positive integer. The value is parsed with `std::atoi`, so unset, empty, `0`, negative, or non-numeric values all mean "no cap". |
+| Default | Unset (no cap). |
+| Cache key | Listed in `CACHE_INVALIDATING_ENV_VARS` (`include/triton/Tools/Sys/GetEnv.h`), so changing it produces a new compile. |
+| Resource | SMEM only. One copy of a group costs the group's largest member (`computeTotalSmem`); for a subtiled epilogue that is one subtile's staging buffer. |
+
+What the cap applies to:
+
+- **Every Phase 3.7 tier**, not only TMA store staging: `P2_InnerTMAStaging`,
+  `P3_OuterTMAStaging`, and `P4_Other` groups (for example epilogue-load
+  buffers merged by Phase 3.5).
+- **TMA-reduce staging by default.** The reduce target
+  (`tmaStaging == 2`) starts from the capped value. It is replaced by
+  `TRITON_WS_TMA_REDUCE_STAGING_COPIES` only when that variable is also set.
+
+The walk's existing rules (`K | S`, budget, reuse-host capacity) still apply,
+so the applied depth can be below `K`.
+
+The cap only limits bumps. It never lowers a group below its current copy
+count or its cross-stage floor (`WSBuffer::minCopies`): if the floor is above
+`K`, the floor is kept. SMEM that the cap leaves unclaimed stays in the budget
+for the Phase 4 `P0`/`P1` operand copy increase, which runs after Phase 3.7.
+Downstream, the resulting `buffer.copy` becomes `can_rotate_by_buffer_count`
+in `doAnnotateTMAStoreWaits` (see [Step 1](#step-1-doannotatetmastorewaits)),
+so fewer copies means each TMA store wait is placed after fewer subsequent
+stores.
+
+Cases where the variable has no effect:
+
+- **2-CTA modules** (`ttng.two-ctas`): ordinary TMA store staging
+  (`tmaStaging == 1`) is held at one copy before the cap is consulted.
+- **Groups with fewer than two members**, for example a single unsubtiled
+  store. Phase 3.7 skips these entirely.
+- **`TRITON_WS_SMEM_PLAN_SEARCH`**, when `allocateSmemBuffersViaSearch` does not
+  fall back to the heuristic. That path pins staging blocks to their floor and
+  never calls `increaseFusedEpilogueCopies`. It falls back, and the cap applies
+  again, when any staging buffer has more than one TMA store user.
+- **`smem_alloc_algo = 0`**: the original `MemoryPlanner` does not read the
+  variable.
+
+Nothing reports the cap's effect.
 
 ### Combined SMEM Cost
 
-If the planner needs an exact hardware-SMEM accounting pass for TMA store
-staging, the cost needs per-entry accounting because the allocs are NOT merged
-into one physical alloc downstream:
+Staging allocs that share a `buffer.id` are merged into one physical
+allocation downstream, so the cost of a fused staging group is
 
 ```
-tmaStoreSmem = numEntries * size * copies
+tmaStoreSmem = size * copies
 ```
+
+Allocs sharing a `buffer.id` collapse onto one representative
+(`replaceBufferReuse`; [Reuse Groups](ReuseGroups.md) case A3), unless their
+types differ. A mismatched member stays separate and `computeTotalSmem`
+undercounts it. Subtiles of one descriptor store have identical types, so the
+usual epilogue staging group is merged.
 
 ### Phase 6: Hoist Before Outermost Loop
 
@@ -302,6 +371,18 @@ pipeliner. Barrier-free wraparound token waits are therefore materialized as
 queue-wide `wait_group(K-1)` operations before the next iteration's staging
 writers, followed by one `wait_group(0)` drain after the loop. Ordinary
 software-pipelined loops retain their loop-carried token schedule.
+
+When a planned-count wait (K > 1) moves to a later iteration of an ordinary
+pipelined loop, it sits a stage after the staging writer, so the pipeliner's
+prologue has no copy of it: the first iterations of the next run of the loop
+(for example the next persistent tile's epilogue) would write the staging slots
+while the previous run's last K-1 stores are still in flight (the drain copies
+keep the rotated count). For barrier- and token-free waits the pass therefore
+also gives the target writer a queue-wide `wait_group(min(K-1, n))` in the
+writer's own stage, where n is the number of TMA store-like ops issued between
+the store and that writer. In steady state it waits for the same store as the
+token wait. One `wait_group(0)` after the outermost enclosing loop drains the
+last run.
 
 The merge attribute can be on an enclosing persistent loop rather than the
 loop containing the dQ stores. The pass therefore searches the loop ancestry:

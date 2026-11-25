@@ -12,15 +12,24 @@ One shot command with extreme simplicity
 python python/test/tlx_benchmark/bench_{op}.py
 
 `{op}` is one of `norm`, `mm`, `torchtlx_mm`, `torchtlx_addmm`, `torchtlx_bmm`,
-`flash_attn`, `flash_attn_mxfp8`, `flash_attn_varlen`, `hstu_attn`, `hstu_cross_attn`, `kda`,
-`kda_prefill`, `kda_decode`, `mla_window_attn`, `swiglu_ffn`, `rmsnorm_cat`, `moe`, `moe_routing`, `router_gemm`,
-or one of the fused operators below.
+`flash_attn`, `flash_attn_mxfp8`, `flash_attn_varlen`, `window_attn_varlen`, `hstu_attn`, `hstu_cross_attn`,
+`kda`, `kda_prefill`, `kda_decode`, `mla_window_attn`, `swiglu_ffn`, `rmsnorm_cat`, `moe`, `moe_routing`, `moe_finalize`, `router_gemm`,
+or one of the fused operators or collectives below.
 
 Fused operators (`tlx/ops/kernels/fused/`) run steps that would otherwise be separate kernels in one launch:
 `addmm_mul_add` and `linear_rowscale` fuse an elementwise epilogue into a GEMM, `norm_residual_norm`
 fuses the post-norm, gated residual add and pre-norm of a residual-stream boundary,
-`qk_norm_rope_kv_cache` fuses the q/k head norm, RoPE, FP8 quantization and paged KV cache write, and
-`rmsnorm_gate` fuses a per-head RMSNorm with a sigmoid output gate.
+`qk_norm_rope_kv_cache` fuses the q/k head norm, RoPE, FP8 quantization and paged KV cache write,
+`rmsnorm_gate` fuses a per-head RMSNorm with a sigmoid output gate, `moe_router_topk_align` fuses the router
+GEMM, sigmoid top-k and expert-aligned slot sort of an MoE layer, and `moe_mxfp4_sort_quant` fuses the expert-aligned
+slot sort, MXFP4 activation quantization and scale sort in front of an A4W4 MoE.
+
+Collectives (`tlx/ops/kernels/collectives/`) are multi-GPU ops. `collectives/all_reduce/` holds `all_reduce`, and
+`collectives/fused/` holds the collectives fused with the op that consumes their result: `all_reduce_norm_residual_norm`
+feeds the all-reduced branch into the `norm_residual_norm` boundary. The single-process harness cannot drive a
+collective, so their benchmarks fork one rank per GPU when run directly:
+`python python/test/tlx_benchmark/bench_all_reduce.py [--suite gfx950_1]` times `all_reduce` against RCCL, and
+`bench_all_reduce_norm_residual_norm.py` times the fused op against `all_reduce` followed by `norm_residual_norm`.
 
 ```
 options:
@@ -57,7 +66,7 @@ options:
 | op | reference | gate | default space |
 |----|-----------|------|---------------|
 | `mm` | `torch.matmul` | speedup >= 0.9x | heuristic |
-| `mm_mxfp8` | `torch.mm` on pre-dequantized BF16 inputs | reports ratio only; non-equivalent reference | heuristic |
+| `mm_mxfp` | `torch.mm` on pre-dequantized BF16 inputs | reports ratio only; non-equivalent reference | heuristic |
 | `addmm` | `torch.addmm` | speedup >= 0.9x | heuristic |
 | `mm_torchtlx` | `torch.compile` with TLX off | speedup >= 0.9x | heuristic |
 | `addmm_torchtlx` | `torch.compile` with TLX off | speedup >= 0.9x | heuristic |
@@ -65,6 +74,7 @@ options:
 | `flash_attn` | `F.scaled_dot_product_attention` | speedup >= 0.9x | full |
 | `flash_attn_mxfp8` | `F.scaled_dot_product_attention` | speedup >= 0.9x | full |
 | `flash_attn_varlen` | `F.scaled_dot_product_attention` on the padded batch, masked | speedup >= 0.9x | heuristic |
+| `window_attn_varlen` | `torch.ops.aten._flash_attention_forward` (FlashAttention-2) with the same window | speedup >= 0.9x | heuristic |
 | `hstu_attn` | `_reference.py::triton_hstu_mha` (production Triton) | speedup >= 0.9x | full |
 | `hstu_cross_attn` | `tutorials/hstu_cross_attn/triton_bw_cross_attention.py` (Triton) | speedup >= 0.9x | curated |
 | `kda` | none | absolute floor, currently unset -> reports only | full |
@@ -76,6 +86,7 @@ options:
 | `moe` | none (FlyDSL's Muse MoE ships with aiter) | absolute floor, currently unset -> reports only | heuristic |
 | `moe_routing` | `torch.compile` of the eager routing | speedup >= 0.9x | heuristic |
 | `router_gemm` | `F.linear` on the fp32 upcast (hipBLASLt fp32) | speedup >= 0.9x | heuristic |
+| `moe_finalize` | unfused Triton finalize; backward: `torch.compile` of the eager finalize | speedup >= 0.9x | heuristic |
 
 ### Fused operators
 
@@ -84,8 +95,17 @@ options:
 | `addmm_mul_add` | `torch.addmm` + `torch.addcmul` | speedup >= 0.9x | heuristic |
 | `linear_rowscale` | `torch.compile` of the eager expression | speedup >= 0.9x | heuristic |
 | `norm_residual_norm` | `torch.compile` of the unfused module sequence | speedup >= 0.9x | heuristic |
+| `moe_router_topk_align` | `router_gemm` + `moe_routing` + the `moe` slot sort (separate launches) | speedup >= 0.9x | heuristic |
+| `moe_mxfp4_sort_quant` | `torch.compile` of the slot sort, MXFP4 row quantization and scale sort | speedup >= 0.9x | heuristic |
 | `qk_norm_rope_kv_cache` | `torch.compile` of the eager norm, RoPE and cache scatter | speedup >= 0.9x | heuristic |
 | `rmsnorm_gate` | `torch.compile` of the eager expression | speedup >= 0.9x | heuristic |
+
+### Collectives (`kernels/collectives/`)
+
+| op | reference | gate | default space |
+|----|-----------|------|---------------|
+| `all_reduce` | RCCL all-reduce (multi-rank main) | reports only | heuristic |
+| `all_reduce_norm_residual_norm` | `all_reduce` + `norm_residual_norm` (multi-rank main) | reports only | heuristic |
 
 The direct `mm` provider has a `heuristic_config`, so its default is a single
 analytically chosen config. The TorchTLX providers use Inductor's template
@@ -118,6 +138,10 @@ config, so `--space` does not change it.
 lowers to cuBLAS `addmm` and one fused kernel that applies the row scale. One
 fixed launch config.
 
+`window_attn_varlen` races PyTorch's FlashAttention-2 varlen forward with the
+same `window_size_left`/`window_size_right`, which computes the same rows and
+keys. The op has one fixed launch config.
+
 Ops with a backward (`flash_attn`, `hstu_attn`, `kda`) produce two cases per
 shape. The backward is a different kernel at 2.5x the FLOPs, so folding it into
 the forward's number would hide it. Both run by default and are reported as two
@@ -140,6 +164,21 @@ different amounts of work do not belong in one TFLOP/s column. `--fwd-only` /
    the autotune winner. An op launching several autotuned kernels gets one entry
    per kernel, `name: config` separated by `|`; a kernel that is not autotuned
    reports `-`. Recorded by the harness, so every op has the column.
+
+The raw artifact and published summary also retain an `autotune` list per case.
+Each entry identifies the kernel, preparation or warmup phase, runtime cache key,
+selected compiler options and selection type: `tuned`, `cached`, `fixed` or
+`unobserved`. The config includes launch options such as CTA count and register
+caps, not just the compact best-config label. `ir_override` records only whether
+an override is present, never its private file path.
+`selected_by_case` names the case whose tuning was observed; it is null for an
+unknown origin, such as an existing disk cache or tuning in the cold-compile
+pass outside this recorder. Candidate `timings_ms` are copied only from a genuine
+tuning event. Cached cases never repeat an earlier case's timings as new
+measurements. Non-finite candidate values are null, not zero. This recorder is
+removed before correctness checks and performance timing. A recording failure
+adds an `unobserved` entry with a `recording_error` type, without discarding the
+performance measurement. Older artifacts have no decision records.
 
 ### Common vs op-specific metrics
 
@@ -169,6 +208,9 @@ pip: speedup < 0.9, or TFLOP/s under an op's absolute floor when it has no
      no heuristic raise it, see above)
 noisy: CV% > 3%
 ok: everything else
+
+Only `error` fails the run. `pip` and `noisy` are reported and published; the
+nightly regression detector tracks throughput over time.
 
 A benchmark may set `REFERENCE_GATE = False` when its reference validates the
 same numerical result but does not use an equivalent storage or instruction

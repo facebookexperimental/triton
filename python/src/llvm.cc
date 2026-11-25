@@ -7,7 +7,6 @@
 #include "triton/Tools/Sys/GetEnv.h"
 #include "triton/Version.h"
 #include "llvm/ADT/ScopeExit.h"
-#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
@@ -23,6 +22,7 @@
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/OptBisect.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/IRReader/IRReader.h"
@@ -76,60 +76,6 @@ void enableFPContraction(llvm::Module &module) {
           instruction.getOpcode() == llvm::Instruction::FSub ||
           instruction.getOpcode() == llvm::Instruction::FMul)
         instruction.setHasAllowContract(true);
-}
-
-// The independently pinned AMD code generator predates disjoint alias scopes.
-// Keep explicit alias/noalias relationships, but drop the additional disjoint
-// guarantee when serializing for that backend. Do this after optimization so
-// Triton's LLVM always sees its own metadata format.
-void downgradeAliasScopeDomains(llvm::Module &module) {
-  SmallPtrSet<MDNode *, 16> seen;
-  SmallVector<TrackingMDNodeRef> scopes;
-  auto collect = [&](MDNode *list) {
-    if (list)
-      for (const MDOperand &operand : list->operands()) {
-        auto *scope = dyn_cast<MDNode>(operand.get());
-        if (scope && seen.insert(scope).second)
-          scopes.emplace_back(scope);
-      }
-  };
-  for (Function &function : module)
-    for (Instruction &instruction : instructions(function)) {
-      collect(instruction.getMetadata(LLVMContext::MD_alias_scope));
-      collect(instruction.getMetadata(LLVMContext::MD_noalias));
-      if (auto *decl = dyn_cast<NoAliasScopeDeclInst>(&instruction))
-        collect(decl->getScopeList());
-    }
-
-  DenseMap<MDNode *, MDNode *> domains;
-  for (const TrackingMDNodeRef &scope : scopes) {
-    if (scope->getNumOperands() < 2)
-      continue;
-    auto *domain = dyn_cast<MDNode>(scope->getOperand(1));
-    if (!domain || domain->getNumOperands() == 0)
-      continue;
-    if (domains.contains(domain))
-      continue;
-    SmallVector<Metadata *> operands{domain->getOperand(0)};
-    if (domain->getNumOperands() == 3)
-      operands.push_back(domain->getOperand(2));
-    bool selfReference = operands[0] == domain;
-    if (selfReference)
-      operands[0] = nullptr;
-    // Do not merge domains that only differ in the removed flag.
-    MDNode *replacement = MDNode::getDistinct(module.getContext(), operands);
-    if (selfReference)
-      replacement->replaceOperandWith(0, replacement);
-    domains[domain] = replacement;
-  }
-  for (const TrackingMDNodeRef &scope : scopes) {
-    if (scope->getNumOperands() < 2)
-      continue;
-    auto *domain = dyn_cast<MDNode>(scope->getOperand(1));
-    auto replacement = domain ? domains.find(domain) : domains.end();
-    if (replacement != domains.end())
-      scope->replaceOperandWith(1, replacement->second);
-  }
 }
 
 struct ExpandMaskedDivRemPass : RequiredPassInfoMixin<ExpandMaskedDivRemPass> {
@@ -255,6 +201,8 @@ class ScopedLSRPassGate : public llvm::OptPassGate {
 public:
   ScopedLSRPassGate(llvm::LLVMContext &context, bool disableLSR)
       : context(context), previousGate(context.getOptPassGate()) {
+    // The gate belongs to this compilation's context, not LLVM's global
+    // command-line state, so concurrent compilations can choose independently.
     if (disableLSR)
       context.setOptPassGate(*this);
   }
@@ -623,8 +571,7 @@ void init_triton_llvm(py::module_ &m) {
 
   m.def(
       "to_bitcode",
-      [](const std::string &llvmIR, bool enable_fp_fusion,
-         bool legacy_alias_scopes) {
+      [](const std::string &llvmIR, bool enable_fp_fusion) {
         std::string bitcode;
         {
           py::gil_scoped_release release;
@@ -640,15 +587,12 @@ void init_triton_llvm(py::module_ &m) {
                 " at line " + std::to_string(error.getLineNo()));
           if (enable_fp_fusion)
             enableFPContraction(*module);
-          if (legacy_alias_scopes)
-            downgradeAliasScopeDomains(*module);
           llvm::raw_string_ostream stream(bitcode);
           llvm::WriteBitcodeToFile(*module, stream);
         }
         return py::bytes(bitcode.data(), bitcode.size());
       },
-      py::arg("llvm_ir"), py::arg("enable_fp_fusion") = false,
-      py::arg("legacy_alias_scopes") = false);
+      py::arg("llvm_ir"), py::arg("enable_fp_fusion") = false);
 
   // Add Triton and LLVM versions to the module.
   m.def("add_version_info", [](llvm::Module *mod) {
@@ -703,7 +647,7 @@ void init_triton_llvm(py::module_ &m) {
          std::string arch, std::string features, std::vector<std::string> flags,
          bool enable_fp_fusion, bool disable_slp_vectorizer,
          bool disable_vector_combine, bool expand_masked_div_rem,
-         bool enable_nvptx_tti) {
+         unsigned nvptx_compute_capability, bool enable_nvptx_tti) {
         if (mlir::triton::tools::getBoolEnv("DISABLE_LLVM_OPT"))
           return;
         // Declare the same flags as codegen even though IR optimization does
@@ -759,12 +703,6 @@ void init_triton_llvm(py::module_ &m) {
         tuningOptions.LoopUnrolling = true;
         tuningOptions.LoopInterleaving = true;
         tuningOptions.LoopVectorization = true;
-        // TODO: currently we run SLP vectorizer with an empty target machine.
-        // This cause the vectorizer to create larger vector which could be bad.
-        // Disabling it would currently cause regressions as this pass also
-        // applies some scheduling that helps performance in some cases. We
-        // should work on using NVPTX target instead and address the performance
-        // regressions with some scheduling solution.
         tuningOptions.SLPVectorization = !disable_slp_vectorizer;
 
         bool disableSLPVectorization =
@@ -823,6 +761,8 @@ void init_triton_llvm(py::module_ &m) {
               // sure all the struct are removed for the following passes.
               fpm.addPass(BreakStructPhiNodesPass());
               fpm.addPass(InstCombinePass());
+              if (nvptx_compute_capability != 0)
+                fpm.addPass(NVPTXVectorizerPass(nvptx_compute_capability));
             });
         bool enableAddressSanitizer =
             mlir::triton::tools::getBoolEnv("TRITON_ENABLE_ASAN");
@@ -845,6 +785,7 @@ void init_triton_llvm(py::module_ &m) {
       py::arg("disable_slp_vectorizer") = false,
       py::arg("disable_vector_combine") = false,
       py::arg("expand_masked_div_rem") = false,
+      py::arg("nvptx_compute_capability") = 0,
       py::arg("enable_nvptx_tti") = false,
       py::call_guard<py::gil_scoped_release>());
 

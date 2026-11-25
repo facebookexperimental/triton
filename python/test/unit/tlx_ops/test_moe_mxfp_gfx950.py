@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from triton._internal_testing import is_hip_cdna4
-from triton.tlx.ops.kernels.moe_mxfp.gfx950 import moe_mxfp4, prepare_w13, prepare_w2, quantize_rows
+from triton.tlx.ops.kernels.moe_mxfp.gfx950 import moe_mxfp4, pick_config, prepare_w13, prepare_w2, quantize_rows
 
 requires_gfx950 = pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
 
@@ -87,6 +87,7 @@ _CFG = {
     "small32": dict(BLOCK_M=32, WN=8, A_LDS=False),
     "small64": dict(BLOCK_M=64, WN=4, A_LDS=True),
     "quad128": dict(BLOCK_M=128, GROUP_M=1, QUAD=True),
+    "quad128g4": dict(BLOCK_M=128, GROUP_M=4, QUAD=True),
     "quad256": dict(BLOCK_M=256, GROUP_M=1, QUAD=True),
 }
 _K, _I, _H, _E_TOTAL, _TOPK = 1024, 1024, 256, 32, 8
@@ -105,19 +106,24 @@ def _routing(T, gen):
     return ids, wts
 
 
+def _engine_cfg(engine, T):
+    return _CFG[engine] if engine != "auto" else pick_config(T * _TOPK, _E_TOTAL)
+
+
 def _check(got, x, wts, ids, weights, start, engine):
     w13, s13, w2, s2, norm = weights
     ref = _reference(x, wts, ids, w13, s13, w2, s2, start, norm, 1e-8, 1.0)
     rel = (got.float() - ref.float()).norm() / ref.float().norm().clamp_min(1e-9)
     # The fused 128-row path sums the top-k expert outputs with BF16 atomics, rounding after each add.
-    fused = engine == "quad128" and norm is None
+    cfg = _engine_cfg(engine, x.shape[0])
+    fused = cfg.get("QUAD", False) and cfg["BLOCK_M"] == 128 and norm is None
     assert rel < (6e-3 if fused else 1e-3), rel
 
 
 def _run(x, wts, ids, weights, prepared, start, engine):
     norm = weights[4]
     return moe_mxfp4(x, wts, ids, *prepared, expert_start=start, post_norm_weight=norm, post_norm_eps=1e-8,
-                     post_norm_gain=1.0, cfg=_CFG[engine])
+                     post_norm_gain=1.0, cfg=_CFG[engine], num_experts=_E_TOTAL)
 
 
 def _prepare(weights):
@@ -127,7 +133,7 @@ def _prepare(weights):
 
 @requires_gfx950
 @pytest.mark.parametrize("T", [1, 5, 40, 300])
-@pytest.mark.parametrize("engine", ["auto", "small32", "small64", "quad128", "quad256"])
+@pytest.mark.parametrize("engine", ["auto", "small32", "small64", "quad128", "quad128g4", "quad256"])
 @pytest.mark.parametrize("start,use_norm", [(0, False), (0, True), (16, True)])
 def test_moe_mxfp4_matches_reference(T, engine, start, use_norm):
     gen = torch.Generator(device="cuda").manual_seed(0)
@@ -135,6 +141,20 @@ def test_moe_mxfp4_matches_reference(T, engine, start, use_norm):
     x = torch.randn(T, _K, device="cuda", generator=gen).to(torch.bfloat16)
     ids, wts = _routing(T, gen)
     _check(_run(x, wts, ids, weights, _prepare(weights), start, engine), x, wts, ids, weights, start, engine)
+
+
+@pytest.mark.parametrize("num_valid,num_experts,engine",
+                         [(128, 32, "small32"),  # 4 rows per expert
+                          (512, 32, "small32"),  # 16
+                          (1024, 32, "quad128g4"),  # 32
+                          (4096, 32, "quad128g4"),  # 128
+                          (8192, 32, "quad128"),  # 256
+                          (16384, 32, "quad256"),  # 512
+                          (16384, 64, "quad128"),  # 256: the same slots over twice the experts pick the smaller tile
+                          (65536, 256, "quad128"),  # 256 under expert parallelism (ids over all 256 experts)
+                          ])
+def test_moe_mxfp4_pick_config_keys_on_rows_per_expert(num_valid, num_experts, engine):
+    assert pick_config(num_valid, num_experts) == _CFG[engine]
 
 
 @requires_gfx950

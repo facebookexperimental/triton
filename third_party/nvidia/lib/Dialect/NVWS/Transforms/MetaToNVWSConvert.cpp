@@ -135,7 +135,8 @@ static LogicalResult promoteMetaWarpSpecializeRoots(FuncOp func) {
     // The planner resolves SMEM policy from the scheduled loop outward.
     // Preserve the closest override that the new root would no longer see,
     // including overrides inherited from an intermediate enclosing loop.
-    for (StringRef name : {"tt.smem_alloc_algo", "tt.smem_circular_reuse"}) {
+    for (StringRef name : {"tt.smem_alloc_algo", "tt.smem_circular_reuse",
+                           "tt.smem_operand_ring_first"}) {
       for (scf::ForOp loop = scheduled; loop != root;
            loop = loop->getParentOfType<scf::ForOp>()) {
         Attribute attr;
