@@ -274,6 +274,16 @@ public:
       return bailOut(funcOp);
     }
 
+    if (Value src = findTensorChannelWithMixedConsumerTasks(funcOp)) {
+      emitWarning(
+          src.getLoc(),
+          "meta autoWS does not support a register value used by consumers "
+          "in different partitions (e.g. a bias folded into both "
+          "data-partition halves' accumulator init); compiling without warp "
+          "specialization");
+      return bailOut(funcOp);
+    }
+
     // Cross-partition run-once, loop-carried "claim the next tile" support for
     // dynamic-persistent kernels. Handles both the `tt.atomic_rmw` tile counter
     // and the CLC tile-scheduler fetch (`ttng.clc_read`) with the same idea:
