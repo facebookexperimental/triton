@@ -145,23 +145,7 @@ public:
   }
 
   void runOnFuncOp(triton::FuncOp funcOp) {
-    // Warp specialization is enabled for this function if any op carries WS
-    // metadata: an `async_task_id` or `ttg.partition` tag, or a loop marked
-    // with the warp-specialize attribute. A single walk with early-out
-    // suffices.
-    bool enabled = false;
-    funcOp->walk([&](Operation *op) {
-      if (op->getAttrOfType<DenseI32ArrayAttr>(kAsyncTaskIdAttrName) ||
-          op->getAttrOfType<DenseI32ArrayAttr>(
-              triton::gpu::kPartitionAttrName) ||
-          (isa<scf::ForOp, scf::WhileOp>(op) &&
-           op->hasAttr(mlir::triton::kWarpSpecializeAttrName))) {
-        enabled = true;
-        return WalkResult::interrupt();
-      }
-      return WalkResult::advance();
-    });
-    if (!enabled)
+    if (!triton::isMetaWarpSpecializedFunc(funcOp))
       return;
 
     int numWarps = mlir::triton::gpu::lookupNumWarps(funcOp);
@@ -177,6 +161,43 @@ public:
     unsigned numWarpGroups =
         isBlackwell ? kNumWarpGroupsBlackwell : kNumWarpGroupsHopper;
 
+    // A loop that asked for warp specialization but got no partitions
+    // (PartitionSchedulingMeta skipped it) next to one that did: task-id
+    // propagation would give the skipped loop every task, so code partitioning
+    // would clone it into every partition and each side effect in it (a TMA
+    // reduce, an atomic) would run once per partition. Its ops cannot be safely
+    // placed in one partition either, since nothing orders them after the
+    // other partitions' writes. Leave the whole function unspecialized. This
+    // must run before doTaskIdPropagate, which tags the skipped loop.
+    auto hasPartitionTag = [](Operation *root) {
+      return root
+          ->walk([](Operation *op) {
+            if (op->getAttrOfType<DenseI32ArrayAttr>(kAsyncTaskIdAttrName) ||
+                op->getAttrOfType<DenseI32ArrayAttr>(
+                    triton::gpu::kPartitionAttrName))
+              return WalkResult::interrupt();
+            return WalkResult::advance();
+          })
+          .wasInterrupted();
+    };
+    if (hasPartitionTag(funcOp)) {
+      bool hasUnpartitionedWSLoop = false;
+      funcOp->walk([&](Operation *op) {
+        if (isa<scf::ForOp, scf::WhileOp>(op) &&
+            op->hasAttr(mlir::triton::kWarpSpecializeAttrName) &&
+            !hasPartitionTag(op)) {
+          hasUnpartitionedWSLoop = true;
+          return WalkResult::interrupt();
+        }
+        return WalkResult::advance();
+      });
+      if (hasUnpartitionedWSLoop) {
+        LDBG("A warp-specialize loop has no partitions while another loop in "
+             "the function does. Skipping.");
+        return bailOut(funcOp);
+      }
+    }
+
     if (failed(doTaskIdPropagate(funcOp))) {
       signalPassFailure();
       return;
@@ -184,7 +205,7 @@ public:
     dumpAfter(moduleOp, "doTaskIdPropagate");
 
     // Final eligibility gate, and the last one before the pipeline starts
-    // rewriting ops. `enabled` above only proves someone *asked* for warp
+    // rewriting ops. The gate above only proves someone *asked* for warp
     // specialization (a `tt.warp_specialize` loop marker). Whether there is
     // anything to specialize is decided by the partitions, which
     // PartitionSchedulingMeta assigns as `ttg.partition` and doTaskIdPropagate

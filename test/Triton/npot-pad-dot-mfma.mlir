@@ -282,7 +282,7 @@ tt.func @mxfp4_k96(%pa: !tt.ptr<i8>, %pb: !tt.ptr<i8>, %ps: !tt.ptr<i8>) {
 // -----
 
 // The third RUN expects fp6 K=96 to pad while the native pattern's gate
-// "fp6 uses decompose upcast" holds; when the gate goes, drop the `not`, the
+// "dense fp6 uses decompose upcast" holds; when the gate goes, drop the `not`, the
 // padded CHECK and the remark.
 // CHECK-LABEL: @fp6_k96
 // CHECK: tt.dot_scaled {{.*}} : tensor<128x128xi8>, tensor<128x4xi8> * tensor<128x128xi8>, tensor<128x4xi8> ->
@@ -296,7 +296,7 @@ tt.func @fp6_k96(%pa: !tt.ptr<i8>, %pb: !tt.ptr<i8>, %ps: !tt.ptr<i8>) {
   %ss = tt.splat %ps : !tt.ptr<i8> -> tensor<128x3x!tt.ptr<i8>>
   %s = tt.load %ss : tensor<128x3x!tt.ptr<i8>>
   %c = arith.constant dense<0.0> : tensor<128x128xf32>
-  // expected-remark @+1 {{NPOT dot_scaled is not yet supported on MFMA: fp6 uses decompose upcast}}
+  // expected-remark @+1 {{NPOT dot_scaled is not yet supported on MFMA: dense fp6 uses decompose upcast}}
   %d = tt.dot_scaled %a scale %s, %b scale %s, %c lhs = e2m3 rhs = e2m3 {fastMath = false} : tensor<128x96xi8>, tensor<128x3xi8> * tensor<96x128xi8>, tensor<128x3xi8> -> tensor<128x128xf32>
   tt.return
 }

@@ -13,12 +13,14 @@ import triton.language as tl
 __all__ = ["TensorDescriptor", "TensorDescriptorIm2Col"]
 
 
-def _validate_fp6_descriptor(tensor, strides, layout, elem_bytes):
+def _validate_fp6_descriptor(tensor, strides, layout, elem_bytes, block_shape):
     if layout.padding not in ("b6x16_p32", "b6p2x16"):
         return
-    assert tensor.data_ptr() % 32 == 0, "For fp6_padded, base must be 32-byte aligned"
+    alignment = 16 if block_shape[-1] == 64 else 32
+    assert tensor.data_ptr() % alignment == 0, f"For fp6_padded, base must be {alignment}-byte aligned"
     for stride in strides[:-1]:
-        assert (stride * elem_bytes) % 32 == 0, "For fp6_padded, tensor strides must be 32-byte aligned"
+        assert (stride * elem_bytes) % alignment == 0, \
+            f"For fp6_padded, tensor strides must be {alignment}-byte aligned"
     target = tl.target_info.current_target()
     assert target is None or tl.target_info.cuda_capability_geq(10, 0), "fp6_padded requires blackwell or newer"
 
@@ -44,15 +46,16 @@ def _validate_common_descriptor(tensor, shape, strides, layout, padding, round_f
     if round_f32_to_tf32:
         assert (dtype_str == "fp32"), "round_f32_to_tf32 is only supported for float32 tensors"
     assert elem_bytes * 8 == layout.element_bitwidth
-    _validate_fp6_descriptor(tensor, strides, layout, elem_bytes)
+    _validate_fp6_descriptor(tensor, strides, layout, elem_bytes, block_shape)
     padding_factor = 2 if layout.fp4_padded else 1
     min_block = layout.swizzle_byte_width // (elem_bytes * padding_factor)
     assert (block_shape[-1]
             >= min_block), f"Expected block_shape[-1] to be at least {min_block} but got {block_shape[-1]}"
     if layout.padding in ("b6x16_p32", "b6p2x16"):
         validate_fp6_box(block_shape[-1], shape[-1], strides[:-1], padding, host=True)
-        if dtype_str != "u8" or layout.swizzle_byte_width not in (0, 128) or tensor.data_ptr() % 32:
-            raise ValueError("FP6 requires 32-byte aligned uint8 storage and 0/128-byte swizzling")
+        alignment = block_shape[-1] // 4
+        if dtype_str != "u8" or layout.swizzle_byte_width not in (0, 128) or tensor.data_ptr() % alignment:
+            raise ValueError(f"FP6 requires {alignment}-byte aligned uint8 storage and 0/128-byte swizzling")
     if layout.fp4_padded:
         assert tensor.data_ptr() % 32 == 0, "For fp4_padded, base must 32-byte aligned"
         for stride in strides[:-1]:
@@ -115,7 +118,7 @@ class TensorDescriptor:
         if self.round_f32_to_tf32:
             assert (dtype_str == "fp32"), "round_f32_to_tf32 is only supported for float32 tensors"
         assert elem_bytes * 8 == self.layout.element_bitwidth
-        _validate_fp6_descriptor(self.base, self.strides, self.layout, elem_bytes)
+        _validate_fp6_descriptor(self.base, self.strides, self.layout, elem_bytes, self.block_shape)
         padding_factor = 2 if self.layout.fp4_padded else 1
         min_block = self.layout.swizzle_byte_width // (elem_bytes * padding_factor)
         assert (self.block_shape[-1]
