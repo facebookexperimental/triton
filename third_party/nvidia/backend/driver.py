@@ -201,10 +201,11 @@ def ty_to_cpp(ty):
         "u16": "uint16_t",
         "u32": "uint32_t",
         "u64": "uint64_t",
-        "fp16": "double",
-        "bf16": "double",
-        "fp32": "double",
-        "f32": "double",
+        # Pass 16-bit floating-point scalars as raw bit patterns.
+        "fp16": "uint16_t",
+        "bf16": "uint16_t",
+        "fp32": "float",
+        "f32": "float",
         "fp64": "double",
         "nvTmaDesc": "CUtensorMap",
     }[ty]
@@ -309,6 +310,7 @@ TMA_DTYPE_DEVICE_TO_HOST[8] = 10
 TMA_DTYPE_DEVICE_TO_HOST[9] = 8
 TMA_DTYPE_DEVICE_TO_HOST[10] = 9
 TMA_TF32 = 11
+TMA_B4X16_P64 = 14
 
 
 class TmaDescKernelParam:
@@ -332,7 +334,6 @@ def make_tensordesc_arg(arg, metadata, _):
     elem_size = metadata["elem_size"]
     elem_type = metadata["elem_type"]
     block_size = metadata["block_size"]
-    fp4_padded = metadata["fp4_padded"]
     is_im2col = metadata.get("is_im2col", False)
 
     shape = arg.shape
@@ -340,7 +341,8 @@ def make_tensordesc_arg(arg, metadata, _):
     assert strides[-1] == 1
     padding = 1 if arg.padding == "nan" else 0
 
-    if fp4_padded:
+    if elem_type == TMA_B4X16_P64:
+        # CUDA counts FP4 values. The backing tensor stores two per byte.
         expanded_shape = list(shape)
         expanded_shape[-1] *= 2
     else:
@@ -402,7 +404,11 @@ class CudaLauncher(object):
             active_driver = triton.runtime.driver.active
             device = active_driver.get_current_device()
             properties = active_driver.utils.get_device_properties(device)
-            min_shared = properties["max_shared_mem_per_multiprocessor"] // (max_occupancy + 1) + 1
+            # Budget for max_occupancy CTAs, including the driver reservation.
+            # Ampere and newer allocate shared memory in 128-byte units. Round
+            # down before subtracting the reservation so all CTAs still fit.
+            shared_per_cta = properties["max_shared_mem_per_multiprocessor"] // max_occupancy
+            min_shared = shared_per_cta // 128 * 128 - properties["reserved_shared_mem_per_block"]
             self.shared = max(self.shared, min_shared)
         if self.gsan_enabled:
             signature["_gsan_globals_ptr"] = "*i8"

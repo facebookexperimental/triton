@@ -256,6 +256,7 @@ def barrier_arrive(
     remote_cta_rank: tl.tensor = None,
     pred: tl.tensor = None,
     cta_mask: tl.constexpr = None,
+    per_warp: tl.constexpr = False,
     _semantic=None,
 ) -> None:
     """
@@ -263,12 +264,20 @@ def barrier_arrive(
 
     Args:
         bar: The mbarrier to signal. Can be a local mbarrier or a remote view of mbarrier.
-        arrive_count: The number of arrivals to signal.
+        arrive_count: The number of arrivals to signal: from the task, from each thread of a warp
+                      barrier, or from each warp with `per_warp`.
         remote_cta_rank: If provided, the barrier will be mapped to the remote CTA's shared memory
                          before signaling. This allows signaling a barrier in another CTA.
         pred: Optional predicate. If provided, the arrive is only performed when pred is true.
         cta_mask: Optional compile-time CTA-dimension mask for cluster multicast arrival.
                   Cannot be combined with remote_cta_rank or a warp barrier.
+        per_warp: If True, each warp of the calling task synchronizes its own lanes and then one of
+                  its lanes arrives with `arrive_count`, instead of the whole task synchronizing
+                  before a single thread arrives. The barrier then counts `arrive_count` times the
+                  task's warp count for this arrive, so a barrier signalled by a 4-warp task this
+                  way is allocated with 4 arrivals per CTA. Per-warp and leader arrives can share a
+                  barrier. `pred` must be the same in all lanes of a warp. Not supported for warp
+                  barriers, with `cta_mask`, or on AMD.
     """
     assert bar.type.storage == tlx.storage_kind.smem, (
         "barrier_arrive does not allow users to pass a remote_view of mbarrier. Remote view is done inside barrier_arrive"
@@ -277,6 +286,12 @@ def barrier_arrive(
 
     # Capture is_warp_barrier before remote_view, which doesn't preserve it.
     is_warp_bar = getattr(bar, 'is_warp_barrier', False)
+
+    per_warp = tl._unwrap_if_constexpr(per_warp)
+    if per_warp:
+        assert not is_warp_bar, "per_warp is not supported for warp barriers, where every thread arrives"
+        assert cta_mask is None, "per_warp cannot be combined with cta_mask"
+        assert not is_hip(), "per_warp is only supported on NVIDIA GPUs"
 
     cta_mask_value = None
     if cta_mask is not None:
@@ -300,6 +315,12 @@ def barrier_arrive(
 
     if is_warp_bar:
         _semantic.builder.create_warp_barrier_arrive(bar.handle, arrive_count.value, pred_handle)
+    elif per_warp:
+        from triton.language.extra.tlx.compiler.code_generator import get_current_num_warps
+        num_warps = get_current_num_warps(_semantic.builder)
+        assert num_warps, "per_warp requires the task's num_warps"
+        # The IR counts what the whole task contributes and lowering splits it across the warps.
+        _semantic.builder.create_warp_barrier_arrive(bar.handle, arrive_count.value * num_warps, pred_handle, per_warp)
     else:
         _semantic.builder.create_barrier_arrive(
             bar.handle,

@@ -30,4 +30,14 @@ bool requiresCrossCTAMBarrierInitSync(
     FunctionOpInterface funcOp, Value barrier, int numCTAs,
     llvm::function_ref<bool(Value)> aliasesBarrier);
 
+// Whether `op` is a per-thread arrival that every thread of its region
+// performs. A predicate can leave threads out, and the arrival does not
+// publish their effects.
+bool arrivesFromEveryThread(Operation *op);
+
+// Whether `op` is a named barrier whose thread count includes every thread
+// of its region, so it completes only after all of them reach it, if they
+// all execute it.
+bool countsEveryThread(Operation *op);
+
 } // namespace mlir::triton::nvidia_gpu

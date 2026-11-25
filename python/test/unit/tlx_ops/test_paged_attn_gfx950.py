@@ -8,10 +8,12 @@ import triton
 from triton._internal_testing import is_hip_cdna4
 from triton.tlx.ops import (
     InvalidInput,
+    UnsupportedBackward,
     allocate_paged_kv_cache_5d,
     paged_attention_decode,
     paged_attention_decode_workspace,
     reshape_and_cache_5d,
+    rmsnorm_gate,
 )
 from triton.tlx.ops.kernels.paged_attn import gfx950_decode as pa
 
@@ -429,3 +431,169 @@ def test_fp8_kv_cache_rejects_invalid_inputs():
     with pytest.raises(InvalidInput):
         paged_attention_decode(query, k5.to(torch.float8_e4m3fn), v5.to(torch.float8_e4m3fn), context_lens,
                                block_tables[:, :3], **descales)
+
+
+@pytest.mark.parametrize("window", [0, 37, 2047], ids=lambda w: f"w{w}")
+@pytest.mark.parametrize("num_seqs", [1, 8, 16, 32, 64], ids=lambda n: f"bs{n}")
+def test_fp8_two_kv_head_decode(num_seqs, window):
+    """16 Q / 2 KV heads (TP8) FP8 decode as SGLang's CUDA graph calls it: page-major pool, a 32K plan bound, mixed
+    context lengths. Window layers and full layers from 16 programs take the direct-load plans."""
+    ctx_lens = [[3, 40, 2055, 9000, 700, 4097, 31000, 16][i % 8] for i in range(num_seqs)]
+    inputs, descales = _fp8_inputs(ctx_lens, 2, 8, 1, "nhd", True)
+    query, key_cache, value_cache, context_lens, block_tables = inputs
+    kwargs = dict(sliding_window=window, max_context_len=32768, kv_layout="NHD")
+    config = pa.get_pa_decode_config(query, key_cache, value_cache, block_tables, **kwargs)
+    assert config.direct_kv and config.block_n == (256 if num_seqs >= (8 if window == 0 else 16) else 128)
+    workspace = paged_attention_decode_workspace(query, key_cache, value_cache, block_tables, **kwargs)
+    out = paged_attention_decode(*inputs, workspace=workspace, **kwargs, **descales)
+    expected = pa.ref_decode(query, key_cache, value_cache, context_lens, block_tables, 64**-0.5, 16, 2, 1, window,
+                             "NHD", **descales)
+    _assert_matches(out, expected)
+
+
+def test_fp8_two_kv_head_plans():
+    """Plans for FP8 single-token page-major decode with 2 KV heads under a 32K bound (tuned on MI350X): direct loads
+    on window layers, and a 256-key tile at ~512 programs on full layers from 16 programs; BF16 keeps its plans."""
+    fp8 = torch.float8_e4m3fn
+    expected = {  # (dtype, window, num_seqs) -> (direct_kv, block_n, kv_stages, num_splits)
+        (fp8, 0, 4): (True, 64, 3, 64),
+        (fp8, 0, 8): (True, 256, 1, 32),
+        (fp8, 0, 16): (True, 256, 1, 16),
+        (fp8, 0, 32): (True, 256, 1, 8),
+        (fp8, 0, 64): (True, 256, 1, 4),
+        (fp8, 2047, 1): (True, 128, 2, 17),
+        (fp8, 2047, 8): (True, 128, 2, 17),
+        (fp8, 2047, 16): (True, 256, 1, 9),
+        (fp8, 2047, 32): (True, 256, 1, 8),
+        (fp8, 2047, 64): (True, 256, 1, 4),
+        (torch.bfloat16, 0, 16): (True, 64, 3, 16),
+        (torch.bfloat16, 2047, 16): (False, 128, 1, 8),
+    }
+    cache = torch.empty(64, 16, 2, 64, dtype=fp8, device=DEVICE)
+    for (dtype, window, num_seqs), plan in expected.items():
+        query = torch.empty(num_seqs, 16, 64, dtype=dtype, device=DEVICE)
+        block_tables = torch.empty(num_seqs, 2048, dtype=torch.int32, device=DEVICE)
+        c = pa.get_pa_decode_config(query, cache.to(dtype), cache.to(dtype), block_tables, max_context_len=32768,
+                                    sliding_window=window, kv_layout="NHD")
+        assert (c.direct_kv, c.block_n, c.kv_stages, c.num_splits) == plan, (dtype, window, num_seqs)
+
+
+@pytest.mark.parametrize("window", [0, 2047], ids=lambda w: f"w{w}")
+def test_int64_context_lens(window):
+    """SGLang passes int64 seq_lens; they give the same output as int32, with no cast kernel."""
+    inputs, descales = _fp8_inputs([9, 3000, 9000] * 6, 2, 8, 1, "nhd", True)
+    query, key_cache, value_cache, context_lens, block_tables = inputs
+    kwargs = dict(sliding_window=window, max_context_len=9000, kv_layout="NHD")
+    workspace = paged_attention_decode_workspace(query, key_cache, value_cache, block_tables, **kwargs)
+    out32 = paged_attention_decode(*inputs, workspace=workspace, **kwargs, **descales)
+    out64 = paged_attention_decode(query, key_cache, value_cache, context_lens.long(), block_tables,
+                                   workspace=workspace, **kwargs, **descales)
+    torch.testing.assert_close(out64, out32, atol=0, rtol=0)
+
+
+def test_paged_attention_decode_rejects_grad_tracked_out():
+    inputs = _inputs([40, 300], 2, 8, 64, 16, cache_layout="nhd")
+    with pytest.raises(UnsupportedBackward):
+        paged_attention_decode(*inputs, kv_layout="NHD", out=torch.empty_like(inputs[0]).requires_grad_())
+
+
+def _projection_gate(num_tokens, num_q_heads, seed=0):
+    """The output gate as a column slice of a wider projection output (SGLang's fused QKV + gate at TP8)."""
+    g = torch.Generator(device=DEVICE).manual_seed(seed)
+    qkv = torch.randn(num_tokens, 2304, generator=g, device=DEVICE).mul_(2).to(torch.bfloat16)
+    return qkv[:, 2304 - num_q_heads * 64:]
+
+
+@pytest.mark.parametrize("window", [0, 2047], ids=lambda w: f"w{w}")
+@pytest.mark.parametrize("num_seqs", [1, 4, 16, 32], ids=lambda n: f"bs{n}")
+def test_out_gate_is_rmsnorm_gate_of_the_output(num_seqs, window):
+    """With out_gate, the reduce writes tlx.ops.rmsnorm_gate(output, out_gate) bit for bit (FP8 TP8 serving plan)."""
+    ctx_lens = [[3, 40, 2055, 9000, 700, 4097, 31000, 16][i % 8] for i in range(num_seqs)]
+    inputs, descales = _fp8_inputs(ctx_lens, 2, 8, 1, "nhd", True)
+    query, key_cache, value_cache, context_lens, block_tables = inputs
+    kwargs = dict(sliding_window=window, max_context_len=32768, kv_layout="NHD")
+    gate = _projection_gate(num_seqs, 16)
+    workspace = paged_attention_decode_workspace(query, key_cache, value_cache, block_tables, norm_gate=True, **kwargs)
+    plain = paged_attention_decode(*inputs, workspace=workspace, **kwargs, **descales)
+    expected = rmsnorm_gate(plain.reshape(num_seqs, -1), gate, eps=1e-5)
+    out = paged_attention_decode(*inputs, workspace=workspace, out_gate=gate, out_norm_eps=1e-5, **kwargs, **descales)
+    assert out.shape == plain.shape
+    torch.testing.assert_close(out.reshape(num_seqs, -1), expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("query_length", [1, 4], ids=lambda q: f"qlen{q}")
+@pytest.mark.parametrize("cache_layout", ["4d", "nhd", "5d"])
+def test_out_gate_bf16_plans(cache_layout, query_length):
+    """BF16 caches, verify rows and every partition plan keep the bitwise rmsnorm_gate contract."""
+    inputs = _inputs([query_length + 2, 300, 2055, 9000], 2, 8, 64, 16, query_length, cache_layout)
+    num_tokens = inputs[0].shape[0]
+    kv_layout = _kv_layout(cache_layout)
+    gate = _projection_gate(num_tokens, 16, seed=1)
+    plain = paged_attention_decode(*inputs, query_length=query_length, kv_layout=kv_layout)
+    out = paged_attention_decode(*inputs, query_length=query_length, kv_layout=kv_layout, out_gate=gate)
+    expected = rmsnorm_gate(plain.reshape(num_tokens, -1), gate)
+    torch.testing.assert_close(out.reshape(num_tokens, -1), expected, atol=0, rtol=0)
+
+
+def test_out_gate_needs_two_splits():
+    """A one-split (fused) plan becomes two splits with out_gate, whose reduce applies the norm and gate; an empty
+    split adds nothing."""
+    inputs, descales = _fp8_inputs([40] * 256, 2, 8, 1, "nhd", True)
+    query, key_cache, value_cache, context_lens, block_tables = inputs
+    kwargs = dict(sliding_window=2047, max_context_len=32768, kv_layout="NHD")
+    assert pa.get_pa_decode_config(query, key_cache, value_cache, block_tables, **kwargs).num_splits == 1
+    assert pa.get_pa_decode_config(query, key_cache, value_cache, block_tables, norm_gate=True,
+                                   **kwargs).num_splits == 2
+    gate = _projection_gate(256, 16, seed=2)
+    out = paged_attention_decode(*inputs, out_gate=gate, **kwargs, **descales)
+    two = torch.empty_like(out)
+    pa.pa_decode_tlx(two, query, key_cache, value_cache, context_lens, block_tables, 64**-0.5, num_splits=2,
+                     max_context_len=32768, sliding_window=2047, kv_layout="NHD", **descales)
+    torch.testing.assert_close(out.reshape(256, -1), rmsnorm_gate(two.reshape(256, -1), gate), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("ctx_lens", [[40], [9], [40, 300, 2055] * 64], ids=["ctx40", "one_page", "bs192"])
+def test_out_gate_packed_5d_one_split_plans(ctx_lens):
+    """The packed 5-D plan picks one split for a block table within one 256-key tile and from 384 programs on; with
+    out_gate it takes two (one page leaves the second split empty) and writes rmsnorm_gate of the two-split output."""
+    inputs = _inputs(ctx_lens, 2, 8, 64, 16)
+    query, key_cache, value_cache, context_lens, block_tables = inputs
+    assert pa.get_pa_decode_config(query, key_cache, value_cache, block_tables).num_splits == 1
+    assert pa.get_pa_decode_config(query, key_cache, value_cache, block_tables, norm_gate=True).num_splits == 2
+    num_tokens = query.shape[0]
+    gate = _projection_gate(num_tokens, 16, seed=3)
+    out = paged_attention_decode(*inputs, out_gate=gate)
+    two = torch.empty_like(query)
+    pa.pa_decode_tlx(two, query, key_cache, value_cache, context_lens, block_tables, 64**-0.5, num_splits=2)
+    expected = rmsnorm_gate(two.reshape(num_tokens, -1), gate)
+    torch.testing.assert_close(out.reshape(num_tokens, -1), expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("name", ["out_gate", "k_descale", "v_descale", "q_descale"])
+def test_paged_attention_decode_rejects_grad_tracked_gate_and_descales(name):
+    """Every float tensor argument is checked for autograd, not only the query, the caches and out."""
+    inputs, descales = _fp8_inputs([40, 300], 2, 8, 1, "nhd", True)
+    kwargs = dict(kv_layout="NHD", out_gate=_projection_gate(2, 16), **descales)
+    kwargs[name] = kwargs[name].detach().requires_grad_()
+    with pytest.raises(UnsupportedBackward):
+        paged_attention_decode(*inputs, **kwargs)
+
+
+def test_out_gate_rejects_bad_inputs():
+    inputs, descales = _fp8_inputs([40, 300], 2, 8, 1, "nhd", True)
+    gate = _projection_gate(2, 16)
+    bad = [
+        dict(out_gate=gate.float()),
+        dict(out_gate=gate[:, :512]),
+        dict(out_gate=gate[:1]),
+        dict(out_gate=gate.t().contiguous().t()),
+        dict(out_gate=gate, out_norm_eps=0.0),
+        dict(out_gate=gate, out=torch.empty(2, 16, 64, dtype=torch.float16, device=DEVICE)),
+    ]
+    for kwargs in bad:
+        with pytest.raises(InvalidInput):
+            paged_attention_decode(*inputs, kv_layout="NHD", **descales, **kwargs)
+    bf16 = _inputs([40, 300], 2, 8, 128, 16, cache_layout="nhd")
+    with pytest.raises(InvalidInput):
+        paged_attention_decode(*bf16, kv_layout="NHD", out_gate=torch.zeros(2, 2048, dtype=torch.bfloat16,
+                                                                            device=DEVICE))

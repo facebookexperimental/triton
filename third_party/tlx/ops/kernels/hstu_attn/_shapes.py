@@ -27,6 +27,13 @@ SYNTHETIC: tuple[HSTUAttentionShape, ...] = (
     HSTUAttentionShape(1, 2048, 2, 128, True, "bf16"),
 )
 
+# Backward on gfx950 only supports head dim 128: the ragged backward kernel
+# in gfx950.py statically asserts BLOCK_D_Q == BLOCK_D_V == 128 for its LDS
+# staging. The head-dim-64 correctness shapes below therefore run forward
+# only; the benchmark exporter skips them in backward mode via FORWARD_ONLY
+# (precedent: flash_attn/_shapes.py).
+FORWARD_ONLY: frozenset[HSTUAttentionShape] = frozenset(shape for shape in SYNTHETIC if shape.head_dim == 64)
+
 FOCUS_SUITES = (
     # TODO: Replace placeholders with captured sparse-length shapes.
     FocusSuite(

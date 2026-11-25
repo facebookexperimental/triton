@@ -46,137 +46,47 @@ void tensormap_cp_fenceproxy(Location loc, MLIRContext *ctx,
 
 void tensormap_replace_generic(Location loc, MLIRContext *ctx,
                                ConversionPatternRewriter &rewriter,
-                               std::string fieldName, Value descPtr,
-                               int32_t newVal) {
-  // The descriptor is zero-initialized before its fields are populated.
-  if (newVal == 0)
-    return;
-
-  PTXBuilder ptxBuilder;
-
-  // prepare asm operands
-  auto *descAddrOpr = ptxBuilder.newAddrOperand(descPtr, "l");
-  auto newValOpr = ptxBuilder.newConstantOperand(newVal);
-
-  // Define the instruction opcode
-  auto &replace = ptxBuilder.create("tensormap.replace.tile")
-                      ->o(fieldName)
-                      .o("shared::cta")
-                      .o("b1024")
-                      .o("b32");
-
-  replace(descAddrOpr, newValOpr);
-
-  ptxBuilder.launch(rewriter, loc, void_ty(ctx));
-}
-
-void tensormap_replace_generic(Location loc, MLIRContext *ctx,
-                               ConversionPatternRewriter &rewriter,
-                               std::string fieldName, Value descPtr,
+                               NVVM::TensormapField field, Value descPtr,
                                Value newVal,
                                std::optional<int32_t> ord = std::nullopt) {
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  if (isa<LLVM::LLVMPointerType>(newVal.getType()))
+    newVal = b.ptrtoint(IntegerType::get(ctx, 64), newVal);
+  NVVM::TensormapReplaceOp::create(
+      rewriter, loc, NVVM::TensormapFieldAttr::get(ctx, field), descPtr, newVal,
+      ord ? rewriter.getI32IntegerAttr(*ord) : IntegerAttr(), Attribute());
+}
+
+template <typename Attr>
+void tensormap_replace_attr(Location loc, MLIRContext *ctx,
+                            ConversionPatternRewriter &rewriter,
+                            NVVM::TensormapField field, Value descPtr,
+                            Attr newVal) {
+  // The descriptor is zero-initialized before its fields are populated.
+  if (static_cast<int32_t>(newVal.getValue()) == 0)
+    return;
+  NVVM::TensormapReplaceOp::create(rewriter, loc,
+                                   NVVM::TensormapFieldAttr::get(ctx, field),
+                                   descPtr, Value(), IntegerAttr(), newVal);
+}
+
+// Copies `ptr` through an opaque move so that `tensormap.replace` addresses the
+// descriptor through a register. When LLVM folds the address into a constant
+// shared-memory symbol offset, ptxas stops using the uniform datapath for the
+// surrounding index math in register-limited warp partitions: the TLX sm100
+// `flash_attn_varlen` forward, which builds a descriptor per tile, spilled and
+// ran 25% slower.
+static Value opaqueSharedAddress(ConversionPatternRewriter &rewriter,
+                                 Location loc, Value ptr) {
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
   PTXBuilder ptxBuilder;
-
-  auto newValTy = newVal.getType();
-  int width = 0;
-
-  // prepare asm operands
-  auto *descAddrOpr = ptxBuilder.newAddrOperand(descPtr, "l");
-  PTXInstr::Operand *ordOpr =
-      ord ? ptxBuilder.newConstantOperand(*ord) : nullptr;
-  PTXInstr::Operand *newValOpr = nullptr;
-  if (mlir::isa<IntegerType>(newValTy)) {
-    width = mlir::cast<IntegerType>(newValTy).getWidth();
-  } else {
-    assert(mlir::isa<mlir::LLVM::LLVMPointerType>(newValTy));
-    width = 64;
-  }
-  const char *constraint = width == 64 ? "l" : "r";
-  newValOpr = ptxBuilder.newOperand(newVal, constraint);
-
-  // Define the instruction opcode
-  auto &replace = ptxBuilder.create("tensormap.replace.tile")
-                      ->o(fieldName)
-                      .o("shared::cta")
-                      .o("b1024")
-                      .o("b32", width == 32)
-                      .o("b64", width == 64);
-
-  if (ord) {
-    replace(descAddrOpr, ordOpr, newValOpr);
-  } else {
-    replace(descAddrOpr, newValOpr);
-  }
-
-  ptxBuilder.launch(rewriter, loc, void_ty(ctx));
-}
-
-void tensormap_replace_global_address(Location loc, MLIRContext *ctx,
-                                      ConversionPatternRewriter &rewriter,
-                                      Value descPtr, Value newVal) {
-  tensormap_replace_generic(loc, ctx, rewriter, "global_address", descPtr,
-                            newVal);
-}
-
-void tensormap_replace_rank(Location loc, MLIRContext *ctx,
-                            ConversionPatternRewriter &rewriter, Value descPtr,
-                            int32_t newVal) {
-  tensormap_replace_generic(loc, ctx, rewriter, "rank", descPtr, newVal);
-}
-
-void tensormap_replace_box_dim(Location loc, MLIRContext *ctx,
-                               ConversionPatternRewriter &rewriter,
-                               Value descPtr, int32_t ord, Value newVal) {
-  tensormap_replace_generic(loc, ctx, rewriter, "box_dim", descPtr, newVal,
-                            ord);
-}
-
-void tensormap_replace_global_dim(Location loc, MLIRContext *ctx,
-                                  ConversionPatternRewriter &rewriter,
-                                  Value descPtr, int32_t ord, Value newVal) {
-  tensormap_replace_generic(loc, ctx, rewriter, "global_dim", descPtr, newVal,
-                            ord);
-}
-
-void tensormap_replace_global_stride(Location loc, MLIRContext *ctx,
-                                     ConversionPatternRewriter &rewriter,
-                                     Value descPtr, int32_t ord, Value newVal) {
-  tensormap_replace_generic(loc, ctx, rewriter, "global_stride", descPtr,
-                            newVal, ord);
-}
-
-void tensormap_replace_element_stride(Location loc, MLIRContext *ctx,
-                                      ConversionPatternRewriter &rewriter,
-                                      Value descPtr, int32_t ord,
-                                      Value newVal) {
-  tensormap_replace_generic(loc, ctx, rewriter, "element_stride", descPtr,
-                            newVal, ord);
-}
-
-void tensormap_replace_elemtype(Location loc, MLIRContext *ctx,
-                                ConversionPatternRewriter &rewriter,
-                                Value descPtr, int32_t newVal) {
-  tensormap_replace_generic(loc, ctx, rewriter, "elemtype", descPtr, newVal);
-}
-
-void tensormap_replace_interleave_layout(Location loc, MLIRContext *ctx,
-                                         ConversionPatternRewriter &rewriter,
-                                         Value descPtr, int32_t newVal) {
-  tensormap_replace_generic(loc, ctx, rewriter, "interleave_layout", descPtr,
-                            newVal);
-}
-
-void tensormap_replace_swizzle_mode(Location loc, MLIRContext *ctx,
-                                    ConversionPatternRewriter &rewriter,
-                                    Value descPtr, int32_t newVal) {
-  tensormap_replace_generic(loc, ctx, rewriter, "swizzle_mode", descPtr,
-                            newVal);
-}
-
-void tensormap_replace_fill_mode(Location loc, MLIRContext *ctx,
-                                 ConversionPatternRewriter &rewriter,
-                                 Value descPtr, int32_t newVal) {
-  tensormap_replace_generic(loc, ctx, rewriter, "fill_mode", descPtr, newVal);
+  auto &mov = *ptxBuilder.create("mov.b64 $0, $1;");
+  mov({ptxBuilder.newOperand("=l"),
+       ptxBuilder.newOperand(b.ptrtoint(i64_ty, ptr), "l")},
+      /*onlyAttachMLIRArgs=*/true);
+  Value addr =
+      ptxBuilder.launch(rewriter, loc, i64_ty, /*hasSideEffect=*/false);
+  return b.inttoptr(ptr.getType(), addr);
 }
 
 struct TensormapFenceproxyAcquireOpConversion
@@ -258,16 +168,22 @@ struct TensormapCreateOpConversion
         createIfBlock(rewriter, loc, isLeader);
     (void)previousBlock;
     rewriter.setInsertionPointToStart(updateBlock);
-    tensormap_replace_global_address(loc, ctx, rewriter, smemBase,
-                                     adaptor.getGlobalAddress());
-    tensormap_replace_rank(loc, ctx, rewriter, smemBase, op.getRank() - 1);
+    Value descAddr = opaqueSharedAddress(rewriter, loc, smemBase);
+    tensormap_replace_generic(loc, ctx, rewriter,
+                              NVVM::TensormapField::GLOBAL_ADDRESS, descAddr,
+                              adaptor.getGlobalAddress());
+    if (op.getRank() > 1)
+      tensormap_replace_generic(loc, ctx, rewriter, NVVM::TensormapField::RANK,
+                                descAddr, b.i32_val(op.getRank() - 1));
     for (int i = 0; i < op.getRank(); ++i) {
-      tensormap_replace_box_dim(loc, ctx, rewriter, smemBase, i,
-                                op.getBoxDim()[i]);
+      tensormap_replace_generic(loc, ctx, rewriter,
+                                NVVM::TensormapField::BOX_DIM, descAddr,
+                                op.getBoxDim()[i], i);
     }
     for (int i = 0; i < op.getRank(); ++i) {
-      tensormap_replace_global_dim(loc, ctx, rewriter, smemBase, i,
-                                   op.getGlobalDim()[i]);
+      tensormap_replace_generic(loc, ctx, rewriter,
+                                NVVM::TensormapField::GLOBAL_DIM, descAddr,
+                                op.getGlobalDim()[i], i);
     }
     for (int i = 0; i + 1 < op.getRank(); ++i) {
       auto strideVal = op.getGlobalStride()[i];
@@ -275,19 +191,32 @@ struct TensormapCreateOpConversion
         // Workaround for a ptxas bug
         strideVal = b.ashr(strideVal, b.i64_val(4));
       }
-      tensormap_replace_global_stride(loc, ctx, rewriter, smemBase, i,
-                                      strideVal);
+      tensormap_replace_generic(loc, ctx, rewriter,
+                                NVVM::TensormapField::GLOBAL_STRIDE, descAddr,
+                                strideVal, i);
     }
     for (int i = 0; i < op.getRank(); ++i) {
-      tensormap_replace_element_stride(loc, ctx, rewriter, smemBase, i,
-                                       op.getElementStride()[i]);
+      tensormap_replace_generic(loc, ctx, rewriter,
+                                NVVM::TensormapField::ELEMENT_STRIDE, descAddr,
+                                op.getElementStride()[i], i);
     }
-    tensormap_replace_elemtype(loc, ctx, rewriter, smemBase, op.getElemType());
-    tensormap_replace_interleave_layout(loc, ctx, rewriter, smemBase,
-                                        op.getInterleaveLayout());
-    tensormap_replace_swizzle_mode(loc, ctx, rewriter, smemBase,
-                                   op.getSwizzleMode());
-    tensormap_replace_fill_mode(loc, ctx, rewriter, smemBase, op.getFillMode());
+    tensormap_replace_attr(
+        loc, ctx, rewriter, NVVM::TensormapField::ELEMTYPE, descAddr,
+        NVVM::TensormapElemtypeAttr::get(
+            ctx, static_cast<NVVM::TensormapElemtype>(op.getElemType())));
+    tensormap_replace_attr(
+        loc, ctx, rewriter, NVVM::TensormapField::INTERLEAVE_LAYOUT, descAddr,
+        NVVM::TensormapInterleaveLayoutAttr::get(
+            ctx, static_cast<NVVM::TensormapInterleaveLayout>(
+                     op.getInterleaveLayout())));
+    tensormap_replace_attr(
+        loc, ctx, rewriter, NVVM::TensormapField::SWIZZLE_MODE, descAddr,
+        NVVM::TensormapSwizzleModeAttr::get(
+            ctx, static_cast<NVVM::TensormapSwizzleMode>(op.getSwizzleMode())));
+    tensormap_replace_attr(
+        loc, ctx, rewriter, NVVM::TensormapField::FILL_MODE, descAddr,
+        NVVM::TensormapFillModeAttr::get(
+            ctx, static_cast<NVVM::TensormapFillMode>(op.getFillMode())));
     rewriter.setInsertionPointToStart(continuationBlock);
     // Make thread zero's field updates visible to the collective copy.
     LLVM::NVIDIA::createSyncWarp(loc, rewriter);

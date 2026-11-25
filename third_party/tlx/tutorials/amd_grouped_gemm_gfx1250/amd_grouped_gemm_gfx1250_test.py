@@ -20,7 +20,7 @@ import torch
 
 import triton
 import triton.language as tl
-from triton._internal_testing import is_hip_gfx1250
+from triton._internal_testing import is_hip_cdna5
 from triton.tlx.ops.kernels.grouped_gemm.gfx1250 import (
     XCD_REMAP_MODES,
     grouped_gemm_enable_wmma_queuing,
@@ -886,7 +886,7 @@ def test_grouped_gemm_tdm_cross_tile_prefetch_compiles_gfx1250(XCD_REMAP_MODE, B
         assert last_dot < late_barrier < late_c_desc < closing_barrier
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
 def test_grouped_gemm_phase0_ragged_gfx1250():
     device = triton.runtime.driver.active.get_active_torch_device()
     torch.manual_seed(0)
@@ -906,7 +906,7 @@ def test_grouped_gemm_phase0_ragged_gfx1250():
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
 @pytest.mark.parametrize("BLOCK_SIZE,TDM_PIPELINE_DEPTH,K", [(128, 2, 512), (128, 3, 512), (128, 4, 512), (256, 2, 256),
                                                              (256, 2, 384), (256, 2, 512)])
 def test_grouped_gemm_tdm_packed_ragged_m_gfx1250(BLOCK_SIZE, TDM_PIPELINE_DEPTH, K):
@@ -939,7 +939,7 @@ def test_grouped_gemm_tdm_packed_ragged_m_gfx1250(BLOCK_SIZE, TDM_PIPELINE_DEPTH
         start += m
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
 def test_grouped_gemm_tdm_asymmetric_depth3_gfx1250():
     device = triton.runtime.driver.active.get_active_torch_device()
     torch.manual_seed(0)
@@ -968,7 +968,7 @@ def test_grouped_gemm_tdm_asymmetric_depth3_gfx1250():
         start += m
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
 @pytest.mark.parametrize("block_m,c_staging_mode,k", [(128, 1, 256), (128, 1, 512), (256, 1, 256), (256, 1, 512),
                                                       (256, 0, 256), (256, 0, 512), (256, 0, 4096)])
 @pytest.mark.parametrize("m_tiles", [[2, 0, 1, 0], [0, 1, 0, 0, 0, 2, 0, 1, 0]])
@@ -1004,7 +1004,7 @@ def test_grouped_gemm_tdm_cross_tile_prefetch_gfx1250(block_m, c_staging_mode, k
         start += m
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
 @pytest.mark.parametrize("XCD_REMAP_MODE", ["balanced", "chunked"])
 def test_grouped_gemm_tdm_xcd_remap_gfx1250(XCD_REMAP_MODE):
     device = triton.runtime.driver.active.get_active_torch_device()
@@ -1033,8 +1033,8 @@ def test_grouped_gemm_tdm_xcd_remap_gfx1250(XCD_REMAP_MODE):
 if __name__ == "__main__":
     import argparse
 
-    if not is_hip_gfx1250():
-        raise SystemExit("Requires gfx1250 hardware")
+    if not is_hip_cdna5():
+        raise SystemExit("Requires CDNA5 hardware")
 
     parser = argparse.ArgumentParser(description="Benchmark the TLX AMD f16 grouped GEMM TDM kernel")
     parser.add_argument("--kernel", choices=("packed", "list"), default="packed",

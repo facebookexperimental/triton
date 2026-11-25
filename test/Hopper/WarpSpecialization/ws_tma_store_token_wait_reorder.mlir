@@ -70,6 +70,69 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // -----
 
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#bar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+// CLC barrierful waits move to just before the wait_barrier guarding the store
+// that reuses their slot; the last two move after the last store.
+// CHECK-LABEL: clc_while_barrierful_rotation
+// CHECK: scf.while
+// CHECK: ttng.wait_barrier %[[F0:[a-z0-9_]+]], %
+// CHECK-NEXT: %[[T0:.*]] = ttng.async_tma_copy_local_to_global
+// CHECK-NEXT: ttng.wait_barrier %[[F1:[a-z0-9_]+]], %
+// CHECK-NEXT: %[[T1:.*]] = ttng.async_tma_copy_local_to_global
+// CHECK-NEXT: ttng.async_tma_store_token_wait %[[T0]] , %{{.*}}[%{{.*}}]
+// CHECK-NEXT: ttng.wait_barrier %[[F0]], %
+// CHECK-NEXT: ttng.wait_barrier %{{.*}}, %
+// CHECK-NEXT: %[[T2:.*]] = ttng.async_tma_copy_local_to_global
+// CHECK-NEXT: ttng.async_tma_store_token_wait %[[T1]] , %{{.*}}[%{{.*}}]
+// CHECK-NEXT: ttng.wait_barrier %[[F1]], %
+// CHECK-NEXT: %[[T3:.*]] = ttng.async_tma_copy_local_to_global
+// CHECK-NEXT: ttng.async_tma_store_token_wait %[[T2]] , %{{.*}}[%{{.*}}]
+// CHECK-NEXT: ttng.async_tma_store_token_wait %[[T3]] , %{{.*}}[%{{.*}}]
+// CHECK-NEXT: scf.yield
+  tt.func public @clc_while_barrierful_rotation(
+      %desc: !tt.tensordesc<128x64xf16, #shared>,
+      %bufs: !ttg.memdesc<2x128x64xf16, #shared, #smem, mutable>,
+      %fulls: !ttg.memdesc<2x1xi64, #bar, #smem, mutable>,
+      %empties: !ttg.memdesc<2x1xi64, #bar, #smem, mutable>,
+      %bcast: !ttg.memdesc<1xi64, #bar, #smem, mutable>, %i: i32, %ph: i32) {
+    %true = arith.constant true
+    %false = arith.constant false
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    scf.while (%valid = %true) : (i1) -> () {
+      scf.condition(%valid)
+    } do {
+      %buf0 = ttg.memdesc_index %bufs[%c0] : !ttg.memdesc<2x128x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      %buf1 = ttg.memdesc_index %bufs[%c1] : !ttg.memdesc<2x128x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      %full0 = ttg.memdesc_index %fulls[%c0] : !ttg.memdesc<2x1xi64, #bar, #smem, mutable> -> !ttg.memdesc<1xi64, #bar, #smem, mutable>
+      %full1 = ttg.memdesc_index %fulls[%c1] : !ttg.memdesc<2x1xi64, #bar, #smem, mutable> -> !ttg.memdesc<1xi64, #bar, #smem, mutable>
+      %empty0 = ttg.memdesc_index %empties[%c0] : !ttg.memdesc<2x1xi64, #bar, #smem, mutable> -> !ttg.memdesc<1xi64, #bar, #smem, mutable>
+      %empty1 = ttg.memdesc_index %empties[%c1] : !ttg.memdesc<2x1xi64, #bar, #smem, mutable> -> !ttg.memdesc<1xi64, #bar, #smem, mutable>
+      ttng.wait_barrier %full0, %ph : !ttg.memdesc<1xi64, #bar, #smem, mutable>
+      %t0 = ttng.async_tma_copy_local_to_global %desc[%i, %i] %buf0 : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
+      ttng.async_tma_store_token_wait %t0, %empty0[%true] {async_task_id = array<i32: 2>, can_rotate_by_buffer_count = 2 : i32} : !ttg.async.token, !ttg.memdesc<1xi64, #bar, #smem, mutable>
+      ttng.wait_barrier %full1, %ph : !ttg.memdesc<1xi64, #bar, #smem, mutable>
+      %t1 = ttng.async_tma_copy_local_to_global %desc[%i, %i] %buf1 : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
+      ttng.async_tma_store_token_wait %t1, %empty1[%true] {async_task_id = array<i32: 2>, can_rotate_by_buffer_count = 2 : i32} : !ttg.async.token, !ttg.memdesc<1xi64, #bar, #smem, mutable>
+      ttng.wait_barrier %full0, %ph : !ttg.memdesc<1xi64, #bar, #smem, mutable>
+      // Not the guard of the reused slot.
+      ttng.wait_barrier %bcast, %ph : !ttg.memdesc<1xi64, #bar, #smem, mutable>
+      %t2 = ttng.async_tma_copy_local_to_global %desc[%i, %i] %buf0 : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
+      ttng.async_tma_store_token_wait %t2, %empty0[%true] {async_task_id = array<i32: 2>, can_rotate_by_buffer_count = 2 : i32} : !ttg.async.token, !ttg.memdesc<1xi64, #bar, #smem, mutable>
+      ttng.wait_barrier %full1, %ph : !ttg.memdesc<1xi64, #bar, #smem, mutable>
+      %t3 = ttng.async_tma_copy_local_to_global %desc[%i, %i] %buf1 : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
+      ttng.async_tma_store_token_wait %t3, %empty1[%true] {async_task_id = array<i32: 2>, can_rotate_by_buffer_count = 2 : i32} : !ttg.async.token, !ttg.memdesc<1xi64, #bar, #smem, mutable>
+      scf.yield %false : i1
+    } attributes {ttg.clc_persistent}
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
 // Dynamic-persistent loops must not acquire a CLC queue drain even if stale

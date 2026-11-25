@@ -154,6 +154,52 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
 .ev-area { font-size: 11px; padding: 0 6px; border-radius: 3px; border: 1px solid var(--axis); color: var(--text-secondary); justify-self: start; }
 .ev-a-dispatch, .ev-a-harness { border-color: var(--warning); }
 .ev-a-kernel, .ev-a-shapes { border-color: var(--critical); color: var(--critical); }
+/* Episodes: one card per op·GPU·direction, holding the episodes that began on one night. */
+.ep-tiles { grid-template-columns: repeat(3, 1fr); }
+button.tile { display: block; width: 100%; text-align: left; cursor: pointer; }
+button.tile[aria-pressed="true"] { border-color: var(--series-1); box-shadow: inset 0 0 0 1px var(--series-1); }
+.ep-in input { font: inherit; color: var(--text-primary); background: var(--surface-1); border: 1px solid var(--axis);
+  border-radius: 6px; padding: 4px 8px; min-width: 180px; }
+.ep-sec { margin: 0 0 28px; }
+.ep-sec > h2 { font-size: 17px; }
+.ep-sec > p.sub { font-size: 12.5px; margin-bottom: 10px; }
+.ep-card { background: var(--surface-1); border: 1px solid var(--ring); border-radius: 8px; padding: 12px 14px; margin-bottom: 10px; }
+.ep-cardh { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.ep-cardh b { font-size: 14px; }
+.ep-ep { display: flex; gap: 14px; align-items: flex-start; border-top: 1px solid var(--grid); margin-top: 10px; padding-top: 10px; }
+.ep-card > .ep-ep:first-of-type { border-top: 0; margin-top: 0; padding-top: 0; }
+.ep-main { flex: 1; min-width: 0; }
+.ep-hd { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.ep-plot { width: 250px; flex: none; }
+.ep-plot .note { font-size: 11px; margin: 2px 0 0; }
+@media (max-width: 800px) { .ep-ep { flex-wrap: wrap; } .ep-plot { width: 100%; }
+  .ep-tiles { grid-template-columns: repeat(3, 1fr); gap: 6px; } .ep-tile { padding: 8px; }
+  .ep-tile .k { font-size: 11px; } .ep-tile .v { font-size: 22px; } }
+.ep-b { display: inline-flex; align-items: center; font-size: 11.5px; font-weight: 600; padding: 1px 8px; border-radius: 10px;
+  border: 1px solid transparent; white-space: nowrap; }
+.ep-b-reg { background: var(--critical); color: #fff; }
+.ep-b-lift { background: var(--good); color: #fff; }
+.ep-b-rec { background: var(--surface-1); color: var(--series-1); border-color: var(--series-1); }
+.ep-b-warn { background: var(--surface-1); color: var(--text-secondary); border-color: var(--warning); }
+.ep-b-unc { background: var(--surface-1); color: var(--text-secondary); border-color: var(--axis); border-style: dashed; }
+.ep-dim { color: var(--text-secondary); font-size: 12.5px; }
+.ep-tools { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 8px 0 4px; }
+.ep-det summary { cursor: pointer; color: var(--series-1); font-size: 12.5px; margin-top: 8px; }
+.ep-det table { font-size: 12.5px; }
+.ep-det th, .ep-det td { padding: 3px 8px 3px 0; white-space: nowrap; }
+.ep-det td.ep-case { white-space: normal; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+.ep-pager { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; font-size: 12.5px; color: var(--text-secondary); }
+.ep-pager button[disabled] { opacity: 0.45; cursor: default; }
+.ep-op-summary { display: flex; align-items: center; justify-content: space-between; gap: 14px; cursor: pointer; list-style: none; }
+.ep-op-summary::-webkit-details-marker { display: none; }
+.ep-op-summary > div:first-child { min-width: 0; }
+.ep-expand { color: var(--series-1); font-size: 12px; }
+.ep-expand::before { content: "▸ "; }
+.ep-card[open] > summary .ep-expand::before { content: "▾ "; }
+.ep-table-scroll { overflow-x: auto; }
+.ep-sort-button { border: 0; background: none; padding: 0; color: var(--text-secondary); font-weight: 600; }
+.ep-sort-button:focus-visible { outline: 2px solid var(--series-1); outline-offset: 2px; }
+@media (max-width: 800px) { .ep-op-summary { flex-wrap: wrap; } }
 </style>
 </head>
 <body>
@@ -166,6 +212,7 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     <div class="tablist" role="tablist" aria-label="Performance views">
       <button id="tab-overview" type="button" role="tab" aria-selected="true" aria-controls="overview" tabindex="0">Overview</button>
       <button id="tab-trending" type="button" role="tab" aria-selected="false" aria-controls="trending" tabindex="-1">Trending</button>
+      <button id="tab-episodes" type="button" role="tab" aria-selected="false" aria-controls="episodes" tabindex="-1">Episodes</button>
     </div>
     <button id="theme" type="button">Toggle theme</button>
   </div>
@@ -258,6 +305,30 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
   </details>
   </div>
   </section>
+
+  <section id="episodes" role="tabpanel" aria-labelledby="tab-episodes" tabindex="0" hidden>
+  <p class="sub">Sustained movements of a case against its own baseline, across every GPU and op.</p>
+  <div class="banner" id="ep-banner"></div>
+  <div id="ep-content">
+  <div class="row filterbar" role="group" aria-label="Episode filters">
+    <label class="ctl">Nights <select id="ep-range"><option value="7">Last 7</option><option value="14">Last 14</option>
+      <option value="30" selected>Last 30</option><option value="60">Last 60</option></select></label>
+    <label class="ctl">GPU <select id="ep-gpu"></select></label>
+    <label class="ctl">Op <select id="ep-op"></select></label>
+    <label class="ctl">Direction <select id="ep-dir"><option value="all">fwd + bwd</option><option value="fwd">fwd</option>
+      <option value="bwd">bwd</option></select></label>
+    <label class="ctl">Dtype <select id="ep-dtype"></select></label>
+    <label class="ctl">Sort <select id="ep-sort"><option value="date">onset date</option><option value="mag">magnitude</option>
+      <option value="dur">duration</option></select></label>
+    <label class="ctl ep-in">Search <input id="ep-q" type="search" placeholder="op, GPU, input"></label>
+    <span class="spacer"></span>
+    <button id="ep-clear" type="button">Clear</button>
+  </div>
+
+  <div class="tiles ep-tiles" id="ep-tiles"></div>
+  <div id="ep-sections"></div>
+  </div>
+  </section>
 </main>
 </div>
 <script>
@@ -302,7 +373,9 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     error: {label: "ERROR", icon: "✕", color: "var(--critical)"},
   };
   const state = {tab: "overview", platform: PLATFORMS.map(([k]) => k).find((k) => DATA.platforms[k]) || Object.keys(DATA.platforms)[0], op: "all", dir: "all", dtype: "all", inputs: {}, group: "op", range: 30, trendScroll: null, hidden: new Set(), statuses: new Set(Object.keys(STATUS)),
-                 sort: {key: null, dir: 1}, sortSum: {key: null, dir: 1}, rows: 50, ev: null, casesSort: "r"};
+                 sort: {key: null, dir: 1}, sortSum: {key: null, dir: 1}, rows: 50, ev: null, casesSort: "r",
+                 ep: {range: 30, gpu: "all", op: "all", dir: "all", dtype: "all", q: "", sort: "date", sec: null,
+                      page: {reg: 1, lift: 1, rec: 1}, open: new Set(), det: {}, cards: {}}};
   const $ = (id) => document.getElementById(id);
   const el = (tag, attrs = {}, text) => {
     const n = document.createElementNS(tag === "svg" || attrs.svg ? "http://www.w3.org/2000/svg" : "http://www.w3.org/1999/xhtml", tag);
@@ -940,9 +1013,453 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     }
   }
 
+  // ---- episodes: sustained movements of a case against its own frozen baseline, across every GPU and op. Rows
+  // carry their own baseline, confirmation, recovery and last comparable measurement; night cells are read only
+  // for the mini plot and to tell a noisy latest measurement from a clean one.
+  const EP_POLICY = {threshold: 0.1, recovery: 0.05, confirmation: 2, ...((RAW && RAW.episode_policy) || {})};
+  const EP_SECTIONS = [["reg", "In regression"], ["lift", "Lifts"], ["rec", "Recovered episodes"]];
+  const EP_PCT = (v) => (v * 100).toFixed(0) + "%";
+  const EP_SECT_SUB = {
+    reg: "At least one affected input has not recovered. Missing data or a changed measurement context leaves it unresolved. Open episodes stay visible outside the history window.",
+    lift: "A sustained higher level. Pending candidates and lifts no longer measured are labeled separately.",
+    rec: "Every affected input recovered against its pre-regression baseline. Expand for individual recovery dates.",
+  };
+  const EP_CARDS = 8, EP_ROWS = [25, 50], EP_SORTS = ["date", "mag", "dur"];
+  const EP_CLEAN = {o: 1, p: 1};
+  const epIsClean = (c) => !!c && !!EP_CLEAN[c[0]] && Number.isFinite(c[2]) && c[2] > 0;
+  const epSet = (v) => v !== null && v !== undefined;
+  const epDate = (d) => (d ? `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6)}` : "–");
+  const epPct = (v) => (epSet(v) ? `${v >= 0 ? "+" : "−"}${Math.abs(v * 100).toFixed(1)}%` : "–");
+  const epPlatName = (k) => { const m = PLATFORMS.find(([p]) => p === k); return m ? m[1] : k.toUpperCase(); };
+  const epAny = () => Object.values(DATA.platforms).some((p) => Array.isArray(p.episodes));
+  function epCell(pd, op, ni, i) {
+    if (ni < 0 || !epSet(i)) return undefined;
+    const night = pd.nights[i], row = night && night.ops[op];
+    return row ? row[ni] : undefined;
+  }
+
+  // A recovery, a measurement that no longer compares, an unconfirmed onset, or a confirmed current measurement.
+  function epRowState(kind, r) {
+    if (r.context_changed) return ["warn", "unresolved · context changed"];
+    if (epSet(r.recovered)) return ["rec", `recovered ${epDate(r.recoveredDate)}`];
+    if (kind === "lift" && epSet(r.end)) return ["unc", `ended ${epDate(r.endDate)}`];
+    if (r.noisy) return ["warn", "latest measurement noisy"];
+    if (r.gone) return ["unc", "unavailable"];
+    if (r.stale) return ["unc", `stale · last ${epDate(r.lastDate)}`];
+    if (!epSet(r.confirmed)) return ["unc", "pending confirmation"];
+    if (kind === "lift") return r.ratio < 1 + EP_POLICY.threshold
+      ? ["unc", "latest below lift level · awaiting confirmation"] : ["lift", "above prior baseline"];
+    if (r.ratio >= 1 - EP_POLICY.recovery) return ["unc", "pending recovery confirmation"];
+    return ["reg", "still low"];
+  }
+
+  // One group per episode: the inputs that began moving on the exact same night.
+  function epBuild() {
+    const groups = [];
+    for (const [pk, pd] of Object.entries(DATA.platforms)) {
+      if (state.ep.gpu !== "all" && pk !== state.ep.gpu) continue;
+      const nights = pd.nights || [], eps = pd.episodes || [];
+      if (!nights.length || !eps.length) continue;
+      const lastIdx = nights.length - 1, from = Math.max(0, nights.length - state.ep.range);
+      const dateAt = (i) => (epSet(i) && nights[i] ? nights[i].date : null);
+      for (const e of eps) {
+        if (state.ep.op !== "all" && e.op !== state.ep.op) continue;
+        if (state.ep.dir !== "all" && e.direction !== state.ep.dir) continue;
+        const cat = (pd.episode_cases || {})[e.op] || [], rows = [];
+        for (const r of e.rows || []) {
+          const c = cat[r.case];
+          if (!c || (state.ep.dtype !== "all" && c[2] !== state.ep.dtype)) continue;
+          const ni = r.case;
+          const cell = epCell(pd, e.op, ni, lastIdx);
+          const label = Object.entries(c[0] || {}).map(([k, v]) => `${k}=${v}`).join(" ");
+          const row = {...r, ni, key: c[3], label, low: label.toLowerCase(), dtype: c[2],
+            baseDate: dateAt(r.base), lastDate: dateAt(r.last), recoveredDate: dateAt(r.recovered),
+            endDate: dateAt(r.end), stale: r.last < lastIdx, gone: !cell || cell[0] === "e", noisy: !!cell && cell[0] === "n",
+            ratio: r.baseline > 0 && r.value > 0 ? r.value / r.baseline : null,
+            ext: e.kind === "lift" ? r.peak : r.worst};
+          [row.cls, row.st] = epRowState(e.kind, row);
+          rows.push(row);
+        }
+        if (!rows.length) continue;
+        const open = rows.filter((r) => !epSet(r.recovered));
+        const recovered = e.kind === "regression" && !open.length;
+        // An open regression stays listed however old its onset; anything resolved is scoped to the window.
+        if (e.start < from && !(e.kind === "regression" && !recovered)) continue;
+        const closed = e.kind === "regression" ? recovered : rows.every((r) => epSet(r.end));
+        const endIdx = !closed ? lastIdx
+          : Math.max(...rows.map((r) => (e.kind === "regression" ? r.recovered : r.end)));
+        const mag = e.kind === "lift"
+          ? Math.max(0, ...rows.map((r) => (typeof r.peak === "number" ? r.peak : 1) - 1))
+          : Math.max(0, ...rows.map((r) => 1 - (typeof r.worst === "number" ? r.worst : 1)));
+        groups.push({key: `${pk}|${e.op}|${e.direction}|${e.kind}|${e.start}`, card: `${pk}|${e.op}|${e.direction}`,
+          platform: pk, op: e.op, dir: e.direction, kind: e.kind,
+          sect: e.kind === "lift" ? "lift" : recovered ? "rec" : "reg",
+          start: e.start, startDate: dateAt(e.start), endDate: closed ? dateAt(endIdx) : null, closed,
+          lastIdx, plotEnd: closed ? Math.max(...rows.map((r) => r.last)) : lastIdx, from, rows, mag,
+          dur: Math.max(0, endIdx - e.start), older: e.start < from,
+          nRec: rows.length - open.length, nCtx: open.filter((r) => r.context_changed).length,
+          nStale: open.filter((r) => !r.context_changed && !r.noisy && (r.stale || r.gone)).length,
+          nNoisy: open.filter((r) => !r.context_changed && r.noisy).length,
+          nPend: rows.filter((r) => !epSet(r.confirmed)).length,
+          current: rows.every((r) => r.last === lastIdx)});
+      }
+    }
+    return groups;
+  }
+
+  // The group list only changes with the window, direction and dtype; search, sort and paging reuse it.
+  let epCache = null;
+  function epAll() {
+    const k = `${state.ep.range}|${state.ep.gpu}|${state.ep.op}|${state.ep.dir}|${state.ep.dtype}`;
+    if (!epCache || epCache.k !== k) epCache = {k, groups: epBuild()};
+    return epCache.groups;
+  }
+  function epMatch(g, q) {
+    if (!q) return true;
+    if (`${g.op} ${g.platform} ${epPlatName(g.platform)} ${g.dir} ${g.kind} ${g.startDate}`.toLowerCase().includes(q)) return true;
+    return g.rows.some((r) => r.low.includes(q) || r.dtype.toLowerCase().includes(q));
+  }
+  const EP_ORDER = {date: (g) => g.startDate, mag: (g) => g.mag, dur: (g) => g.dur};
+  const epCmp = (a, b) => {
+    const f = EP_ORDER[state.ep.sort] || EP_ORDER.date, va = f(a), vb = f(b);
+    return (va < vb ? 1 : va > vb ? -1 : 0) || a.card.localeCompare(b.card) || b.start - a.start;
+  };
+
+  const epBadge = (cls, text) => el("span", {class: `ep-b ep-b-${cls}`}, text);
+  function epChips(g) {
+    const out = [], n = g.rows.length, plural = n === 1 ? "" : "s";
+    if (g.kind === "regression") {
+      if (g.sect === "rec") out.push(["rec", `all ${n} input${plural} recovered`]);
+      else {
+        out.push(["reg", `${n - g.nRec} of ${n} input${plural} not recovered`]);
+        if (g.nRec) out.push(["rec", `${g.nRec} recovered`]);
+      }
+    } else {
+      out.push(g.nPend ? ["unc", "lift candidate"] : ["lift", g.closed ? `ended ${epDate(g.endDate)}`
+        : g.current && g.rows.every((r) => r.ratio >= 1 + EP_POLICY.threshold) ? "above prior baseline through latest night" : "historical confirmed lift"]);
+      if (!g.closed && g.current && g.rows.some((r) => r.ratio < 1 + EP_POLICY.threshold))
+        out.push(["unc", "latest downturn · awaiting confirmation"]);
+    }
+    if (g.nCtx) out.push(["warn", `${g.nCtx} unresolved · context changed`]);
+    if (g.nStale) out.push(["unc", `${g.nStale} not measured on the latest night`]);
+    if (g.nNoisy) out.push(["warn", `${g.nNoisy} latest measurement noisy`]);
+    if (g.nPend) out.push(["unc", g.nPend === n ? `pending confirmation · needs ${EP_POLICY.confirmation} clean nights`
+      : `${g.nPend} pending confirmation`]);
+    return out;
+  }
+
+  // Mini plot: this group's own affected inputs, each divided by its own baseline, one geometric mean per night.
+  // A night where any of them has no clean measurement is a gap, never a carried-forward or substituted value.
+  function epPlot(g) {
+    const box = el("div", {class: "ep-plot"});
+    const pd = DATA.platforms[g.platform], vals = [];
+    const i0 = Math.max(Math.min(g.from, Math.max(0, g.start - 1)), ...g.rows.map((r) => r.base));
+    for (let i = i0; i <= g.plotEnd; i++) {
+      let sum = 0, n = 0, full = true;
+      for (const r of g.rows) {
+        const cell = epCell(pd, g.op, r.ni, i);
+        if (i > r.last || !epIsClean(cell) || !(r.baseline > 0)) { full = false; break; }
+        sum += Math.log(cell[2] / r.baseline); n++;
+      }
+      vals.push(full && n ? Math.exp(sum / n) : null);
+    }
+    const seen = vals.filter((v) => v !== null), n = g.rows.length;
+    const note = (t) => box.append(el("p", {class: "note"}, t));
+    if (!seen.length) {
+      note(`No night in this window measured all ${n} affected input${n === 1 ? "" : "s"} together.`);
+      return box;
+    }
+    const W = 250, Hh = 62, m = {l: 4, r: 4, t: 8, b: 12};
+    const band = g.kind === "lift" ? 1 + EP_POLICY.threshold : 1 - EP_POLICY.threshold;
+    let lo = Math.min(1, band, ...seen), hi = Math.max(1, band, ...seen);
+    const pad = (hi - lo) * 0.12 || 0.05;
+    lo -= pad; hi += pad;
+    const x = (i) => m.l + (W - m.l - m.r) * (vals.length === 1 ? 0.5 : i / (vals.length - 1));
+    const y = (v) => m.t + (Hh - m.t - m.b) * (hi - v) / (hi - lo);
+    const col = g.sect === "reg" ? "var(--critical)" : g.sect === "lift" ? "var(--good)" : "var(--series-1)";
+    const last = vals.reduce((k, v, i) => (v === null ? k : i), -1);
+    const svg = s("svg", {viewBox: `0 0 ${W} ${Hh}`, role: "img", "aria-label":
+      `${g.op} ${g.dir} on ${epPlatName(g.platform)}: throughput against baseline over ${seen.length} fully measured `
+      + `night(s) from ${epDate(vals.length ? (pd.nights[i0] || {}).date : null)}; latest ${epPct(seen[seen.length - 1] - 1)}`});
+    svg.append(s("line", {x1: m.l, x2: W - m.r, y1: y(1), y2: y(1), stroke: "var(--axis)", "stroke-width": 1, "stroke-dasharray": "4 3"}));
+    svg.append(s("line", {x1: m.l, x2: W - m.r, y1: y(band), y2: y(band), stroke: col, "stroke-width": 1,
+                          "stroke-dasharray": "3 3", opacity: 0.6}));
+    const ox = x(g.start - i0);
+    svg.append(s("line", {x1: ox, x2: ox, y1: m.t, y2: Hh - m.b, stroke: "var(--muted)", "stroke-width": 1,
+                          "stroke-dasharray": "2 2"}));
+    let run = [];
+    const flush = () => {
+      if (run.length > 1)
+        svg.append(s("polyline", {points: run.map(([i, v]) => `${x(i)},${y(v)}`).join(" "), fill: "none", stroke: col,
+                                  "stroke-width": 1.6, "stroke-linejoin": "round"}));
+      else if (run.length === 1) svg.append(s("circle", {cx: x(run[0][0]), cy: y(run[0][1]), r: 1.8, fill: col}));
+      run = [];
+    };
+    vals.forEach((v, i) => (v === null ? flush() : run.push([i, v])));
+    flush();
+    svg.append(s("circle", {cx: x(last), cy: y(vals[last]), r: 2.6, fill: col, stroke: "var(--surface-1)", "stroke-width": 1}));
+    const tick = (xx, anchor, text) => {
+      const t = el("text", {svg: 1, x: xx, y: Hh - 2, "text-anchor": anchor}, text);
+      t.setAttribute("style", "font-size:9px");
+      svg.append(t);
+    };
+    tick(m.l, "start", fmtDate((pd.nights[i0] || {}).date || ""));
+    if (vals.length > 1) tick(W - m.r, "end", fmtDate((pd.nights[g.plotEnd] || {}).date || ""));
+    box.append(svg);
+    note(`${seen.length} of ${vals.length} nights compare all ${n} input${n === 1 ? "" : "s"} · `
+      + `last joint point ${epDate(pd.nights[i0 + last].date)}: ${epPct(seen[seen.length - 1] - 1)}`);
+    return box;
+  }
+
+  // Inputs, only once the group is expanded: searchable, sortable, paged at 25 or 50 rows.
+  const EP_COLS = [["label", "input"], ["dtype", "dtype"], ["baseline", "baseline TF/s", 1], ["value", "last TF/s", 1],
+                   ["lastDate", "last measured"], ["ratio", "vs baseline", 1], ["ext", "worst / peak", 1], ["st", "status"]];
+  function epDetail(g, host) {
+    const d = (state.ep.det[g.key] ||= {q: "", sort: {key: "ext", dir: g.kind === "lift" ? -1 : 1}, rows: EP_ROWS[0], page: 1});
+    host.textContent = "";
+    const tools = el("div", {class: "ep-tools"});
+    const lab = el("label", {class: "ctl ep-in"}, "Filter ");
+    const q = el("input", {type: "search", placeholder: "input or dtype", "aria-label": "Filter inputs"});
+    q.value = d.q;
+    lab.append(q);
+    const rows = el("select", {"aria-label": "Rows per page"});
+    for (const n of EP_ROWS) rows.append(el("option", {value: n}, `${n} rows`));
+    rows.value = String(d.rows);
+    tools.append(lab, rows);
+    const body = el("div");
+    const draw = () => {
+      body.textContent = "";
+      const needle = d.q.trim().toLowerCase();
+      let list = needle ? g.rows.filter((r) => r.low.includes(needle) || r.dtype.toLowerCase().includes(needle)) : g.rows;
+      const {key, dir} = d.sort;
+      list = [...list].sort((a, b) => ((a[key] ?? -Infinity) > (b[key] ?? -Infinity) ? 1 : -1) * dir);
+      const page = epPager(list.length, d.rows, d.page, (p) => { d.page = p; draw(); },
+                           `input${list.length === 1 ? "" : "s"}`, `input-${g.key}`);
+      d.page = page.page;
+      const tb = el("table");
+      const hr = el("tr");
+      for (const [k, name, num] of EP_COLS) {
+        const th = el("th", num ? {class: "num"} : {});
+        th.setAttribute("aria-sort", key === k ? (dir > 0 ? "ascending" : "descending") : "none");
+        const button = el("button", {type: "button", class: "ep-sort-button"}, name + (key === k ? (dir > 0 ? " ▲" : " ▼") : ""));
+        button.onclick = () => {
+          const focused = document.activeElement === button;
+          d.sort = {key: k, dir: d.sort.key === k ? -d.sort.dir : 1}; d.page = 1; draw();
+          if (focused) body.querySelectorAll(".ep-sort-button")[EP_COLS.findIndex(([column]) => column === k)]?.focus();
+        };
+        th.append(button);
+        hr.append(th);
+      }
+      tb.append(hr);
+      for (const r of list.slice(page.from, page.from + d.rows)) {
+        const tr = el("tr");
+        tr.append(el("td", {class: "ep-case", title: r.key}, r.label), el("td", {}, r.dtype),
+                  el("td", {class: "num"}, fmtTf(r.baseline)), el("td", {class: "num"}, fmtTf(r.value)),
+                  el("td", {}, epDate(r.lastDate)));
+        const pct = el("td", {class: "num"}, epPct(epSet(r.ratio) ? r.ratio - 1 : null));
+        if (epSet(r.ratio)) pct.style.color = r.ratio >= 1 ? "var(--good-text)" : "var(--critical)";
+        const ext = el("td", {class: "num"}, epPct(typeof r.ext === "number" ? r.ext - 1 : null));
+        const st = el("td");
+        st.append(epBadge(r.cls, r.st));
+        tr.append(pct, ext, st);
+        tb.append(tr);
+      }
+      const scroll = el("div", {class: "ep-table-scroll"});
+      scroll.append(tb);
+      body.append(scroll);
+      if (!list.length) body.append(el("p", {class: "note"}, "No input matches this filter."));
+      body.append(page.bar);
+      body.append(el("p", {class: "note"},
+        "Each input's baseline is its own normal level, a median of up to three clean samples and then frozen, not "
+        + 'the throughput of any one night. "Last TF/s" is the last measurement that still compares with that '
+        + "baseline, which is not always the latest night."));
+    };
+    q.oninput = () => { d.q = q.value; d.page = 1; draw(); };
+    rows.onchange = () => { d.rows = Number(rows.value); d.page = 1; draw(); };
+    host.append(tools, body);
+    draw();
+  }
+
+  // Fixed pages for both cards and input rows, never a list that grows as it is clicked.
+  function epPager(total, per, page, go, unit, identity = unit) {
+    const pages = Math.max(1, Math.ceil(total / per));
+    page = Math.min(Math.max(1, page), pages);
+    const pagerId = `ep-page-${encodeURIComponent(identity)}`;
+    const bar = el("div", {class: "ep-pager", id: pagerId});
+    if (pages > 1) {
+      const btn = (text, to, off) => {
+        const b = el("button", {type: "button", "data-page-action": text}, text);
+        b.disabled = off;
+        b.onclick = () => {
+          const focused = document.activeElement === b;
+          go(to);
+          if (focused) {
+            const replacement = document.getElementById(pagerId);
+            if (replacement) (replacement.querySelector(`[data-page-action="${text}"]:not(:disabled)`) || replacement.querySelector("button:not(:disabled)"))?.focus();
+          }
+        };
+        return b;
+      };
+      bar.append(btn("Previous", page - 1, page === 1), el("span", {}, `Page ${page} of ${pages} · ${total} ${unit}`),
+                 btn("Next", page + 1, page === pages));
+    } else bar.append(el("span", {}, `${total} ${unit}`));
+    return {bar, page, from: (page - 1) * per};
+  }
+
+  function epGroupNode(g) {
+    const wrap = el("div", {class: "ep-ep"}), main = el("div", {class: "ep-main"}), hd = el("div", {class: "ep-hd"});
+    hd.append(epBadge(g.sect, g.sect === "rec" ? "recovered" : g.sect === "lift" ? "lift" : "in regression"),
+              el("b", {}, `onset ${epDate(g.startDate)}`));
+    if (g.older) hd.append(el("span", {class: "ep-dim"}, "onset before this window"));
+    hd.append(el("span", {class: "ep-dim"},
+      `${g.kind === "lift" ? "peak" : "worst"} ${epPct(g.kind === "lift" ? g.mag : -g.mag)} · `
+      + (g.dur ? `${g.dur} night${g.dur === 1 ? "" : "s"}${g.closed ? "" : " and counting"}` : "first night")));
+    if (g.closed && g.endDate) hd.append(el("span", {class: "ep-dim"}, `${g.kind === "regression" ? "recovered" : "ended"} ${epDate(g.endDate)}`));
+    main.append(hd);
+    const evidence = el("div", {class: "ep-hd"});
+    const night = DATA.platforms[g.platform].events[g.start];
+    if (night && night.compare) evidence.append(el("a", {href: night.compare, target: "_blank", rel: "noopener"}, "Commit comparison"));
+    for (const date of [...new Set([g.startDate, ...g.rows.map((r) => r.lastDate)])])
+      evidence.append(el("a", {href: `${REPO}/releases/download/${DATA.tag}/${date}.${g.platform}.json`, target: "_blank", rel: "noopener"}, `${epDate(date)} results`));
+    main.append(evidence);
+    const chips = el("div", {class: "ep-hd", style: "margin-top:4px"});
+    for (const [cls, text] of epChips(g)) chips.append(epBadge(cls, text));
+    main.append(chips);
+    const det = el("details");
+    det.className = "ep-det";
+    const body = el("div");
+    det.append(el("summary", {}, `Inputs (${g.rows.length})`), body);
+    det.open = state.ep.open.has(g.key);
+    if (det.open) epDetail(g, body);
+    det.addEventListener("toggle", () => {
+      if (det.open) { state.ep.open.add(g.key); if (!body.childNodes.length) epDetail(g, body); }
+      else { state.ep.open.delete(g.key); body.textContent = ""; }
+    });
+    main.append(det);
+    wrap.append(main, epPlot(g));
+    return wrap;
+  }
+
+  function epSectionNode(k, title, groups) {
+    const sec = el("section", {class: "ep-sec", id: `ep-sec-${k}`});
+    const h = el("div", {class: "ep-cardh"});
+    h.append(el("h2", {}, title), el("span", {class: "ep-dim"},
+      `${groups.length} episode${groups.length === 1 ? "" : "s"}`));
+    sec.append(h, el("p", {class: "sub"}, EP_SECT_SUB[k]));
+    if (!groups.length) {
+      sec.append(el("p", {class: "note"}, "Nothing here under these filters."));
+      return sec;
+    }
+    const cards = new Map();
+    for (const g of [...groups].sort(epCmp)) {
+      if (!cards.has(g.card)) cards.set(g.card, []);
+      cards.get(g.card).push(g);
+    }
+    const names = [...cards.keys()];
+    const page = epPager(names.length, EP_CARDS, state.ep.page[k], (p) => { state.ep.page[k] = p; render(); },
+                         `op group${names.length === 1 ? "" : "s"}`, `op-${k}`);
+    state.ep.page[k] = page.page;
+    state.ep.cards ||= {};
+    for (const name of names.slice(page.from, page.from + EP_CARDS)) {
+      const [pk, op, dir] = name.split("|"), gs = cards.get(name);
+      const st = state.ep.cards[`${k}|${name}`] ||= {open: false, page: 1};
+      const box = el("details", {class: "ep-card"}), summary = el("summary", {class: "ep-op-summary"});
+      const left = el("div"), head = el("div", {class: "ep-cardh"});
+      head.append(el("b", {}, op), el("span", {class: "ev-pill"}, epPlatName(pk)), el("span", {class: "ev-pill"}, dir),
+                  el("span", {class: "ep-dim"}, `${gs.length} episode${gs.length === 1 ? "" : "s"}`));
+      const affected = new Set(gs.flatMap((g) => g.rows.map((r) => r.case))).size;
+      const total = DATA.platforms[pk].episode_cases[op].filter((c) => c[1] === dir && (state.ep.dtype === "all" || c[2] === state.ep.dtype)).length;
+      left.append(head, el("div", {class: "ep-dim"}, `${affected} / ${total} catalogued inputs · shown onset ${epDate(gs[0].startDate)}`));
+      const badges = el("div", {class: "ep-hd"});
+      badges.append(epBadge(k, `${k === "lift" ? "peak input" : "worst input"} ${epPct(k === "lift" ? gs[0].mag : -gs[0].mag)}`));
+      for (const [cls, text] of epChips(gs[0])) badges.append(epBadge(cls, text));
+      left.append(badges, el("span", {class: "ep-expand"}, "Episodes"));
+      summary.append(left, epPlot(gs[0]));
+      const body = el("div", {class: "ep-op-body"});
+      const draw = () => {
+        body.textContent = "";
+        const paging = epPager(gs.length, EP_CARDS, st.page, (p) => { st.page = p; draw(); }, "episodes", `cohort-${k}-${name}`);
+        st.page = paging.page;
+        for (const g of gs.slice(paging.from, paging.from + EP_CARDS)) body.append(epGroupNode(g));
+        body.append(paging.bar);
+      };
+      box.append(summary, body);
+      box.open = st.open;
+      if (box.open) draw();
+      box.addEventListener("toggle", () => {
+        st.open = box.open;
+        if (box.open) { if (!body.childNodes.length) draw(); }
+        else body.textContent = "";
+      });
+      sec.append(box);
+    }
+    sec.append(page.bar);
+    return sec;
+  }
+
+  function epTiles(shown) {
+    const t = $("ep-tiles");
+    t.textContent = "";
+    for (const [k, title] of EP_SECTIONS) {
+      const gs = shown.filter((g) => g.sect === k);
+      const inputs = new Set(gs.flatMap((g) => g.rows.map((r) => `${g.platform}|${g.op}|${r.case}`))).size;
+      const b = el("button", {type: "button", class: "tile ep-tile", "aria-pressed": String(state.ep.sec === k)});
+      b.append(el("div", {class: "k"}, title), el("div", {class: "v"}, String(gs.length)),
+               el("div", {class: "k"}, `${inputs} input${inputs === 1 ? "" : "s"} · `
+                 + `${new Set(gs.map((g) => g.op)).size} op(s) · ${new Set(gs.map((g) => g.platform)).size} GPU(s)`));
+      b.onclick = () => { state.ep.sec = state.ep.sec === k ? null : k; render(); };
+      t.append(b);
+    }
+  }
+
+  function epControls() {
+    const ps = Object.keys(DATA.platforms);
+    const names = [...new Set(ps.flatMap((p) => Object.keys(DATA.platforms[p].episode_cases || {})))].sort();
+    for (const [id, value, options, label] of [["ep-gpu", state.ep.gpu, ps, "All GPUs"], ["ep-op", state.ep.op, names, "All ops"]]) {
+      const control = $(id);
+      control.textContent = "";
+      control.append(el("option", {value: "all"}, label));
+      for (const option of options) control.append(el("option", {value: option}, id === "ep-gpu" ? epPlatName(option) : option));
+      control.value = value;
+    }
+    const dts = [...new Set(Object.values(DATA.platforms).flatMap((p) => Object.values(p.episode_cases || {})
+      .flatMap((cs) => cs.map((c) => c[2]))))].sort();
+    if (state.ep.dtype !== "all" && !dts.includes(state.ep.dtype)) state.ep.dtype = "all";
+    const ds = $("ep-dtype");
+    ds.textContent = "";
+    ds.append(el("option", {value: "all"}, "all"));
+    for (const d of dts) ds.append(el("option", {value: d}, d));
+    ds.value = state.ep.dtype;
+    $("ep-range").value = String(state.ep.range);
+    $("ep-dir").value = state.ep.dir;
+    $("ep-sort").value = state.ep.sort;
+    const q = $("ep-q");
+    if (q.value !== state.ep.q) q.value = state.ep.q;  // never move the caret while the reader is typing
+  }
+
+  function episodes() {
+    const bn = $("ep-banner"), host = $("ep-sections");
+    bn.textContent = "";
+    $("ep-content").hidden = !epAny();
+    if (!epAny()) { bn.textContent = "This build carries no episode data."; return; }
+    epControls();
+    const q = state.ep.q.trim().toLowerCase();
+    const shown = epAll().filter((g) => epMatch(g, q));
+    bn.textContent = `Major change ≥${EP_PCT(EP_POLICY.threshold)}; recovery ≥${EP_PCT(1 - EP_POLICY.recovery)} of the pre-regression baseline. `
+      + `Both require ${EP_POLICY.confirmation} consecutive clean measurements. Missing or noisy data cannot confirm recovery. Only retained history is shown.`;
+    epTiles(shown);
+    host.textContent = "";
+    for (const [k, title] of EP_SECTIONS) {
+      if (state.ep.sec && state.ep.sec !== k) continue;
+      host.append(epSectionNode(k, title, shown.filter((g) => g.sect === k)));
+    }
+  }
+
   // The view lives in the URL hash, so a link reopens exactly what the sender saw.
+  const TABS = ["overview", "trending", "episodes"];
   const params = new URLSearchParams(location.hash.slice(1));
-  if (params.has("tab")) state.tab = params.get("tab") === "trending" ? "trending" : "overview";
+  if (params.has("tab")) state.tab = TABS.includes(params.get("tab")) ? params.get("tab") : "overview";
+  else if ([...params.keys()].some((k) => k.startsWith("ep."))) state.tab = "episodes";
   else if (params.has("platform") || params.has("op") || params.has("ev")) state.tab = "trending";
   if (DATA.platforms[params.get("platform")]) state.platform = params.get("platform");
   if (state.platform && params.get("op") && DATA.platforms[state.platform].latest[params.get("op")]) state.op = params.get("op");
@@ -953,6 +1470,15 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
   state.group = params.get("group") || (state.op === "all" ? "op" : "none");  // controls() falls back if not offered
   for (const [k, v] of params) if (k.startsWith("in.") && state.op !== "all") state.inputs[k.slice(3)] = v;  // controls() drops a dtype this platform lacks
   if (["light", "dark"].includes(params.get("theme"))) document.documentElement.dataset.theme = params.get("theme");
+  // Episodes reads its own ep.* parameters, each validated against what the page offers.
+  if (["7", "14", "30", "60"].includes(params.get("ep.nights"))) state.ep.range = Number(params.get("ep.nights"));
+  if (DATA.platforms[params.get("ep.gpu")]) state.ep.gpu = params.get("ep.gpu");
+  if (Object.values(DATA.platforms).some((p) => (p.episode_cases || {})[params.get("ep.op")])) state.ep.op = params.get("ep.op");
+  if (["fwd", "bwd"].includes(params.get("ep.dir"))) state.ep.dir = params.get("ep.dir");
+  if (params.get("ep.dtype")) state.ep.dtype = params.get("ep.dtype");  // epControls() drops a dtype with no episodes
+  if (params.get("ep.q")) state.ep.q = params.get("ep.q");
+  if (EP_SORTS.includes(params.get("ep.sort"))) state.ep.sort = params.get("ep.sort");
+  if (EP_SECTIONS.some(([k]) => k === params.get("ep.sec"))) state.ep.sec = params.get("ep.sec");
   $("range").value = String(state.range);
   const saveHash = () => {
     const p = new URLSearchParams();
@@ -965,6 +1491,14 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     if (state.dtype !== "all") p.set("dtype", state.dtype);
     if (state.group !== (state.op === "all" ? "op" : "none")) p.set("group", state.group);
     if (state.op !== "all") for (const [k, v] of Object.entries(state.inputs)) p.set(`in.${k}`, v);
+    if (state.ep.range !== 30) p.set("ep.nights", state.ep.range);
+    if (state.ep.gpu !== "all") p.set("ep.gpu", state.ep.gpu);
+    if (state.ep.op !== "all") p.set("ep.op", state.ep.op);
+    if (state.ep.dir !== "all") p.set("ep.dir", state.ep.dir);
+    if (state.ep.dtype !== "all") p.set("ep.dtype", state.ep.dtype);
+    if (state.ep.q.trim()) p.set("ep.q", state.ep.q.trim());
+    if (state.ep.sort !== "date") p.set("ep.sort", state.ep.sort);
+    if (state.ep.sec) p.set("ep.sec", state.ep.sec);
     if (document.documentElement.dataset.theme) p.set("theme", document.documentElement.dataset.theme);
     history.replaceState(null, "", p.toString() ? "#" + p : location.pathname);
   };
@@ -977,9 +1511,10 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     const kv = $("ver-kv");
     kv.textContent = "";
     const rows = [
-      ["fbtriton nightly", p.version],
+      ["Version", p.version],
       ["triton.__version__", p.triton],
       ["Commit", null],
+      ["TLX tests on commit", p.ci ? undefined : "not recorded"],
       ["PyTorch", p.torch],
       ["GPU runtime", p.runtime || "–"],
       ["Driver", p.driver || "–"],
@@ -995,6 +1530,9 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
         const a = el("a", {href: `${REPO}/commit/${p.sha}`});
         a.append(el("code", {}, p.sha.slice(0, 12)));
         dd.append(a);
+      } else if (v === undefined) {
+        dd.append(p.ci.run ? el("a", {href: p.ci.run, target: "_blank", rel: "noopener"}, p.ci.tlx_test) : p.ci.tlx_test);
+        if (p.ci.tlx_test !== "success") dd.style.color = "var(--critical)";
       } else dd.textContent = v;
       kv.append(dd);
     }
@@ -1276,7 +1814,6 @@ python .github/scripts/tlx_ops_bench_dashboard.py render site --from rel   # pre
     td.append(d);
   }
 
-  const TABS = ["overview", "trending"];
   function render() {
     for (const name of TABS) {
       const selected = state.tab === name, tab = $(`tab-${name}`);
@@ -1289,7 +1826,7 @@ python .github/scripts/tlx_ops_bench_dashboard.py render site --from rel   # pre
       if (state.platform) {
         controls(); banner(); inputs(); tiles(); trend(); evCard(); dist(); cases(); table(); versions(); howto();
       } else $("banner").textContent = "No nightly results published yet.";
-    }
+    } else if (state.tab === "episodes") episodes();
     saveHash();
   }
   for (const [i, name] of TABS.entries()) {
@@ -1324,6 +1861,19 @@ python .github/scripts/tlx_ops_bench_dashboard.py render site --from rel   # pre
     if (state.tab === "trending" && state.platform) { trend(); dist(); cases(); }
   });
   $("cases-sort").onchange = (e) => { state.casesSort = e.target.value; cases(); };
+  // A changed window, direction or dtype rebuilds the groups, so paging and expansion reset.
+  const epReset = () => { state.ep.page = {reg: 1, lift: 1, rec: 1}; state.ep.open.clear(); state.ep.det = {}; state.ep.cards = {}; };
+  $("ep-gpu").onchange = (e) => { state.ep.gpu = e.target.value; epReset(); render(); };
+  $("ep-op").onchange = (e) => { state.ep.op = e.target.value; epReset(); render(); };
+  $("ep-range").onchange = (e) => { state.ep.range = Number(e.target.value); epReset(); render(); };
+  $("ep-dir").onchange = (e) => { state.ep.dir = e.target.value; epReset(); render(); };
+  $("ep-dtype").onchange = (e) => { state.ep.dtype = e.target.value; epReset(); render(); };
+  $("ep-sort").onchange = (e) => { state.ep.sort = e.target.value; state.ep.page = {reg: 1, lift: 1, rec: 1}; render(); };
+  $("ep-q").oninput = (e) => { state.ep.q = e.target.value; state.ep.page = {reg: 1, lift: 1, rec: 1}; render(); };
+  $("ep-clear").onclick = () => {
+    state.ep.range = 30; state.ep.gpu = "all"; state.ep.op = "all"; state.ep.dir = "all"; state.ep.dtype = "all"; state.ep.q = ""; state.ep.sort = "date";
+    state.ep.sec = null; epReset(); render();
+  };
   for (const p of (RAW && RAW.overview) || []) {
     const item = el("li"), date = p.date;
     item.append(el("a", {href: p.source, target: "_blank", rel: "noopener"},

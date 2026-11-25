@@ -3,13 +3,13 @@
 import pytest
 import torch
 import triton
-from triton._internal_testing import is_hip_gfx1250
+from triton._internal_testing import is_hip_cdna5
 from triton.tlx.ops import flash_attn
 from triton.tlx.ops.kernels.flash_attn._shapes import CORRECTNESS_SHAPES
 from triton.tlx.ops.kernels.flash_attn import gfx1250 as _gfx1250_attention
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("BATCH,H,SEQLEN_Q,SEQLEN_K", [
     (1, 8, 1024, 1024),
     (2, 4, 1024, 1024),
@@ -63,7 +63,7 @@ def _check_attention(BATCH, H, SEQLEN_Q, SEQLEN_K, dtype):
 
 # Automatic narrow/long-K routes plus forced medium/wide tiles exercise replay
 # without allocating an unusually large adversarial query sequence.
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("seqlen_k,block_m,block_n", [(512, None, None), (1025, None, None), (1025, 128, 64),
                                                       (1025, 256, 64), (65537, None, None)])
@@ -120,7 +120,7 @@ def test_gfx1250_attn_fwd_tdm_pipelined_recovery(dtype, seqlen_k, block_m, block
             torch.testing.assert_close(out.double(), ref, atol=tolerance, rtol=tolerance)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("layout", ["offset", "padded", "odd_stride"])
 @pytest.mark.parametrize("seqlen_k,block_m,block_n,query_tiles_first", [
@@ -178,14 +178,14 @@ def test_gfx1250_attn_fwd_tdm_pipelined_strides(dtype, layout, seqlen_k, block_m
         assert (storage[-256:] == -123.0).all()
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("shape", [shape for shape in CORRECTNESS_SHAPES if shape.head_dim == 128 and not shape.causal])
 def test_flash_attn_shared_shapes(shape):
     dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}[shape.dtype]
     _check_attention(shape.batch, shape.heads, shape.context, shape.context, dtype)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 def test_flash_attn_batch_head_changes_reuse_kernel(monkeypatch):
     compiled = []
     monkeypatch.setattr(triton.knobs.compilation, "listener", lambda **kwargs: compiled.append(kwargs["src"]))
@@ -198,7 +198,7 @@ def test_flash_attn_batch_head_changes_reuse_kernel(monkeypatch):
             assert len(compiled) == first_call
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("space", ["heuristic", "full", "smoke"])
 def test_flash_attn_public_spaces(dtype, space):
@@ -212,7 +212,7 @@ def test_flash_attn_public_spaces(dtype, space):
     assert (out.double() - ref).square().mean().sqrt() < tolerance * ref.square().mean().sqrt()
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("invalid", ["causal", "gqa", "dtype", "stride", "scale", "empty", "head_dim", "backward"])
 def test_flash_attn_public_rejects_unsupported(invalid):
     from triton.tlx.ops import InvalidInput, UnsupportedBackward
@@ -277,7 +277,7 @@ def test_flash_attn_default_space_is_architecture_specific(monkeypatch, arch, ex
         kernel.assert_not_called()
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("value", [65504.0, -65504.0])
 @pytest.mark.parametrize("seqlen_k", [129, 1025])
 def test_flash_attn_fp16_output_range(value, seqlen_k):
@@ -290,7 +290,7 @@ def test_flash_attn_fp16_output_range(value, seqlen_k):
     torch.testing.assert_close(output, torch.full_like(output, value), atol=0, rtol=0)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("value", [float("inf"), -float("inf"), float("nan")])
 def test_flash_attn_fp16_preserves_nonfinite_output(value):
     q = torch.zeros((1, 1, 128, 128), device="cuda", dtype=torch.float16)
@@ -298,7 +298,7 @@ def test_flash_attn_fp16_preserves_nonfinite_output(value):
     torch.testing.assert_close(output, torch.full_like(output, value), equal_nan=True)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("axis", [0, 1])
 def test_flash_attn_large_outer_stride(dtype, axis):

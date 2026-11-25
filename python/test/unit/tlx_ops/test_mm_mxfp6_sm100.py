@@ -1,6 +1,6 @@
 """Authoritative coverage for ``tlx.ops.mm_mxfp6``.
 
-Mirrored from ``test_mm_mxfp8_sm100.py``: same catalog, signature, config,
+Mirrored from ``test_mm_mxfp_sm100.py``: same catalog, signature, config,
 and validation coverage, with E2M3 (A) / E3M2 (B) dense-packed uint8 operands
 and an fp6-aware reference.
 """
@@ -8,12 +8,16 @@ and an fp6-aware reference.
 from __future__ import annotations
 
 import inspect
+import re
 import subprocess
 import sys
 
 import pytest
 import torch
+import triton
 from triton._internal_testing import swizzle_scale_to_5d
+from triton.backends.compiler import GPUTarget
+from triton.compiler import ASTSource
 
 
 def _is_sm100():
@@ -125,7 +129,7 @@ def _dummy_inputs(*, device="cpu", m=128, n=128, k=128):
     return a, a_scale, b, b_scale
 
 
-def _make_inputs(m, n, k, *, sf_layout="natural", device="cuda"):
+def _make_inputs(m, n, k, *, sf_layout="natural", device="cuda", a_format="e2m3", b_format="e3m2"):
     generator = torch.Generator(device=device).manual_seed(0)
     a_codes = torch.randint(0, 64, (m, k), device=device, generator=generator, dtype=torch.uint8)
     b_codes = torch.randint(0, 64, (n, k), device=device, generator=generator, dtype=torch.uint8)
@@ -133,7 +137,10 @@ def _make_inputs(m, n, k, *, sf_layout="natural", device="cuda"):
     b = _pack_fp6_dense(b_codes)
     a_scale = _e8m0((m, k // 32), device=device, seed=1)
     b_scale = _e8m0((n, k // 32), device=device, seed=2)
-    reference = _dequantize(a, a_scale, ebits=2, bias=1) @ _dequantize(b, b_scale, ebits=3, bias=3).T
+    formats = {"e2m3": (2, 1), "e3m2": (3, 3)}
+    ea, ba = formats[a_format]
+    eb, bb = formats[b_format]
+    reference = _dequantize(a, a_scale, ebits=ea, bias=ba) @ _dequantize(b, b_scale, ebits=eb, bias=bb).T
     if sf_layout == "cublas_blocked":
         a_scale, b_scale = _to_blocked(a_scale), _to_blocked(b_scale)
     return (a, a_scale, b, b_scale), reference
@@ -184,7 +191,7 @@ import inspect
 import sys
 from triton.tlx import ops
 assert 'triton.tlx.ops.kernels.mm_mxfp6.sm100' not in sys.modules
-assert str(inspect.signature(ops.mm_mxfp6)) == "(a, a_scale, b, b_scale, *, out=None, sf_layout='natural', space='full')"
+assert str(inspect.signature(ops.mm_mxfp6)) == "(a, a_scale, b, b_scale, *, out=None, sf_layout='natural', space='full', a_format='e2m3', b_format='e3m2')"
 assert 'mm_mxfp6' in ops.__all__
 """
     subprocess.run([sys.executable, "-c", script], check=True)
@@ -197,7 +204,8 @@ def test_mm_mxfp6_catalog_resolves_implementation():
     implementation, _ = impl_for("mm_mxfp6", arch="sm100")
     assert implementation is mm_mxfp6
     assert str(
-        inspect.signature(implementation)) == "(a, a_scale, b, b_scale, *, out=None, sf_layout='natural', space='full')"
+        inspect.signature(implementation)
+    ) == "(a, a_scale, b, b_scale, *, out=None, sf_layout='natural', space='full', a_format='e2m3', b_format='e3m2')"
 
 
 def test_mm_mxfp6_import_builds_no_autotune_space():
@@ -283,6 +291,19 @@ def test_mm_mxfp6_rejects_types_ranks_and_shapes_before_resolution(monkeypatch):
     _assert_invalid_before_resolution(monkeypatch, _dummy_inputs(n=192), "divisible by 128")
 
 
+@pytest.mark.parametrize("side", ["a", "b"])
+@pytest.mark.parametrize("fmt", ["e2m1", "e4m3", "fp6_e2m3", None])
+def test_mm_mxfp6_rejects_invalid_formats(monkeypatch, side, fmt):
+    from triton.tlx.ops.kernels.mm_mxfp6 import gfx950, sm100
+
+    inputs = _dummy_inputs()
+    kwargs = {f"{side}_format": fmt}
+    _assert_invalid_before_resolution(monkeypatch, inputs, "a_format and b_format", **kwargs)
+    for backend in (gfx950, sm100):
+        with pytest.raises(ValueError, match="a_format and b_format"):
+            backend.mm_mxfp6(*inputs, **kwargs)
+
+
 def test_mm_mxfp6_rejects_dtypes_layouts_and_devices_before_resolution(monkeypatch):
     inputs = _dummy_inputs()
     _assert_invalid_before_resolution(monkeypatch, _replace(inputs, 0, inputs[0].to(torch.bfloat16)),
@@ -326,9 +347,12 @@ def test_mm_mxfp6_rejects_unaligned_base_before_launch(monkeypatch, offset):
 @requires_sm100
 @pytest.mark.parametrize("shape", [(128, 128, 128), (256, 256, 256), (384, 256, 512)], ids=str)
 @pytest.mark.parametrize("sf_layout", ["natural", "cublas_blocked"])
-def test_mm_mxfp6_heuristic(shape, sf_layout):
-    inputs, reference = _make_inputs(*shape, sf_layout=sf_layout)
-    _assert_correct(_call(inputs, sf_layout=sf_layout, space="heuristic"), reference)
+@pytest.mark.parametrize("a_format", ["e2m3", "e3m2"])
+@pytest.mark.parametrize("b_format", ["e2m3", "e3m2"])
+def test_mm_mxfp6_heuristic(shape, sf_layout, a_format, b_format):
+    inputs, reference = _make_inputs(*shape, sf_layout=sf_layout, a_format=a_format, b_format=b_format)
+    _assert_correct(_call(inputs, sf_layout=sf_layout, space="heuristic", a_format=a_format, b_format=b_format),
+                    reference)
 
 
 @requires_sm100
@@ -349,9 +373,11 @@ def test_mm_mxfp6_natural_and_blocked_are_bitwise_equal():
 
 
 @requires_sm100
-def test_mm_mxfp6_default_full_space():
-    inputs, reference = _make_inputs(128, 128, 128)
-    _assert_correct(_call(inputs), reference)
+@pytest.mark.parametrize("a_format", ["e2m3", "e3m2"])
+@pytest.mark.parametrize("b_format", ["e2m3", "e3m2"])
+def test_mm_mxfp6_default_full_space(a_format, b_format):
+    inputs, reference = _make_inputs(128, 128, 128, a_format=a_format, b_format=b_format)
+    _assert_correct(_call(inputs, a_format=a_format, b_format=b_format), reference)
 
 
 @requires_sm100
@@ -439,11 +465,59 @@ def test_mm_mxfp6_out_identity_and_backward_policy():
         "n_inner_async_store",
     ],
 )
-def test_mm_mxfp6_explicit_config(shape, config):
+@pytest.mark.parametrize("a_format", ["e2m3", "e3m2"])
+@pytest.mark.parametrize("b_format", ["e2m3", "e3m2"])
+def test_mm_mxfp6_explicit_config(shape, config, a_format, b_format):
     from triton.tlx.ops.kernels.mm_mxfp6 import sm100
 
-    inputs, reference = _make_inputs(*shape)
-    _assert_correct(sm100._run_config(*inputs, config), reference)
+    inputs, reference = _make_inputs(*shape, a_format=a_format, b_format=b_format)
+    _assert_correct(sm100._run_config(*inputs, config, a_format=a_format, b_format=b_format), reference)
+
+
+@pytest.mark.parametrize("a_format", ["e2m3", "e3m2"])
+@pytest.mark.parametrize("b_format", ["e2m3", "e3m2"])
+@pytest.mark.parametrize(
+    "config", [
+        {},
+        {"PEELED_FIRST_K": True},
+        {"SPLIT_K": 4},
+        CONFIG_2CTA,
+        {**CONFIG_2CTA, "COLLAB_2CTA": True},
+        OVERLAP,
+        {**OVERLAP, **COLLAB_2CTA_OVERLAP},
+        B_RESIDENT_FUSED,
+    ], ids=["basic", "peeled", "split_k", "2cta", "collab_2cta", "overlap", "collab_overlap", "resident_fused"])
+def test_mm_mxfp6_compile_native_formats(a_format, b_format, config):
+    from triton.tlx.ops.kernels.mm_mxfp6 import sm100
+
+    defaults = {
+        name: param.default
+        for name, param in inspect.signature(sm100._gemm_mxfp6_ws_kernel.fn).parameters.items()
+        if param.default is not inspect.Parameter.empty
+    }
+    meta = {**defaults, **sm100.DEFAULT_CONFIG, **config, "A_FORMAT": a_format, "B_FORMAT": b_format, "NUM_SMS": 1}
+    bm, bn, bk = (meta[f"BLOCK_SIZE_{dim}"] for dim in "MNK")
+    signature = {
+        "a_desc": f"tensordesc<u8[{bm}, {bk}]>",
+        "b_desc": f"tensordesc<u8[{bn // meta['NUM_CTAS']}, {bk}]>",
+        "a_scale_desc": f"tensordesc<u8[1, {bm // 128}, {bk // 128}, 2, 256]>",
+        "b_scale_desc": f"tensordesc<u8[1, {bn // 128}, {bk // 128}, 2, 256]>",
+        "out_desc": f"tensordesc<bf16[{bm}, {bn // meta['EPILOGUE_SUBTILE']}]>",
+        "workspace_desc": f"tensordesc<fp32[{bm}, {bn // meta['EPILOGUE_SUBTILE']}]>",
+        "M": "i32",
+        "N": "i32",
+        "K": "i32",
+    }
+    source = ASTSource(sm100._gemm_mxfp6_ws_kernel, signature, constexprs=meta)
+    options = {"num_warps": 4, "num_stages": 1}
+    if meta["NUM_CTAS"] == 2:
+        options["ctas_per_cga"] = (2, 1, 1)
+    compiled = triton.compile(source, target=GPUTarget("cuda", 100, 32), options=options)
+    dots = [line for line in compiled.asm["ttgir"].splitlines() if "tc_gen5_mma_scaled" in line]
+    assert dots
+    assert all(f"lhs = {a_format}" in line and f"rhs = {b_format}" in line for line in dots)
+    assert re.search(r"tcgen05\.mma\.cta_group::[12]\.kind::mxf8f6f4", compiled.asm["ptx"])
+    assert compiled.asm["cubin"]
 
 
 @requires_sm100
