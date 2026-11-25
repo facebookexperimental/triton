@@ -1440,6 +1440,95 @@ static bool isSmemLiveAcrossInnerLoop(Operation *alloc,
   return false;
 }
 
+/// Returns false if the staging can be written while the host still holds data
+/// a later read needs. Within one pass of the warp-specialized loop (or of a
+/// non-persistent kernel), every read of the host must come before every write
+/// of the staging group, in program order of their common block; a read nested
+/// in an inner loop counts at that loop's position, so a K-loop operand is read
+/// before the epilogue. Step 7.5 then orders the next tile's refill after the
+/// staging drains. A host read after a staging write (e.g. the TMA-loaded
+/// vector of a later epilogue subtile) would be overwritten by the earlier
+/// subtile's staged data before it is read. Reads in another loop around the
+/// write, reads in another partition at the same level, and any order that
+/// cannot be established are rejected.
+static bool isConsumedBeforeStaging(Operation *alloc,
+                                    ArrayRef<Operation *> stagingAllocs,
+                                    SmallVector<Channel *> &channels) {
+  Channel *hostCh = findChannelForOp(alloc, channels);
+  if (!hostCh)
+    return false;
+  SmallVector<Operation *> producers;
+  for (Operation *staging : stagingAllocs) {
+    Channel *stagingCh = findChannelForOp(staging, channels);
+    if (!stagingCh || !stagingCh->getSrcOp())
+      return false;
+    producers.push_back(stagingCh->getSrcOp());
+  }
+  if (producers.empty())
+    return false;
+
+  SmallVector<Operation *> dstOps;
+  hostCh->getDstOps(dstOps);
+  if (dstOps.empty())
+    if (Operation *dst = hostCh->getDstOp())
+      dstOps.push_back(dst);
+  if (dstOps.empty())
+    return false;
+  for (Operation *dstOp : dstOps) {
+    for (Operation *consumer : getActualConsumers(dstOp)) {
+      for (Operation *producer : producers) {
+        // Innermost loop around the read that also holds the staging write.
+        Operation *scope = consumer->getParentOp();
+        while (scope && !scope->isAncestor(producer))
+          scope = scope->getParentOp();
+        if (!scope)
+          return false;
+        // Program order only holds for one pass through the scope. Step 7.5
+        // orders consecutive passes of the warp-specialized outer loop; any
+        // other loop at or around the scope (e.g. an epilogue subtile loop)
+        // repeats the read and the staging write with nothing between them.
+        // A scope outside every loop (a non-persistent kernel) runs once.
+        Operation *scopeLoop =
+            isa<LoopLikeOpInterface>(scope)
+                ? scope
+                : scope->getParentOfType<LoopLikeOpInterface>().getOperation();
+        if (scopeLoop && !scopeLoop->hasAttr("tt.warp_specialize"))
+          return false;
+        // Compare positions in the scope's block that holds both (e.g. the
+        // after region of a CLC scf.while). A read nested in an inner loop
+        // maps to that loop, so a K-loop operand counts as read before the
+        // epilogue and a loop placed after the staging write does not.
+        Operation *readAt = nullptr, *writeAt = nullptr;
+        for (Region &region : scope->getRegions()) {
+          if (!region.hasOneBlock())
+            continue;
+          Block &body = region.front();
+          if ((readAt = body.findAncestorOpInBlock(*consumer)) &&
+              (writeAt = body.findAncestorOpInBlock(*producer)))
+            break;
+          readAt = writeAt = nullptr;
+        }
+        if (!readAt || !writeAt || !readAt->isBeforeInBlock(writeAt))
+          return false;
+        // Program order is execution order only within one partition, so a
+        // read not nested in an earlier inner loop (including one under an
+        // scf.if) and the staging write must both run in one and the same
+        // partition: a write replicated into another partition is not ordered
+        // after the read. A read in an earlier inner loop (an MMA operand) is
+        // ordered before the epilogue through the accumulator it produces.
+        // TODO: that ordering is assumed, not checked.
+        if (!isa<LoopLikeOpInterface>(readAt)) {
+          auto readTasks = getAsyncTaskIds(consumer);
+          auto writeTasks = getAsyncTaskIds(producer);
+          if (readTasks.size() != 1 || writeTasks != readTasks)
+            return false;
+        }
+      }
+    }
+  }
+  return true;
+}
+
 /// Compute the byte size for a local_alloc op.
 static unsigned getSmemAllocSizeBytes(ttg::LocalAllocOp alloc) {
   auto allocType = alloc.getType();
@@ -2078,6 +2167,21 @@ findReuseCandidate(WSBuffer &candidate, SmallVector<WSBuffer> &wsBuffers,
            << " is live across the inner loop but is not a descriptor operand "
               "eligible for TMA-staging reuse by candidate bufferId="
            << candidate.bufferId << " — skip");
+      continue;
+    }
+
+    // TMA staging may only land on a host that is consumed before the
+    // staging is written; see isConsumedBeforeStaging.
+    SmallVector<Operation *> stagingGroup;
+    if (candidate.tmaStaging != 0)
+      for (const WSBuffer &member : wsBuffers)
+        if (member.bufferId == candidate.bufferId && member.tmaStaging != 0)
+          stagingGroup.push_back(member.allocOp);
+    if (candidate.tmaStaging != 0 &&
+        !isConsumedBeforeStaging(buf.allocOp, stagingGroup, channels)) {
+      LDBG("  findReuseCandidate: target bufferId="
+           << buf.bufferId << " is read in the loop body that writes staging "
+           << "bufferId=" << candidate.bufferId << " — skip");
       continue;
     }
 
