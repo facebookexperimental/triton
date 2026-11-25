@@ -768,7 +768,7 @@ def test_snapshot_line_reads_pin_pending_changes_issues_and_history():
         },
     ]
     line = ch.snapshot_line(get, "main", "triton_beta", releases, issues)
-    assert line["pinned"] == {"tag": "llvm-bbbbbbbb-1", "llvm_hash": B, "base": None}
+    assert line["pinned"] == {"tag": "llvm-bbbbbbbb-1", "llvm_hash": B}
     assert line["newest"]["tag"] == "llvm-cccccccc-1"
     assert line["pending"] == [{"sha": "d" * 40, "title": "[triton/beta] Backport VOPD fix", "pr": 18}]
     assert line["pr"]["number"] == 4282 and [i["number"] for i in line["issues"]] == [7]

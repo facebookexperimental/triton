@@ -602,6 +602,8 @@ def _reduce_split_k(workspace, c, M, N, split_k, bias=None, stride_bias=0):
         # runs and waits on it in-kernel, hiding the launch gap (~1 us on H100,
         # 608x512x20992), as cuBLAS's splitKreduce does.
         launch_pdl=True,
+        # Hopper: keep the instruction order this kernel had before upstream #11478 (see _launch_ws).
+        use_slp_vectorizer=True,
     )
 
 
@@ -1447,6 +1449,9 @@ def _launch_ws(a_store, b_store, a_rm, b_rm, c, M, N, K, space, bias=None, strid
         # Under swap-AB the kernel's A is B, streamed once.
         A_EVICTION="evict_last" if N <= 1024 and not swap_ab else "",
         ADD_BIAS=bias is not None,
+        # Upstream #11478's NVPTX vectorizer emits this kernel in an order that
+        # costs 5-10% on Hopper; SLP keeps the previous instruction order.
+        use_slp_vectorizer=True,
     )
     # post_hook only fires while benchmarking, so reduce here for the real launch.
     split_k = kernel.best_config.kwargs["SPLIT_K"]
