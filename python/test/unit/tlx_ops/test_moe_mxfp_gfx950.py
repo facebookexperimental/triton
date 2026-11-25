@@ -4,7 +4,8 @@ import pytest
 import torch
 
 from triton._internal_testing import is_hip_cdna4
-from triton.tlx.ops.kernels.moe_mxfp.gfx950 import moe_mxfp4, pick_config, prepare_w13, prepare_w2, quantize_rows
+from triton.tlx.ops.kernels.moe_mxfp.gfx950 import (_shuffle_weights, moe_mxfp4, pick_config, prepare_w13,
+                                                    prepare_w13_scales, prepare_w2, prepare_w2_scales, quantize_rows)
 
 requires_gfx950 = pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
 
@@ -86,6 +87,8 @@ _CFG = {
     "auto": None,
     "small32": dict(BLOCK_M=32, WN=8, A_LDS=False),
     "small64": dict(BLOCK_M=64, WN=4, A_LDS=True),
+    "small64s": dict(BLOCK_M=64, WN=4, A_LDS=True, SORTED=True),
+    "small96s": dict(BLOCK_M=96, WN=4, A_LDS=True, SORTED=True, WPE=2),
     "quad128": dict(BLOCK_M=128, GROUP_M=1, QUAD=True),
     "quad128g4": dict(BLOCK_M=128, GROUP_M=4, QUAD=True),
     "quad256": dict(BLOCK_M=256, GROUP_M=1, QUAD=True),
@@ -133,7 +136,8 @@ def _prepare(weights):
 
 @requires_gfx950
 @pytest.mark.parametrize("T", [1, 5, 40, 300])
-@pytest.mark.parametrize("engine", ["auto", "small32", "small64", "quad128", "quad128g4", "quad256"])
+@pytest.mark.parametrize("engine",
+                         ["auto", "small32", "small64", "small64s", "small96s", "quad128", "quad128g4", "quad256"])
 @pytest.mark.parametrize("start,use_norm", [(0, False), (0, True), (16, True)])
 def test_moe_mxfp4_matches_reference(T, engine, start, use_norm):
     gen = torch.Generator(device="cuda").manual_seed(0)
@@ -143,15 +147,60 @@ def test_moe_mxfp4_matches_reference(T, engine, start, use_norm):
     _check(_run(x, wts, ids, weights, _prepare(weights), start, engine), x, wts, ids, weights, start, engine)
 
 
+@requires_gfx950
+@pytest.mark.parametrize("T", [1, 40, 300])
+@pytest.mark.parametrize("engine",
+                         ["auto", "small32", "small64", "small64s", "small96s", "quad128", "quad128g4", "quad256"])
+@pytest.mark.parametrize("start,use_norm", [(0, False), (16, True)])
+def test_moe_mxfp4_natural_weights_match_prepared(T, engine, start, use_norm):
+    """Natural-layout weights load the same bytes into each lane, so the result is bitwise the prepared path's."""
+    gen = torch.Generator(device="cuda").manual_seed(1)
+    weights = _weights(8, gen, use_norm)
+    w13, s13, w2, s2, norm = weights
+    x = torch.randn(T, _K, device="cuda", generator=gen).to(torch.bfloat16)
+    ids, wts = _routing(T, gen)
+    # The fused 128-row weighted sum uses BF16 atomics, whose order varies run to run.
+    cfg = dict(_engine_cfg(engine, T), FUSE_WSUM=False)
+    kw = dict(expert_start=start, post_norm_weight=norm, post_norm_eps=1e-8, post_norm_gain=1.0, cfg=cfg,
+              num_experts=_E_TOTAL)
+    want = moe_mxfp4(x, wts, ids, *_prepare(weights), **kw)
+    got = moe_mxfp4(x, wts, ids, w13, prepare_w13_scales(w13, s13), w2, prepare_w2_scales(w2, s2), natural_weights=True,
+                    **kw)
+    assert torch.equal(got.view(torch.int16), want.view(torch.int16))
+
+
+@requires_gfx950
+@pytest.mark.parametrize("T", [1, 40, 300])
+@pytest.mark.parametrize("engine",
+                         ["auto", "small32", "small64", "small64s", "small96s", "quad128", "quad128g4", "quad256"])
+def test_moe_mxfp4_gate_up_stacked_match_prepared(T, engine):
+    """Pre-shuffled w13 that keeps [gate; up] stacked (AITER's ``shuffle_weight(w13, (16, 16))`` bytes) reads the
+    same bytes into each lane as the interleaved prepared layout, so the result is bitwise the same."""
+    gen = torch.Generator(device="cuda").manual_seed(2)
+    weights = _weights(8, gen, use_norm=True)
+    w13, s13, w2, s2, norm = weights
+    x = torch.randn(T, _K, device="cuda", generator=gen).to(torch.bfloat16)
+    ids, wts = _routing(T, gen)
+    cfg = dict(_engine_cfg(engine, T), FUSE_WSUM=False)
+    kw = dict(expert_start=0, post_norm_weight=norm, post_norm_eps=1e-8, post_norm_gain=1.0, cfg=cfg,
+              num_experts=_E_TOTAL)
+    want = moe_mxfp4(x, wts, ids, *_prepare(weights), **kw)
+    got = moe_mxfp4(x, wts, ids, _shuffle_weights(w13), prepare_w13_scales(w13, s13), _shuffle_weights(w2),
+                    prepare_w2_scales(w2, s2), gate_up_stacked=True, **kw)
+    assert torch.equal(got.view(torch.int16), want.view(torch.int16))
+
+
 @pytest.mark.parametrize("num_valid,num_experts,engine",
                          [(128, 32, "small32"),  # 4 rows per expert
                           (512, 32, "small32"),  # 16
                           (1024, 32, "quad128g4"),  # 32
-                          (4096, 32, "quad128g4"),  # 128
-                          (8192, 32, "quad128"),  # 256
-                          (16384, 32, "quad256"),  # 512
-                          (16384, 64, "quad128"),  # 256: the same slots over twice the experts pick the smaller tile
-                          (65536, 256, "quad128"),  # 256 under expert parallelism (ids over all 256 experts)
+                          (2048, 32, "quad128g4"),  # 64
+                          (4096, 32, "small64s"),  # 128
+                          (8192, 32, "small96s"),  # 256
+                          (12288, 32, "small96s"),  # 384
+                          (16384, 32, "small96s"),  # 512
+                          (16384, 64, "small96s"),  # 256: the same slots over twice the experts pick the smaller tile
+                          (65536, 256, "small96s"),  # 256 under expert parallelism (ids over all 256 experts)
                           ])
 def test_moe_mxfp4_pick_config_keys_on_rows_per_expert(num_valid, num_experts, engine):
     assert pick_config(num_valid, num_experts) == _CFG[engine]

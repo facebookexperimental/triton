@@ -12,9 +12,8 @@ One shot command with extreme simplicity
 python python/test/tlx_benchmark/bench_{op}.py
 
 `{op}` is one of `norm`, `mm`, `torchtlx_mm`, `torchtlx_addmm`, `torchtlx_bmm`,
-`flash_attn`, `flash_attn_mxfp8`, `flash_attn_varlen`, `flash_attn_varlen_mxfp8`, `hstu_attn`,
-`hstu_cross_attn`, `kda`,
-`kda_prefill`, `kda_decode`, `mla_window_attn`, `swiglu_ffn`, `rmsnorm_cat`, `moe`, `moe_routing`, `moe_finalize`, `router_gemm`,
+`flash_attn`, `flash_attn_mxfp8`, `flash_attn_varlen`, `flash_attn_varlen_mxfp8`, `window_attn_varlen`, `hstu_attn`, `hstu_cross_attn`,
+`kda`, `kda_prefill`, `kda_decode`, `mla_window_attn`, `swiglu_ffn`, `rmsnorm_cat`, `moe`, `moe_routing`, `moe_finalize`, `router_gemm`,
 or one of the fused operators or collectives below.
 
 Fused operators (`tlx/ops/kernels/fused/`) run steps that would otherwise be separate kernels in one launch:
@@ -76,6 +75,7 @@ options:
 | `flash_attn_mxfp8` | `F.scaled_dot_product_attention` | speedup >= 0.9x | full |
 | `flash_attn_varlen` | `F.scaled_dot_product_attention` on the padded batch, masked | speedup >= 0.9x | heuristic |
 | `flash_attn_varlen_mxfp8` | none | reports absolute throughput | heuristic |
+| `window_attn_varlen` | `torch.ops.aten._flash_attention_forward` (FlashAttention-2) with the same window | speedup >= 0.9x | heuristic |
 | `hstu_attn` | `_reference.py::triton_hstu_mha` (production Triton) | speedup >= 0.9x | full |
 | `hstu_cross_attn` | `tutorials/hstu_cross_attn/triton_bw_cross_attention.py` (Triton) | speedup >= 0.9x | curated |
 | `kda` | none | absolute floor, currently unset -> reports only | full |
@@ -138,6 +138,10 @@ config, so `--space` does not change it.
 `linear_rowscale` races `torch.compile` of the eager expression, which Inductor
 lowers to cuBLAS `addmm` and one fused kernel that applies the row scale. One
 fixed launch config.
+
+`window_attn_varlen` races PyTorch's FlashAttention-2 varlen forward with the
+same `window_size_left`/`window_size_right`, which computes the same rows and
+keys. The op has one fixed launch config.
 
 Ops with a backward (`flash_attn`, `hstu_attn`, `kda`) produce two cases per
 shape. The backward is a different kernel at 2.5x the FLOPs, so folding it into

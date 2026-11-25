@@ -125,8 +125,8 @@ __all__ = [
     "moe_routing", "moe_finalize", "moe_router_topk_align", "moe_mxfp4_sort_quant", "norm_residual_norm", "all_reduce",
     "all_reduce_workspace", "all_reduce_norm_residual_norm", "rmsnorm_gate", "router_gemm", "qk_norm_rope_kv_cache",
     "addmm", "addmm_mul_add", "addmm_mul_add_launch", "flash_attn", "flash_attn_mxfp8", "flash_attn_varlen",
-    "flash_attn_varlen_mxfp8", "linear_rowscale", "linear_rowscale_launch", "rmsnorm_cat", "swiglu_ffn",
-    "mla_window_attn", "hstu_attn_dev", "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill",
+    "flash_attn_varlen_mxfp8", "linear_rowscale", "linear_rowscale_launch", "window_attn_varlen", "rmsnorm_cat",
+    "swiglu_ffn", "mla_window_attn", "hstu_attn_dev", "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill",
     "kda_recurrent_decode", "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward",
     "paged_attention_decode", "paged_attention_prefill", "paged_attention_decode_workspace",
     "allocate_paged_kv_cache_5d", "reshape_and_cache_5d", "UnsupportedOp", "UnsupportedBackward", "InvalidInput",
@@ -434,16 +434,16 @@ def _check_mm_mxfp6_scales(a_scale, b_scale, *, M, N, K, sf_layout):
                            f"got {a_scale.numel()} and {b_scale.numel()}")
 
 
-def mm_mxfp6(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="full"):
+def mm_mxfp6(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="full", a_format="e2m3", b_format="e3m2"):
     """``a @ b.T`` over pre-quantized MXFP6 inputs, returning BF16 ``[M, N]``.
 
-    ``a`` is contiguous dense-packed E2M3 ``[M, K]`` and ``b`` is contiguous
-    dense-packed E3M2 ``[N, K]`` (K-major, as for a linear weight), both uint8
+    ``a`` is contiguous dense-packed ``[M, K]`` and ``b`` is contiguous
+    dense-packed ``[N, K]`` (K-major, as for a linear weight), both uint8
     with groups of 16 codes per 12 bytes LSB-first and the K dim padded to
     the unpacked width; M, N and K must be multiples of 128. The format
-    pairing is fixed (E2M3 A x E3M2 B) to the validated ``mxf8f6f4``
-    configuration; other pairings are not exposed yet. Each run of 32
-    values along K
+    arguments ``a_format`` and ``b_format`` independently select "e2m3"
+    or "e3m2", defaulting to E2M3 A x E3M2 B. They specialize the kernel
+    as constexpr arguments. Each run of 32 values along K
     has one E8M0 scale. ``sf_layout="natural"`` takes ``[M, K // 32]`` and
     ``[N, K // 32]`` scales; ``"cublas_blocked"`` takes the swizzled byte
     layout returned by torchao's ``MXTensor.to_mx(..., is_swizzled_scales=True)``.
@@ -457,6 +457,8 @@ def mm_mxfp6(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="fu
     """
     import torch
 
+    if a_format not in ("e2m3", "e3m2") or b_format not in ("e2m3", "e3m2"):
+        raise InvalidInput("tlx.ops.mm_mxfp6 a_format and b_format must each be 'e2m3' or 'e3m2'")
     tensors = (a, a_scale, b, b_scale)
     if not all(isinstance(tensor, torch.Tensor) for tensor in tensors):
         raise InvalidInput("tlx.ops.mm_mxfp6 expects tensor inputs")
@@ -498,7 +500,7 @@ def mm_mxfp6(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="fu
     tma_tensors = tensors if out is None else (*tensors, out)
     check_inputs(spec, dtype=a.dtype, base_ptrs=tuple(tensor.data_ptr() for tensor in tma_tensors))
     check_backward(spec, *tensors, out)
-    return fn(a, a_scale, b, b_scale, out=out, sf_layout=sf_layout, space=space)
+    return fn(a, a_scale, b, b_scale, out=out, sf_layout=sf_layout, space=space, a_format=a_format, b_format=b_format)
 
 
 def grouped_gemm(group_a, group_b, *, space=None):
@@ -1767,6 +1769,53 @@ def flash_attn_varlen_mxfp8(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, m
     scale = 128**-0.5 if sm_scale is None else sm_scale
     with torch.cuda.device(q.device):
         return fn(q, k, v, cu_seqlens_q, cu_seqlens_k, int(max_seqlen_q), int(max_seqlen_k), scale, fast_exp=fast_exp)
+
+
+def window_attn_varlen(q, k, v, cu_seqlens, window_size, sm_scale=None, *, space=None):
+    """Forward-only sliding-window self-attention over packed ``(tokens, heads, HEAD_DIM)`` fp16/bf16 sequences.
+
+    Sequence ``b`` owns rows ``cu_seqlens[b]:cu_seqlens[b + 1]`` of Q, K and V (int32, ``(batch + 1,)``, starting at 0
+    and ending at ``tokens``; empty sequences are allowed). With ``window_size=(left, right)``, row ``i`` attends the
+    keys ``i - left .. i + right`` of its own sequence, both ends inclusive: FlashAttention's ``window_size`` for
+    self-attention, without causal masking. K/V may have fewer heads than Q (GQA) if they divide its head count.
+    ``sm_scale`` defaults to ``HEAD_DIM ** -0.5`` and must be positive and finite, with ``sm_scale * log2(e)`` finite
+    in float32 (the kernel works in base 2); a scale whose ``sm_scale * log2(e)`` is below the smallest normal float32
+    is treated as 0, which gives the visible keys equal weight.
+    Supported: ``HEAD_DIM`` in (64, 128), ``0 <= left``, ``0 <= right``, ``left + right <= 256``. Returns the output
+    only (no log-sum-exp).
+    """
+    import torch
+    if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
+        raise InvalidInput("tlx.ops.window_attn_varlen expects rank-3 (tokens, heads, head_dim) Q/K/V tensors")
+    if (k.shape != v.shape or q.shape[0] != k.shape[0] or q.shape[2] != k.shape[2] or k.shape[1] < 1
+            or q.shape[1] % k.shape[1] != 0):
+        raise InvalidInput("tlx.ops.window_attn_varlen expects K/V of identical shape, Q's tokens and head dim, and a "
+                           f"head count dividing Q's; got q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}")
+    if q.dtype != k.dtype or q.dtype != v.dtype:
+        raise InvalidInput("tlx.ops.window_attn_varlen expects Q/K/V to have the same dtype")
+    if q.stride(2) != 1 or k.stride(2) != 1 or v.stride(2) != 1:
+        raise InvalidInput("tlx.ops.window_attn_varlen expects unit-stride head dims")
+    if cu_seqlens.ndim != 1 or cu_seqlens.shape[0] < 2 or cu_seqlens.dtype != torch.int32:
+        raise InvalidInput("tlx.ops.window_attn_varlen expects int32 (batch + 1,) cu_seqlens with batch >= 1")
+    if any(t.device != q.device for t in (k, v, cu_seqlens)):
+        raise InvalidInput("tlx.ops.window_attn_varlen expects all tensors on one device")
+    if (not isinstance(window_size, (tuple, list)) or len(window_size) != 2
+            or any(type(w) is not int or w < 0 for w in window_size) or sum(window_size) > 256):
+        raise InvalidInput("tlx.ops.window_attn_varlen expects window_size=(left, right) with non-negative ints and "
+                           f"left + right <= 256; got {window_size!r}")
+    if sm_scale is not None and not 0 < sm_scale < math.inf:
+        raise InvalidInput(f"tlx.ops.window_attn_varlen expects a positive finite sm_scale; got {sm_scale!r}")
+    if sm_scale is not None and sm_scale * math.log2(math.e) > 3.4028234663852886e38:
+        raise InvalidInput(
+            f"tlx.ops.window_attn_varlen: sm_scale * log2(e) overflows float32; got sm_scale={sm_scale!r}")
+    space_name, invariance = _normalize_space_arg("window_attn_varlen", space)
+    _check_single_config_space("window_attn_varlen", space_name)
+    fn, spec = impl_for("window_attn_varlen", device=q.device)
+    check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[2])
+    check_backward(spec, q, k, v)
+    _check_enforced("window_attn_varlen", spec, invariance)
+    with torch.cuda.device(q.device):
+        return fn(q, k, v, cu_seqlens, tuple(window_size), sm_scale)
 
 
 def _check_lora(name, proj, d_model, out_features):

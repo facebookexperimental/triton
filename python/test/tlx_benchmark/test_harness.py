@@ -926,6 +926,7 @@ def test_focus_suite_can_union_other_suites():
         "triton.tlx.ops.kernels.fused.qk_norm_rope_kv_cache._shapes",
         "triton.tlx.ops.kernels.router_gemm._shapes",
         "triton.tlx.ops.kernels.swiglu_ffn._shapes",
+        "triton.tlx.ops.kernels.window_attn_varlen._shapes",
     ],
 )
 def test_operator_shape_modules_expose_the_l1_union(module_name):
@@ -997,6 +998,7 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
         "triton.tlx.ops.kernels.fused.qk_norm_rope_kv_cache._shapes": {"gfx950": ("gfx950_all", )},
         "triton.tlx.ops.kernels.router_gemm._shapes": {"gfx950": ("gfx950_all", )},
         "triton.tlx.ops.kernels.swiglu_ffn._shapes": {"sm90": ("sm90_1", )},
+        "triton.tlx.ops.kernels.window_attn_varlen._shapes": {"sm90": ("sm90_1", )},
     }
     pattern = re.compile(r"^(?:sm|gfx)\d+_(?:[1-9]\d*|all)$")
     for module_name, defaults in expected.items():
@@ -1108,6 +1110,7 @@ BENCH_MODULES = (
     "bench_rmsnorm_cat",
     "bench_rmsnorm_gate",
     "bench_swiglu_ffn",
+    "bench_window_attn_varlen",
 )
 
 

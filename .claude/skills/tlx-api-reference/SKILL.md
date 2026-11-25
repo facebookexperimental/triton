@@ -41,7 +41,7 @@ with tlx.async_tasks():
 | `tlx.alloc_warp_barrier(num_barriers, num_warps=1, num_arrivals=1)` | Allocate SMEM barriers whose software arrivals are performed independently by every participating thread. The initialized count is `num_warps * 32 * num_arrivals`. | NVIDIA |
 | `tlx.barrier_expect_bytes(bar, bytes, pred=None)` | Set expected transaction byte count on barrier | Both |
 | `tlx.barrier_wait(bar, phase, pred=None)` | Wait until barrier phase flips (LOCAL mbarrier only) | Both |
-| `tlx.barrier_arrive(bar, arrive_count=1, remote_cta_rank=None, per_warp=False)` | Signal arrival at barrier. `remote_cta_rank` signals a barrier in a remote CTA — **only valid when ctas_per_cga > 1**, causes "Unexpected buffer remote view in 1cta mode" otherwise. Guard with `if USE_2CTA:` when kernel supports both modes. `per_warp=True` (NVIDIA, not on warp barriers): each warp syncs its own lanes and one lane arrives with `arrive_count`, so the barrier counts `arrive_count * task warps` for it. | Both |
+| `tlx.barrier_arrive(bar, arrive_count=1, remote_cta_rank=None, per_warp=False)` | Signal arrival at barrier. By default it is task-collective on NVIDIA: one thread arrives, and the compiler orders all of the task's earlier SMEM/TMEM accesses before it, so releasing a buffer right after `local_load` needs no extra barrier (global writes are not ordered for other CTAs). `remote_cta_rank` signals a barrier in a remote CTA — **only valid when ctas_per_cga > 1**, causes "Unexpected buffer remote view in 1cta mode" otherwise. Guard with `if USE_2CTA:` when kernel supports both modes. `per_warp=True` (NVIDIA, not on warp barriers): each warp syncs its own lanes and one lane arrives with `arrive_count`, so the barrier counts `arrive_count * task warps` for it. | Both |
 | `tlx.cluster_barrier()` | Full cluster-wide synchronization barrier | Both |
 
 **Ordinary barrier count rules:**
@@ -215,6 +215,20 @@ N-blocks.
   arrive on leader's barrier. Use `arrive_count=NUM_CTAS`.
 - MMA `mBarriers` with `two_ctas=True`: hardware signals when input reads
   complete. The TMEM output write may still be in-flight.
+
+### Barrier allocation before TMEM allocation (any multi-CTA cluster)
+
+Allocate all barriers before any SMEM/TMEM allocation in the kernel prologue.
+With more than one physical CTA, entry-block barrier inits must precede the
+first TMEM alloc so the compiler can insert the init fence and cluster
+rendezvous between them. This applies whenever the kernel has a remote barrier
+arrive (`remote_cta_rank`, `async_remote_shmem_store(..., barrier=)`, multicast
+TMA, CLC), a multicast arrive, paired MMA (`two_ctas=True`), or a
+`scope="cluster"` barrier — not only 2-CTA MMA (e.g. a K-split cluster
+reducing onto rank 0's barrier). The compiler hoists inits it can move, but
+errors with "Barrier init is not before TMEM allocation" when a dependency
+cannot be hoisted. Single-CTA kernels are exempt. See
+`third_party/tlx/doc/tlx_barriers.md` ("Default-Scope Triggers").
 
 
 **input_precision options:** `tf32`, `tf32x3`, `ieee`

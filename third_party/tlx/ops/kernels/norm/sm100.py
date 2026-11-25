@@ -532,6 +532,9 @@ def norm_bwd(x, weight, dout, rstd, *, mean=None, norm='rms', has_bias=False, ad
                 ACS=dx_accum.stride(0) if dx_accum is not None else n, DXS=dx.stride(0),
                 num_warps=layout_kw.get('NW', 4), SHOULD_MASK_COL=n != bn, STRIDED=not layout_kw['WIDE'],
                 N_FLOAT=float(n) if bm > 1 else None, **layout_kw)
+    # On Hopper, upstream #11478's NVPTX vectorizer raises this kernel's register
+    # use past an occupancy step (72 -> 80 at N=384); SLP keeps the old order.
+    args['use_slp_vectorizer'] = torch.cuda.get_device_capability(x.device)[0] == 9
     sms = torch.cuda.get_device_properties(x.device).multi_processor_count
     if not layout_kw['WIDE']:
         tiles = triton.cdiv(m, bm)

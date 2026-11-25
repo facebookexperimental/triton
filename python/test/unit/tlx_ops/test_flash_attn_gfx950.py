@@ -740,6 +740,25 @@ def test_flash_attn_gfx950_invalid_inputs_use_public_exception(invalid, match, r
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
+@pytest.mark.parametrize("context", (128, 150, 384, 400, 511, 512, 513))
+def test_flash_attn_gfx950_short_ragged_inference(context):
+    from triton.tlx.ops import flash_attn
+
+    torch.manual_seed(31)
+    q, k, v = _qkv(128, requires_grad=False, context=context)
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        scores = (q.float() @ k.float().transpose(-2, -1)) * q.shape[-1]**-0.5
+        reference = torch.softmax(scores, dim=-1) @ v.float()
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+    actual = flash_attn(q, k, v)
+    tolerance = 8e-3 * reference.abs().max().item()
+    torch.testing.assert_close(actual.float(), reference, atol=tolerance, rtol=8e-3)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
 def test_flash_attn_gfx950_keeps_inference_only_shapes():
     from triton.tlx.ops import flash_attn
 
