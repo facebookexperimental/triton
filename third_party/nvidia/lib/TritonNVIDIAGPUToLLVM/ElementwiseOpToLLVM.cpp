@@ -4,6 +4,7 @@
 #include "TritonNVIDIAGPUToLLVM/PTXAsmFormat.h"
 #include "Utility.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/Support/LLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/ElementwiseOpToLLVMBase.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
@@ -24,17 +25,10 @@ namespace {
 struct Fp8ConversionDesc {
   std::string ptx;
   int inVecWidthBits;
-  int outVecWidthBits;
   size_t numElements;
 };
 
-static Fp8ConversionDesc Fp_to_Fp8E5M2_RTNE(int computeCapability,
-                                            bool fromFp32) {
-  if (computeCapability >= 89)
-    return {fromFp32 ? "cvt.rn.satfinite.e5m2x2.f32 $0, $2, $1;"
-                     : "cvt.rn.satfinite.e5m2x2.f16x2 $0, $1;",
-            32, 16, 2};
-
+static Fp8ConversionDesc Fp_to_Fp8E5M2_RTNE(bool fromFp32) {
   std::string ptx = R"({
 .reg .b32 h<2>, a<2>, n<2>, t<2>, maxval;
 )";
@@ -91,7 +85,7 @@ lop3.b32 a0, a0, h0, 0x80008000, 0xf8;
 lop3.b32 a1, a1, h1, 0x80008000, 0xf8;
 prmt.b32 $0, a0, a1, 0x7531;
 })";
-  return {ptx, 32, 32, 4};
+  return {ptx, 32, 4};
 }
 
 const Fp8ConversionDesc Fp16_to_Fp8E5M2_RTZ = {
@@ -101,46 +95,14 @@ const Fp8ConversionDesc Fp16_to_Fp8E5M2_RTZ = {
     "and.b32 a1, $2, 0xfffefffe;  \n"   // (strip lowest bit)
     "prmt.b32 $0, a0, a1, 0x7531; \n\t" // output = a1a0
     "}",
-    32, 32, 4};
+    32, 4};
 
-static const Fp8ConversionDesc Fp8E5M2_to_Fp16(bool hasNativeFP) {
-  Fp8ConversionDesc ret;
-  if (!hasNativeFP) {
-    ret = {"{                           \n"
-           "prmt.b32 $0, 0, $2, 0x5140; \n\t"
-           "prmt.b32 $1, 0, $2, 0x7362; \n\t"
-           "}",
-           32, 32, 4};
-  } else {
-    ret = {"cvt.rn.f16x2.e5m2x2 $0, $1; \n\t", 16, 32, 2};
-  }
-  return ret;
-}
-
-static const Fp8ConversionDesc Bf16_to_Fp8E5M2 = {
-    "{                                       \n"
-    ".reg .b16 a<2>;                         \n"
-    ".reg .f32 b<2>;                         \n"
-    "mov.b32 {a0, a1}, $1;                   \n"
-    "cvt.f32.bf16 b0, a0;                    \n"
-    "cvt.f32.bf16 b1, a1;                    \n"
-    "cvt.rn.satfinite.e5m2x2.f32 $0, b1, b0; \n"
+static const Fp8ConversionDesc Fp8E5M2_to_Fp16 = {
+    "{\n"
+    "prmt.b32 $0, 0, $2, 0x5140;\n"
+    "prmt.b32 $1, 0, $2, 0x7362;\n"
     "}",
-    32, 16, 2};
-
-// Fp8E4M3 (x2) -> Fp16 (x2) (packed)
-static const Fp8ConversionDesc Fp8E4M3Nv_to_Fp16 = {
-    "{ \n"
-    "cvt.rn.f16x2.e4m3x2 $0, $1; \n"
-    "}",
-    16, 32, 2};
-
-// Fp16 (x2) -> Fp8E4M3 (x2) (packed)
-static const Fp8ConversionDesc Fp16_to_Fp8E4M3Nv = {
-    "{ \n"
-    "cvt.rn.satfinite.e4m3x2.f16x2 $0, $1; \n"
-    "}",
-    32, 16, 2};
+    32, 4};
 
 static Fp8ConversionDesc Fp8_to_Bf16(int computeCapability, bool isE5M2) {
   if (isE5M2 && computeCapability < 89) {
@@ -161,7 +123,7 @@ cvt.f32.f16 f3, h3;
 prmt.b32 $0, f0, f1, 0x7632;
 prmt.b32 $1, f2, f3, 0x7632;
 })",
-            32, 32, 4};
+            32, 4};
   }
 
   std::string ptx = R"({
@@ -186,24 +148,8 @@ cvt.rn.bf16.f32 b1, c1;
   }
   ptx += R"(mov.b32 $0, {b0, b1};
 })";
-  return {ptx, 16, 32, 2};
+  return {ptx, 16, 2};
 }
-
-// Bf16 (x2) -> Fp8E4M3 (x2) (packed)
-static const Fp8ConversionDesc Bf16_to_Fp8E4M3Nv = {
-    "{                                       \n"
-    ".reg .b16 a<2>;                         \n"
-    ".reg .f32 b<2>;                         \n"
-    "mov.b32 {a0, a1}, $1;                   \n"
-    "cvt.f32.bf16 b0, a0;                    \n"
-    "cvt.f32.bf16 b1, a1;                    \n"
-    "cvt.rn.satfinite.e4m3x2.f32 $0, b1, b0; \n"
-    "}",
-    32, 16, 2};
-
-// Fp32 (x2) -> Fp8 (x2) (packed)
-static const Fp8ConversionDesc Fp32_to_Fp8E4M3Nv = {
-    "cvt.rn.satfinite.e4m3x2.f32  $0, $2, $1; \n", 32, 16, 2};
 
 /* ----- Packed integer to BF16 ------ */
 static const std::string S8_to_Bf16 =
@@ -254,12 +200,11 @@ typedef std::function<SmallVector<Value>(Location, ConversionPatternRewriter &,
 
 static ConverterT makeConverterFromPtx(const std::string &ptxAsm, Type inType,
                                        Type outType,
-                                       const int inVecWidthBits = 32,
-                                       const int outVecWidthBits = 32) {
+                                       const int inVecWidthBits = 32) {
   ConverterT converter =
-      [ptxAsm, inType, outType, inVecWidthBits,
-       outVecWidthBits](Location loc, ConversionPatternRewriter &rewriter,
-                        const SmallVector<Value> &v) -> SmallVector<Value> {
+      [ptxAsm, inType, outType,
+       inVecWidthBits](Location loc, ConversionPatternRewriter &rewriter,
+                       const SmallVector<Value> &v) -> SmallVector<Value> {
     auto b = TritonLLVMOpBuilder(loc, rewriter);
     int numElements = v.size();
     assert(numElements == 4 || numElements == 2 && "invalid vector size");
@@ -278,14 +223,13 @@ static ConverterT makeConverterFromPtx(const std::string &ptxAsm, Type inType,
       inPacked[i] = b.bitcast(inPacked[i], int_ty(inVecWidthBits));
 
     // then, we run the provided inline PTX
-    int outVecWidth = outVecWidthBits / outBitwidth;
+    int outVecWidth = 32 / outBitwidth;
     int outNums = numElements / outVecWidth;
     PTXBuilder builder;
     SmallVector<PTXBuilder::Operand *> operands;
-    auto outConstraint = outVecWidthBits == 16 ? "=h" : "=r";
     auto inConstraint = inVecWidthBits == 16 ? "h" : "r";
     for (int i = 0; i < outNums; i++) {
-      operands.push_back(builder.newOperand(outConstraint));
+      operands.push_back(builder.newOperand("=r"));
     }
 
     for (Value inVal : inPacked) {
@@ -342,9 +286,43 @@ static Value convertFpTrunc(Location loc, ConversionPatternRewriter &rewriter,
       .getResult(0);
 }
 
-// Use packed conversions where the target supports them.
+static ConverterT makeNativeFp8Converter(Type srcTy, Type dstTy, bool useFp32) {
+  return [srcTy, dstTy,
+          useFp32](Location loc, ConversionPatternRewriter &rewriter,
+                   const SmallVector<Value> &values) -> SmallVector<Value> {
+    assert(values.size() == 2 && "expected a packed conversion");
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    Value result;
+    if (useFp32) {
+      Value lo = values[0];
+      Value hi = values[1];
+      if (!srcTy.isF32()) {
+        lo = b.fpext(f32_ty, lo);
+        hi = b.fpext(f32_ty, hi);
+      }
+      // The first scalar operand fills the high half of the packed result.
+      result = NVVM::ConvertF32x2ToF8x2Op::create(
+          rewriter, loc, vec_ty(i8_ty, 2), hi, lo, NVVM::FPRoundingMode::RN,
+          NVVM::SaturationMode::SATFINITE, false, dstTy);
+    } else {
+      Value packed = packLLVector(loc, values, rewriter);
+      if (srcTy.isF16()) {
+        result = NVVM::ConvertF16x2ToF8x2Op::create(
+            rewriter, loc, vec_ty(i8_ty, 2), packed, false, dstTy);
+      } else if (srcTy.isBF16()) {
+        result = NVVM::ConvertBF16x2ToF8x2Op::create(
+            rewriter, loc, vec_ty(i8_ty, 2), packed, NVVM::FPRoundingMode::RN,
+            NVVM::SaturationMode::SATFINITE, false, dstTy);
+      } else {
+        result = NVVM::ConvertF8x2ToF16x2Op::create(
+            rewriter, loc, vec_ty(f16_ty, 2), packed, srcTy, false);
+      }
+    }
+    return unpackLLVector(loc, result, rewriter);
+  };
+}
 
-// Attempts to use vectorized conversions via inline PTX when possible.
+// Use packed conversions where the target supports them.
 struct FpToFpOpConversion
     : public ElementwiseOpConversionBase<FpToFpOp, FpToFpOpConversion> {
   using ElementwiseOpConversionBase<
@@ -378,40 +356,43 @@ struct FpToFpOpConversion
     // Require PTX 9.2 to support both directions.
     bool hasPackedBf16 = computeCapability >= 100 && ptxVersion >= 92;
 
+    if (computeCapability < 89 &&
+        (isa<Float8E4M3FNType>(srcTy) || isa<Float8E4M3FNType>(dstTy))) {
+      llvm::report_fatal_error("Conversion from/to f8e4m3nv is only supported "
+                               "on compute capability >= 89\n");
+    }
+    if (computeCapability >= 89) {
+      if (isa<Float8E4M3FNType, Float8E5M2Type>(dstTy) &&
+          (srcTy.isF16() || srcTy.isBF16() || srcTy.isF32()) &&
+          roundingMode == RoundingMode::RTNE) {
+        bool useFp32 = srcTy.isF32() || (srcTy.isBF16() && !hasPackedBf16);
+        return {makeNativeFp8Converter(srcTy, dstTy, useFp32), 2};
+      }
+      if (isa<Float8E4M3FNType, Float8E5M2Type>(srcTy) && dstTy.isF16() &&
+          !roundingMode.has_value())
+        return {makeNativeFp8Converter(srcTy, dstTy, false), 2};
+    }
+
     DenseMap<std::tuple<TypeID, TypeID, RoundingMode>, Fp8ConversionDesc>
         srcMap = {
             // F8 -> F16
-            {{F8E4M3TyID, F16TyID, undefRounding}, Fp8E4M3Nv_to_Fp16},
-            {{F8E5M2TyID, F16TyID, undefRounding},
-             Fp8E5M2_to_Fp16(computeCapability >= 89)},
-            {{F16TyID, F8E4M3TyID, RoundingMode::RTNE}, Fp16_to_Fp8E4M3Nv},
+            {{F8E5M2TyID, F16TyID, undefRounding}, Fp8E5M2_to_Fp16},
             {{F16TyID, F8E5M2TyID, RoundingMode::RTNE},
-             Fp_to_Fp8E5M2_RTNE(computeCapability, /*fromFp32=*/false)},
+             Fp_to_Fp8E5M2_RTNE(/*fromFp32=*/false)},
             {{F16TyID, F8E5M2TyID, RoundingMode::RTZ}, Fp16_to_Fp8E5M2_RTZ},
-            // F8 -> BF16
+            // NVVM's FP8-to-BF16 op emits a scaled instruction.
+            // Keep the unscaled conversion here.
             {{F8E5M2TyID, BF16TyID, undefRounding},
              hasPackedBf16
-                 ? Fp8ConversionDesc{"cvt.rn.bf16x2.e5m2x2 $0, $1;", 16, 32, 2}
+                 ? Fp8ConversionDesc{"cvt.rn.bf16x2.e5m2x2 $0, $1;", 16, 2}
                  : Fp8_to_Bf16(computeCapability, /*isE5M2=*/true)},
             {{F8E4M3TyID, BF16TyID, undefRounding},
              hasPackedBf16
-                 ? Fp8ConversionDesc{"cvt.rn.bf16x2.e4m3x2 $0, $1;", 16, 32, 2}
+                 ? Fp8ConversionDesc{"cvt.rn.bf16x2.e4m3x2 $0, $1;", 16, 2}
                  : Fp8_to_Bf16(computeCapability, /*isE5M2=*/false)},
-            // BF16 -> F8
-            {{BF16TyID, F8E5M2TyID, RoundingMode::RTNE},
-             hasPackedBf16
-                 ? Fp8ConversionDesc{"cvt.rn.satfinite.e5m2x2.bf16x2 $0, $1;",
-                                     32, 16, 2}
-                 : Bf16_to_Fp8E5M2},
-            {{BF16TyID, F8E4M3TyID, RoundingMode::RTNE},
-             hasPackedBf16
-                 ? Fp8ConversionDesc{"cvt.rn.satfinite.e4m3x2.bf16x2 $0, $1;",
-                                     32, 16, 2}
-                 : Bf16_to_Fp8E4M3Nv},
             // F32 -> F8
-            {{F32TyID, F8E4M3TyID, RoundingMode::RTNE}, Fp32_to_Fp8E4M3Nv},
             {{F32TyID, F8E5M2TyID, RoundingMode::RTNE},
-             Fp_to_Fp8E5M2_RTNE(computeCapability, /*fromFp32=*/true)},
+             Fp_to_Fp8E5M2_RTNE(/*fromFp32=*/true)},
         };
     std::tuple<TypeID, TypeID, RoundingMode> key = {
         srcTy.getTypeID(), dstTy.getTypeID(),
@@ -425,16 +406,11 @@ struct FpToFpOpConversion
       llvm::errs() << "\n";
       llvm::report_fatal_error("Unsupported rounding mode for conversion.");
     }
-    if (computeCapability < 89 && (llvm::isa<Float8E4M3FNType>(srcTy) ||
-                                   llvm::isa<Float8E4M3FNType>(dstTy))) {
-      llvm::report_fatal_error("Conversion from/to f8e4m3nv is only supported "
-                               "on compute capability >= 89\n");
-    }
     auto convDesc = srcMap.lookup(key);
-    return {makeConverterFromPtx(
-                convDesc.ptx, getTypeConverter()->convertType(srcTy),
-                getTypeConverter()->convertType(dstTy), convDesc.inVecWidthBits,
-                convDesc.outVecWidthBits),
+    return {makeConverterFromPtx(convDesc.ptx,
+                                 getTypeConverter()->convertType(srcTy),
+                                 getTypeConverter()->convertType(dstTy),
+                                 convDesc.inVecWidthBits),
             convDesc.numElements};
   }
 
@@ -575,6 +551,49 @@ struct FpToFpOpConversion
     return outVals;
   }
 
+  SmallVector<Value> lowerSrStore(FpToFpOp op,
+                                  ConversionPatternRewriter &rewriter,
+                                  MultipleOperandsRange operands,
+                                  Location loc) const {
+    if ((computeCapability != 100 && computeCapability != 103) ||
+        ptxVersion < 87) {
+      op.emitOpError("SR stores require Blackwell and PTX 8.7 or newer");
+      return {};
+    }
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    SmallVector<Value> result;
+    constexpr unsigned packSize = 2;
+    for (unsigned i = 0; i < operands.size(); i += packSize) {
+      Value first = operands[i][0];
+      Value second =
+          i + 1 < operands.size() ? operands[i + 1][0] : b.undef(f32_ty);
+      Value upper = i + 1 < operands.size() ? operands[i + 1][1] : b.i32_val(0);
+      // Each element uses the low 16 bits of its own Philox r0. Adjacent
+      // elements' entropy is packed separately, without XOR mixing.
+      // Legacy TLX's original mixing remains unchanged.
+      Value entropy = b.or_(b.and_(operands[i][1], b.i32_val(0xffff)),
+                            b.shl(upper, b.i32_val(16)));
+      PTXBuilder builder;
+      // Saturated stores restore input infinities in TTIR before the write.
+      // Bit-exact tests: python/test/unit/language/test_stochastic_rounding.py.
+      auto &cvt =
+          *builder.create(op->hasAttr("sr_satfinite")
+                              ? "cvt.rs.satfinite.bf16x2.f32 $0, $1, $2, $3;"
+                              : "cvt.rs.bf16x2.f32 $0, $1, $2, $3;");
+      cvt({builder.newOperand("=r", "r"), builder.newOperand(second, "r"),
+           builder.newOperand(first, "r"), builder.newOperand(entropy, "r")},
+          /*onlyAttachMLIRArgs=*/true);
+      auto elementType = getTypeConverter()->convertType(bf16_ty);
+      auto packed =
+          builder.launch(rewriter, loc, vec_ty(elementType, packSize), false);
+      for (unsigned lane = 0; lane < packSize && i + lane < operands.size();
+           ++lane)
+        result.push_back(
+            b.extract_element(elementType, packed, b.i32_val(lane)));
+    }
+    return result;
+  }
+
   SmallVector<Value> createDestOps(FpToFpOp op, OpAdaptor adaptor,
                                    ConversionPatternRewriter &rewriter,
                                    Type elemTy, MultipleOperandsRange operands,
@@ -585,6 +604,8 @@ struct FpToFpOpConversion
     auto roundingMode = op.getRounding();
 
     if (roundingMode.has_value() && roundingMode.value() == RoundingMode::RS) {
+      if (op->hasAttr("sr_ieee"))
+        return lowerSrStore(op, rewriter, operands, loc);
       return lowerFpToFpWithStochRounding(op, adaptor, rewriter, elemTy, loc);
     }
 
@@ -679,22 +700,12 @@ struct FDivOpConversion
                                    ConversionPatternRewriter &rewriter,
                                    Type elemTy, MultipleOperandsRange operands,
                                    Location loc) const {
-    unsigned bitwidth = getIntOrFloatOrPtrBitWidth(elemTy);
-    StringRef name;
-    Type resultTy;
-    if (32 == bitwidth) {
-      name = "llvm.nvvm.div.full";
-      resultTy = f32_ty;
-    } else if (64 == bitwidth) {
-      name = "llvm.nvvm.div.rn.d";
-      resultTy = f64_ty;
-    } else {
+    if (!elemTy.isF32() && !elemTy.isF64())
       llvm::report_fatal_error("Unsupported bitwidth");
-    }
-    Value args[] = {operands[0][0], operands[0][1]};
-    auto callOp =
-        LLVM::createLLVMIntrinsicCallOp(rewriter, loc, name, resultTy, args);
-    return {callOp.getResult(0)};
+    return {NVVM::DivFOp::create(
+        rewriter, loc, elemTy, operands[0][0], operands[0][1],
+        elemTy.isF32() ? NVVM::FPRoundingMode::NONE : NVVM::FPRoundingMode::RN,
+        /*ftz=*/false, /*approx=*/false, /*full=*/elemTy.isF32())};
   }
 };
 
@@ -754,11 +765,7 @@ struct ExpOpConversionApprox
     const double log2e = 1.4426950408889634;
     Value prod = b.fmul(f32_ty, operands[0][0], b.f32_val(log2e));
 
-    Type resultTy = operands[0][0].getType();
-    StringRef name = "llvm.nvvm.ex2.approx";
-    auto callOp =
-        LLVM::createLLVMIntrinsicCallOp(rewriter, loc, name, resultTy, {prod});
-    return {callOp.getResult(0)};
+    return {NVVM::Ex2Op::create(rewriter, loc, f32_ty, prod, /*ftz=*/false)};
   }
 };
 
@@ -774,7 +781,10 @@ struct PackedArithOpConversion
     auto spec = nvidia_gpu::getPackedArithInstructionSpec(op);
     const auto &resultInfo = *spec.result;
     unsigned packWidth = resultInfo.lanes;
-
+    bool isHomogeneousHalf =
+        (resultInfo.suffix == "f16x2" || resultInfo.suffix == "bf16x2") &&
+        llvm::all_of(spec.operands,
+                     [&](const auto *info) { return info == spec.result; });
     SmallVector<SmallVector<Value>> operandValues;
     for (auto [operand, converted] :
          llvm::zip(op.getOperands(), adaptor.getOperands())) {
@@ -797,33 +807,72 @@ struct PackedArithOpConversion
     SmallVector<Value> packedResults;
     packedResults.reserve(packCount * packWidth);
     for (unsigned packIndex = 0; packIndex < packCount; ++packIndex) {
-      PTXBuilder ptxBuilder;
-      SmallVector<PTXBuilder::Operand *> asmOperands;
-      asmOperands.push_back(ptxBuilder.newOperand(
-          "=" +
-          NVIDIA::getPtxRegisterSizeCode(resultInfo.registerBits, false)));
+      SmallVector<Value> packedOperands;
       for (auto [index, values] : llvm::enumerate(operandValues)) {
         const auto &info = *spec.operands[index];
         unsigned width = info.storageLanes();
         auto lanes = ArrayRef(values).slice(packIndex * width, width);
-        Value packed = b.bitcast(packLLVector(loc, lanes, rewriter),
-                                 int_ty(info.registerBits));
-        asmOperands.push_back(ptxBuilder.newOperand(
-            packed, NVIDIA::getPtxRegisterSizeCode(info.registerBits, false)));
+        packedOperands.push_back(packLLVector(loc, lanes, rewriter));
       }
+      Value resultVector;
+      if (isHomogeneousHalf) {
+        switch (op.getOpKind()) {
+        case nvidia_gpu::PackedArithOpKind::ADD:
+          resultVector =
+              NVVM::AddFOp::create(rewriter, loc, resultVectorType,
+                                   packedOperands[0], packedOperands[1]);
+          break;
+        case nvidia_gpu::PackedArithOpKind::SUB:
+          resultVector =
+              NVVM::SubFOp::create(rewriter, loc, resultVectorType,
+                                   packedOperands[0], packedOperands[1]);
+          break;
+        case nvidia_gpu::PackedArithOpKind::FMA:
+          resultVector = NVVM::FmaOp::create(
+              rewriter, loc, resultVectorType, packedOperands[0],
+              packedOperands[1], packedOperands[2], NVVM::FPRoundingMode::RN);
+          break;
+        case nvidia_gpu::PackedArithOpKind::MIN:
+        case nvidia_gpu::PackedArithOpKind::MAX: {
+          StringRef name = op.getOpKind() == nvidia_gpu::PackedArithOpKind::MIN
+                               ? "llvm.nvvm.fmin."
+                               : "llvm.nvvm.fmax.";
+          resultVector = LLVM::createLLVMIntrinsicCallOp(
+                             rewriter, loc, (name + resultInfo.suffix).str(),
+                             resultVectorType, packedOperands)
+                             .getResult(0);
+          break;
+        }
+        default:
+          break;
+        }
+      }
+      if (!resultVector) {
+        PTXBuilder ptxBuilder;
+        SmallVector<PTXBuilder::Operand *> asmOperands;
+        asmOperands.push_back(ptxBuilder.newOperand(
+            "=" +
+            NVIDIA::getPtxRegisterSizeCode(resultInfo.registerBits, false)));
+        for (auto [index, packed] : llvm::enumerate(packedOperands)) {
+          unsigned bits = spec.operands[index]->registerBits;
+          asmOperands.push_back(ptxBuilder.newOperand(
+              b.bitcast(packed, int_ty(bits)),
+              NVIDIA::getPtxRegisterSizeCode(bits, false)));
+        }
+        auto &instruction = *ptxBuilder.create(
+            stringifyPackedArithOpKind(op.getOpKind()).str());
+        instruction.o(spec.modifiers.str(), !spec.modifiers.empty())
+            .o(resultInfo.suffix.str());
+        for (const auto *info :
+             ArrayRef(spec.operands).take_front(spec.operandSuffixes))
+          instruction.o(info->suffix.str());
+        instruction(asmOperands);
 
-      auto &instruction =
-          *ptxBuilder.create(stringifyPackedArithOpKind(op.getOpKind()).str());
-      instruction.o(spec.modifiers.str(), !spec.modifiers.empty())
-          .o(resultInfo.suffix.str());
-      for (const auto *info :
-           ArrayRef(spec.operands).take_front(spec.operandSuffixes))
-        instruction.o(info->suffix.str());
-      instruction(asmOperands);
-
-      Value packedResult = ptxBuilder.launch(rewriter, loc, resultRegisterType,
-                                             /*hasSideEffect=*/false);
-      Value resultVector = b.bitcast(packedResult, resultVectorType);
+        Value packedResult =
+            ptxBuilder.launch(rewriter, loc, resultRegisterType,
+                              /*hasSideEffect=*/false);
+        resultVector = b.bitcast(packedResult, resultVectorType);
+      }
       llvm::append_range(packedResults,
                          unpackLLVector(loc, resultVector, rewriter));
     }

@@ -8,6 +8,7 @@ from unittest import mock
 
 import sympy
 import torch
+from torch._dynamo.testing import CompileCounterWithBackend
 from torch._inductor import config
 from torch._inductor.codegen.simd_kernel_features import (
     DisableReduction,
@@ -668,6 +669,14 @@ class TestTLXTemplates(TestCase):
             self.assertIs(_tlx_registry._is_gfx950(), True)
             self.assertIs(_tlx_registry._is_gfx942(), True)
 
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_blackwell_gemm_ws_grid_pads_m_tiles_to_cluster(self):
+        # M=6202 has 25 M tiles of 256; a 2-CTA grid must be a whole number of clusters.
+        from triton.language.extra.tlx.inductor import mm_templates as _tlx_mm
+
+        meta = {"BLOCK_M": 256, "BLOCK_N": 128, "NUM_SMS": 148, "NUM_CTAS": 2}
+        self.assertEqual(_tlx_mm._persistent_mm_grid_split_k(6202, 384, meta), (78, 1, 1))
+
     @staticmethod
     @contextlib.contextmanager
     def _force_warppipe_split_k_choice():
@@ -840,6 +849,56 @@ class TestTLXTemplates(TestCase):
                 config.patch({"triton.tlx_mode": mode}),
         ):
             self.assertEqual(heuristic.should_run(inputs), accepted)
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_matmul_ws_fp32_operand_layout(self):
+        # tcgen05.mma rejects transposed FP32 SMEM operands: FP32 needs K-inner A and B.
+        from torch._inductor.kernel_inputs import MMKernelInputs
+        from triton.language.extra.tlx.inductor import registry as _tlx_registry
+
+        m = k = n = 256
+        device = torch.device("cuda")
+        graph = mock.Mock(sizevars=SizeVarAllocator(), unaligned_buffers=set())
+        heuristic = object.__new__(_tlx_registry.BlackwellGemmWSConfigHeuristic)
+
+        def should_run(a_strides):
+            return heuristic.should_run(
+                MMKernelInputs([
+                    ir.Buffer(name="a", layout=ir.FixedLayout(device, torch.float32, [m, k], a_strides)),
+                    ir.Buffer(name="b", layout=ir.FixedLayout(device, torch.float32, [k, n], (1, k))),
+                ]))
+
+        with (
+                V.set_graph_handler(graph),
+                mock.patch("torch.utils._triton.has_triton_tma_device", return_value=True),
+                mock.patch.object(_tlx_registry, "_mm_allow_tf32", return_value=True),
+                config.patch({"triton.tlx_mode": "allow"}),
+        ):
+            self.assertTrue(should_run((k, 1)))
+            self.assertFalse(should_run((1, m)))
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_matmul_ws_smem_check_scales_with_operand_bytes(self):
+        from triton.language.extra.tlx.inductor import registry as _tlx_registry
+
+        heuristic = _tlx_registry.BlackwellGemmWSConfigHeuristic
+        tile = (128, 128, 64, 4, 2, 1, 1, 2)  # BM, BN, BK, smem, tmem, groups, ctas, subtile
+        self.assertTrue(heuristic._is_valid_config_with_margin(*tile))
+        self.assertFalse(heuristic._is_valid_config_with_margin(*tile, 4))
+        template_kwargs = {
+            "BLOCK_M": 128,
+            "BLOCK_N": 256,
+            "BLOCK_K": 32,
+            "NUM_SMEM_BUFFERS": 3,
+            "NUM_TMEM_BUFFERS": 1,
+            "NUM_MMA_GROUPS": 1,
+            "NUM_CTAS": 1,
+            "EPILOGUE_SUBTILE": 1,
+            "SPLIT_K": 1,
+        }
+        tma = [kw["TMA_EPILOGUE_STORE"] for kw in heuristic._yield_tma_variants(template_kwargs)]
+        tma_fp32 = [kw["TMA_EPILOGUE_STORE"] for kw in heuristic._yield_tma_variants(template_kwargs, 4)]
+        self.assertEqual((tma, tma_fp32), ([1], [0]))
 
     @unittest.skipIf(not has_tlx(), "TLX not available")
     def test_tlx_amd_mm_template_is_registered_once(self):
@@ -2565,6 +2624,118 @@ class TestTLXTemplates(TestCase):
         self.assertIn("tlx.async_load", src)  # aligned-K async path
         self.assertIn("a_reg = tl.load", src)  # register-path fallback load
 
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_amd_stride_assume_nonnegative_source(self):
+        """Inductor bakes a size-1 or broadcast operand dim in as a literal 0 stride, so a strict
+        `tl.assume(stride > 0)` folds to `llvm.assume(false)` and the kernel compiles to a lone
+        `s_trap 2`. Source check -- no GPU needed."""
+        from triton.language.extra.tlx.inductor.mm_templates import load_tlx_template
+
+        for name in (
+                "gfx942_mm_register",
+                "gfx950_addmm_interwave",
+                "gfx950_addmm_persistent_warppipe",
+                "gfx950_addmm_warppipe",
+                "gfx950_bmm_warppipe",
+                "gfx950_mm_local_split_u",
+                "gfx950_mm_persistent",
+                "gfx950_mm_register",
+        ):
+            src = load_tlx_template(name)
+            self.assertIsNone(re.search(r"tl\.assume\(stride_\w+ > 0\)", src), name)
+            self.assertIn("tl.assume(stride_am >= 0)", src)
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX warp-pipe bmm template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_bmm_warppipe_zero_stride_m(self):
+        """M=1 bmm whose A has a 0 stride on the size-1 M dim, with a dynamic batch (the faulting
+        production bmm: batch=8*s, m=1, n=32, k=4 -> register path). With a strict stride assume
+        every launch of the TLX candidate trapped (HSA_STATUS_ERROR_EXCEPTION, SIGABRT)."""
+        batch, M, K, N = 24576, 1, 4, 32
+        a = torch.randn(batch * K, device=GPU_TYPE, dtype=torch.float16).as_strided((batch, M, K), (K, 0, 1))
+        b = torch.randn(batch, K, N, device=GPU_TYPE, dtype=torch.float16)
+        torch._dynamo.mark_dynamic(a, 0)
+        torch._dynamo.mark_dynamic(b, 0)
+
+        def bmm(a, b):
+            return torch.bmm(a, b)
+
+        with config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "enable_caching_generated_triton_templates": False,
+                # With coordinate descent on, the bmm decomposition turns an m == 1 bmm into mul+sum.
+                "coordinate_descent_tuning": False,
+        }):
+            c_actual, code = run_and_get_code(torch.compile(bmm), a, b)
+
+        c_expected = torch.bmm(a.float(), b.float()).to(torch.float16)
+        torch.testing.assert_close(c_actual, c_expected, atol=2e-2, rtol=2e-2)
+        self.assertIn("triton_tem", "\n".join(code))
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX warp-pipe addmm template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_addmm_warppipe_broadcast_a(self):
+        """addmm whose A is a broadcast row (stride_am == 0). With a strict stride assume every
+        TLX addmm candidate compiled to a lone `s_trap 2` and its benchmark launch aborted the
+        process. Odd K selects the register path (USE_ASYNC=0)."""
+        M, K, N = 512, 255, 256
+        a = torch.randn(1, K, device=GPU_TYPE, dtype=torch.float16).expand(M, K)
+        w = torch.randn(N, K, device=GPU_TYPE, dtype=torch.float16)
+        bias = torch.randn(N, device=GPU_TYPE, dtype=torch.float16)
+
+        def addmm(bias, a, w):
+            return torch.addmm(bias, a, w.t())
+
+        with config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "enable_caching_generated_triton_templates": False,
+        }):
+            c_actual, code = run_and_get_code(torch.compile(addmm), bias, a, w)
+
+        c_expected = (a.float() @ w.t().float() + bias.float()).to(torch.float16)
+        torch.testing.assert_close(c_actual, c_expected, atol=2e-2, rtol=2e-2)
+        self.assertIn("triton_tem", "\n".join(code))
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX mm templates",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_mm_broadcast_a(self):
+        """mm whose A is a broadcast row (stride_am == 0); the gfx950 register, local-split-U and
+        persistent mm templates used to trap on it like the warp-pipe templates."""
+        M, K, N = 512, 256, 256
+        a = torch.randn(1, K, device=GPU_TYPE, dtype=torch.float16).expand(M, K)
+        b = torch.randn(K, N, device=GPU_TYPE, dtype=torch.float16)
+
+        def mm(a, b):
+            return torch.mm(a, b)
+
+        with config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "enable_caching_generated_triton_templates": False,
+        }):
+            c_actual, code = run_and_get_code(torch.compile(mm), a, b)
+
+        c_expected = (a.float() @ b.float()).to(torch.float16)
+        torch.testing.assert_close(c_actual, c_expected, atol=2e-2, rtol=2e-2)
+        self.assertIn("triton_tem", "\n".join(code))
+
     @unittest.skipIf(
         not is_gfx950(),
         "Need AMD MI350X (gfx950) for the TLX persistent warp-pipe addmm template",
@@ -2958,12 +3129,10 @@ class TestHopperMMTemplate(TestCase):
     ))
     @parametrize("op", ("mm", "addmm"))
     def test_dynamic_m(self, template, marker, k, op):
-        """A dynamic M leaves A's TMA descriptor with a symbolic shape. A launcher
-        that reads dynamic sizes at launch builds it on the host; otherwise it is
-        built on the device. B's, all static, stays on the host either way. A
-        second M reuses the compiled kernel and must not reuse A's descriptor."""
-        from torch._inductor.runtime import triton_heuristics
-
+        """A dynamic M leaves A's TMA descriptor with a symbolic shape; the launcher
+        builds it on the host from the dynamic size it reads at launch. B's, all
+        static, stays on the host too. A second M reuses the compiled kernel and
+        must not reuse A's descriptor."""
         bias = torch.randn(256, device=GPU_TYPE, dtype=torch.float16)
         fn = torch.mm if op == "mm" else functools.partial(torch.addmm, bias)
         with config.patch({**_HOPPER_ADDMM_PATCH, "test_configs.autotune_choice_name_regex": template}):
@@ -2978,11 +3147,79 @@ class TestHopperMMTemplate(TestCase):
                     generated = "\n".join(code)
         self.assertIn(marker, generated)
         self.assertNotIn("desc_b = tl.make_tensor_descriptor(", generated)
-        if getattr(triton_heuristics, "HOST_TMA_SYMBOLIC_DIMS", False):
-            self.assertNotIn("tl.make_tensor_descriptor(base=arg_A", generated)
-            self.assertRegex(generated, r"'arg_A': \{'block_shape': \[[0-9, ]+\], 'shape': \['ks0'")
+        self.assertNotIn("tl.make_tensor_descriptor(base=A", generated)
+        self.assertRegex(generated, r"'arg_A': \{'block_shape': \[[0-9, ]+\], 'shape': \['ks0'")
+
+    @parametrize("template,marker,k", (
+        ("tlx_hopper_gemm_ws", _HOPPER_WS, 1096),
+        ("tlx_hopper_gemm_small_k", _HOPPER_SMALL_K, 256),
+    ))
+    @parametrize("op", ("mm", "addmm"))
+    @parametrize("compile_time_autotune", (True, False))
+    def test_dynamic_m_cpp_wrapper(self, template, marker, k, op, compile_time_autotune):
+        """Under the C++ wrapper with compile-time autotuning (AOTInductor's
+        default), the kernel's call wrapper builds both host-side TMA descriptors,
+        A's from the dynamic size ks0 it takes as a parameter, so neither is built
+        on the device. A second M reuses the compiled kernel with a descriptor of
+        the new shape. The lazy-compile wrapper cannot take a template's host-side
+        descriptor, so there both stay on the device."""
+        bias = torch.randn(256, device=GPU_TYPE, dtype=torch.float16)
+        fn = torch.mm if op == "mm" else functools.partial(torch.addmm, bias)
+        with config.patch({
+                **_HOPPER_ADDMM_PATCH,
+                "cpp_wrapper": True,
+                "triton.autotune_at_compile_time": compile_time_autotune,
+                "test_configs.autotune_choice_name_regex": template,
+        }):
+            counter = CompileCounterWithBackend("inductor")
+            compiled = torch.compile(fn, backend=counter)
+            for m in (706, 300):
+                a, b = _operands((m, 256, k), "nt", torch.float16)
+                torch._dynamo.mark_dynamic(a, 0)
+                expected = (a.float() @ b.float() + (bias.float() if op == "addmm" else 0)).half()
+                if m == 706:
+                    # run_and_get_code resets dynamo, so only the first M goes through it.
+                    actual, code = run_and_get_code(compiled, a, b)
+                    generated = "\n".join(code)
+                else:
+                    actual = compiled(a, b)
+                torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+        self.assertEqual(counter.frame_count, 1, "a second M must reuse the compiled code")
+        self.assertIn(marker, generated)
+        if compile_time_autotune:
+            self.assertNotIn("tl.make_tensor_descriptor(base=A", generated)
+            self.assertNotIn("tl.make_tensor_descriptor(base=B", generated)
+            self.assertIn("arg_A_tma_tensor_", generated)
+            self.assertRegex(generated, r"arg_A\.global_shape\[0\] = static_cast<uint64_t>\(ks0\);")
         else:
-            self.assertIn("desc_a = tl.make_tensor_descriptor(", generated)
+            self.assertIn("tl.make_tensor_descriptor(base=A", generated)
+            self.assertNotIn("_tma_tensor_", generated)
+
+    @parametrize("cpp_wrapper", (False, True))
+    def test_host_tma_offset_operand(self, cpp_wrapper):
+        """A view with a storage offset (here a column slice taken inside the
+        graph) keeps a device-side descriptor: the template moves its pointer by
+        the offset in the kernel, which a host-side descriptor cannot carry. The
+        other operand keeps its host descriptor."""
+        m, k, n, skip = 706, 1096, 256, 16
+        x = torch.randn(m, k + skip, device=GPU_TYPE, dtype=torch.float16)
+        b = torch.randn(n, k, device=GPU_TYPE, dtype=torch.float16).t()
+
+        def fn(x, b):
+            return x[:, skip:] @ b
+
+        patch = {**_HOPPER_ADDMM_PATCH, "test_configs.autotune_choice_name_regex": "tlx_hopper_gemm_ws"}
+        if cpp_wrapper:
+            patch.update({"cpp_wrapper": True, "triton.autotune_at_compile_time": True})
+        with config.patch(patch):
+            torch._dynamo.mark_dynamic(x, 0)
+            actual, code = run_and_get_code(torch.compile(fn), x, b)
+        torch.testing.assert_close(actual, (x[:, skip:].float() @ b.float()).half(), atol=2e-2, rtol=2e-2)
+        generated = "\n".join(code)
+        self.assertIn(_HOPPER_WS, generated)
+        self.assertIn(f"A = arg_A + {skip}", generated)
+        self.assertIn("tl.make_tensor_descriptor(base=A", generated)
+        self.assertNotIn("tl.make_tensor_descriptor(base=B", generated)
 
     @parametrize("block_n", (192, 96))
     @parametrize("bias_shape", ("n", "mn"))
@@ -3745,6 +3982,24 @@ HEURISTIC_CONFIG_CASES = [
             "SPLIT_K": 1,
         },
     ),
+    # Rule 1b via alt-tiling (torchTLX-only): AI>1.5, N<1024 unaligned, m_tiles>74.
+    # tlx.ops would pick Rule 3 here.
+    (
+        "rule_1b_alt_tiling",
+        32768,
+        257,
+        4096,
+        {
+            "BLOCK_SIZE_M": 256,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 128,
+            "NUM_CTAS": 2,
+            "NUM_MMA_GROUPS": 2,
+            "NUM_SMEM_BUFFERS": 2,
+            "INTERLEAVE_EPILOGUE": 1,
+            "SPLIT_K": 1,
+        },
+    ),
     # Rule 3: tall_m, saturated, AI>1.5, no alt-tiling, K>N*2
     (
         "rule_3",
@@ -3810,6 +4065,23 @@ HEURISTIC_CONFIG_CASES = [
             "NUM_MMA_GROUPS": 2,
             "EPILOGUE_SUBTILE": 8,
             "SPLIT_K": 4,
+            "INTERLEAVE_EPILOGUE": 1,
+        },
+    ),
+    # Rule 5 at SPLIT_K=1 (torchTLX-only): k_tiles=4 is too few to split.
+    # tlx.ops would fall through to its candidate scorer here.
+    (
+        "rule_5_no_split_k",
+        1025,
+        1024,
+        256,
+        {
+            "BLOCK_SIZE_M": 256,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 64,
+            "NUM_CTAS": 1,
+            "EPILOGUE_SUBTILE": 8,
+            "SPLIT_K": 1,
             "INTERLEAVE_EPILOGUE": 1,
         },
     ),
@@ -5898,6 +6170,16 @@ class TestSdpaToFlex(TestCase):
         def fn(q, k):
             return torch.nn.functional.scaled_dot_product_attention(q, k, k if v is None else v)
 
+        from torch.nn.attention import sdpa_kernel
+
+        try:
+            with sdpa_kernel(sdpa_backend):
+                fn(q, kv)
+        except RuntimeError as e:
+            if "No available kernel" not in str(e):
+                raise
+            self.skipTest(f"no {backend} SDPA kernel for these inputs on this build")
+
         out, grads, code = self._compile_fw_bw(fn, q, kv, routed=True, backend=sdpa_backend)
         ref, ref_grads, ref_code = self._compile_fw_bw(fn, q, kv, routed=False, backend=sdpa_backend)
         self.assertRegex(code, rf"triton_tem_fused_\w*scaled_dot_product_{backend}_attention_backward")
@@ -6662,6 +6944,101 @@ class TestWarppipeInt32Gate(TestCase):
                 use_async=False,
                 persistent=True,
             ))
+
+
+@instantiate_parametrized_tests
+class TestConv1dToMm(TestCase):
+    """tlx_config.conv1d_to_mm: (K, 1) convs lowered to GEMMs and fused pointwise ops.
+
+    Eligible convs must drop the extern conv kernels that the lowering replaces and
+    match stock PT2 in the forward output and every grad.
+    """
+
+    def _compile_fw_bw(self, module, fn, x, routed):
+        x = x.detach().requires_grad_(True)
+        module.zero_grad(set_to_none=True)
+        torch._dynamo.reset()
+        with tlx_config.patch(conv1d_to_mm=routed), config.patch(
+            {"force_disable_caches": True, "triton.tlx_mode": "allow"}):
+            out, code = run_fw_bw_and_get_code(lambda: fn(x))
+        grads = [x.grad] + [p.grad for p in module.parameters()]
+        return out, grads, "\n".join(code)
+
+    @unittest.skipIf(not is_hopper(), "Need H100 (sm90)")
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @parametrize("C,L,K,P,groups,channels_last", (
+        (96, 200, 3, 0, 1, True),
+        (96, 250, 3, 1, 1, True),
+        (96, 250, 1, 0, 1, False),
+        (96, 250, 3, 1, 96, False),
+        (64, 129, 3, 1, 64, False),
+    ))
+    def test_routes_eligible(self, C, L, K, P, groups, channels_last):
+        import triton.language.extra.tlx.inductor.registry  # noqa: F401
+
+        torch.manual_seed(0)
+        conv = torch.nn.Conv2d(C, C, (K, 1), padding=(P, 0), groups=groups)
+        conv = conv.to(GPU_TYPE, torch.bfloat16)
+        x = torch.randn(64, C, L, 1, device=GPU_TYPE, dtype=torch.bfloat16)
+        if channels_last:
+            conv = conv.to(memory_format=torch.channels_last)
+            x = x.to(memory_format=torch.channels_last)
+        fn = torch.compile(lambda t: torch.nn.functional.gelu(conv(t)))
+
+        out, grads, code = self._compile_fw_bw(conv, fn, x, routed=True)
+        ref, ref_grads, ref_code = self._compile_fw_bw(conv, fn, x, routed=False)
+        self.assertIn("convolution_backward", ref_code)
+        if groups > 1:
+            self.assertNotRegex(code, r"extern_kernels\.convolution|aten\.convolution_backward\.default\(")
+        elif K == 1:
+            self.assertNotIn("aten.convolution_backward.default(", code)
+        else:
+            self.assertRegex(code, r"extern_kernels\.mm\(|triton_tem_fused")
+        for got, want in zip((out, *grads), (ref, *ref_grads)):
+            self.assertLessEqual(_rel_l2(got, want), 1e-2)
+
+    @unittest.skipIf(not is_hopper(), "Need H100 (sm90)")
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @parametrize("C,K,W", ((32, (3, 3), 16), (128, (3, 1), 1)))
+    def test_ineligible_keeps_conv(self, C, K, W):
+        """A 2-D kernel, and a dense conv on 64-channel multiples where cuDNN is faster."""
+        import triton.language.extra.tlx.inductor.registry  # noqa: F401
+
+        torch.manual_seed(0)
+        padding = (1, 1) if K[1] == 3 else (1, 0)
+        conv = torch.nn.Conv2d(C, C, K, padding=padding).to(GPU_TYPE, torch.bfloat16)
+        x = torch.randn(4, C, 16, W, device=GPU_TYPE, dtype=torch.bfloat16)
+        _, _, code = self._compile_fw_bw(conv, torch.compile(conv), x, routed=True)
+        self.assertIn("convolution_backward", code)
+
+    @unittest.skipIf(not is_hopper(), "Need H100 (sm90)")
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_prod_wgrad_vs_fp64(self):
+        """IG-CTR dense (3, 1) wgrad at L=2500: within 2x of stock's error against fp64."""
+        import triton.language.extra.tlx.inductor.registry  # noqa: F401
+
+        torch.manual_seed(0)
+        n, c, length, k = 1365, 96, 2500, 3
+        conv = torch.nn.Conv2d(c, c, (k, 1), bias=False).to(GPU_TYPE, torch.bfloat16)
+        conv = conv.to(memory_format=torch.channels_last)
+        x = torch.randn(n, c, length, 1, device=GPU_TYPE, dtype=torch.bfloat16)
+        x = x.to(memory_format=torch.channels_last)
+        g = torch.randn(n, c, length - k + 1, 1, device=GPU_TYPE, dtype=torch.bfloat16)
+        g = g.to(memory_format=torch.channels_last)
+
+        def wgrad(routed):
+            conv.zero_grad(set_to_none=True)
+            torch._dynamo.reset()
+            with tlx_config.patch(conv1d_to_mm=routed), config.patch(
+                {"force_disable_caches": True, "triton.tlx_mode": "allow"}):
+                torch.compile(conv)(x).backward(g)
+            return conv.weight.grad
+
+        routed, stock = wgrad(True), wgrad(False)
+        xs, gs = x[..., 0].double(), g[..., 0].double()
+        lo = length - k + 1
+        ref = torch.stack([torch.einsum("nol,ncl->oc", gs, xs[:, :, i:i + lo]) for i in range(k)], dim=2).unsqueeze(-1)
+        self.assertLessEqual(_rel_l2(routed, ref), max(1e-3, 2 * _rel_l2(stock, ref)))
 
 
 if __name__ == "__main__":

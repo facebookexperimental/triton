@@ -143,6 +143,7 @@ class Result:
     #: number cannot be reproduced or attributed: two runs of the same shape at
     #: `space="full"` may land on different tiles.
     best_config: Optional[str] = None
+    autotune: list[dict] = dataclasses.field(default_factory=list)
     #: Free-text, carried into the failure message and the artifact.
     notes: list = dataclasses.field(default_factory=list)
     #: Op-specific derived metrics, JSON-serializable. The dividing line against
@@ -167,6 +168,7 @@ class Result:
             "t_compile_single_s": self.t_compile_single_s,
             "n_configs": self.n_configs,
             "best_config": self.best_config,
+            "autotune": list(self.autotune),
             "notes": list(self.notes),
             "extra": dict(self.extra),
         }

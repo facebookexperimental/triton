@@ -79,8 +79,9 @@ def matmul_tma_set_block_size_hook(nargs):
     for piece, name in ((n1, "b_tail_desc"), (n2, "b_tail2_desc")):
         nargs[name].block_shape = [piece or n0, block_k]
     if swap_ab:
-        # The kernel computes C^T; each consumer stores its transposed tile.
-        epilogue_block = [block_n, block_m_split]
+        # The kernel computes C^T; each consumer stores its transposed tile, or
+        # its first N piece.
+        epilogue_block = [n0, block_m_split]
     elif _npot_subtile(block_n):
         epilogue_block = [block_m_split, n1 // 2]
     elif n1:
@@ -91,7 +92,8 @@ def matmul_tma_set_block_size_hook(nargs):
     c = nargs["c_desc"]
     c.block_shape = epilogue_block
     for piece, name in ((n1, "c_tail_desc"), (n2, "c_tail2_desc")):
-        nargs[name].block_shape = [block_m_split, piece] if piece else epilogue_block
+        tail_block = [piece, block_m_split] if swap_ab else [block_m_split, piece]
+        nargs[name].block_shape = tail_block if piece else epilogue_block
 
     split_k = nargs["SPLIT_K"]
     workspace_desc = nargs["workspace_desc"]
@@ -435,14 +437,34 @@ def heuristic_config(M, N, K, b_row_major=True, *, invariance=None):
         # Square shapes favor 128x256 tiles. The 4-stage ring (the SMEM max)
         # wins at large K but regresses some tall shapes with K <= 512.
         return [_config(block_m, block_n, 4 if K >= 1024 else 3)]
+    _, block_m, block_n, split_k = _heuristic_pick(M, N, K, b_row_major, gemm_fixed_split_k(invariance))
+    num_stages = _heuristic_stages(block_m, block_n, split_k)
+    assert _fits_smem(block_m, block_n, num_stages, split_k)
+    # Row-major tile order only where the full-space prune keeps it (N <= 512,
+    # and split-K, whose configs are all G=1); otherwise the grouped order wins
+    # (706x2560x2560: 23.6 vs 29.2 us, 706x2560x20992: 130 vs 167 us).
+    group_size_m = 1 if split_k > 1 or N <= 512 else 8
+    return [_config(block_m, block_n, num_stages, group_size_m=group_size_m, split_k=split_k)]
+
+
+def _heuristic_pick(M, N, K, b_row_major, fixed=None, swapped=False):
+    """(cost, BM, BN, SPLIT_K) of the sub-wave heuristic pick for the kernel's (M, N, K).
+
+    A swapped pick runs whole-K on 128-row tiles, whose transposed epilogue
+    rows stay 64 wide as in the skinny swap path."""
+    num_sms = _get_num_sms()
     # Under two waves of the wide tile, wave quantization dominates: take the
     # power-of-two tile and K split the cost model rates fastest, preferring
     # fewer splits, then the larger tile, on a tie.
-    tiles = [(block_m, block_n), (128, 128), (128, 64)] if N > 64 else [(128, 64)]
-    fixed = gemm_fixed_split_k(invariance)
+    wide = (256, 128) if M > N and not swapped else (128, 256)
+    tiles = [wide, (128, 128), (128, 64)] if N > 64 else [(128, 64)]
+    if swapped:
+        splits = (1, )
+    else:
+        splits = (1, ) + _SPLIT_K_CHOICES if fixed is None else (fixed, )
     candidates = []
     for bm, bn in tiles:
-        for split_k in (1, ) + _SPLIT_K_CHOICES if fixed is None else (fixed, ):
+        for split_k in splits:
             if fixed is None and split_k > 1 and (_mn_tiles(M, N, bm, bn) * split_k > num_sms
                                                   or not _split_k_valid(K, split_k)):
                 continue
@@ -451,18 +473,67 @@ def heuristic_config(M, N, K, b_row_major=True, *, invariance=None):
     # The two-piece 192 tile, for a K-major B: on a tie with 128x128, and against
     # a wider tile only when it cuts the cost by 10% (706x3072x12288: 100.8 vs
     # 118.6 us; 706x20992x512, 6% by the model: 33.4 vs 32.8 us). The 96 tile at
-    # best ties a power-of-two tile here.
-    if not b_row_major and N > 128 and split_k == 1:
+    # best ties a power-of-two tile here. Swapped picks stay power-of-two: the
+    # model rates a swapped 192 tile 25% ahead on 264x6144x4096 (row-major A
+    # and B), but it measures 56.3 vs 54.0 us direct; the full space still
+    # times swapped NPOT tiles.
+    if not b_row_major and N > 128 and split_k == 1 and not swapped:
         margin = 0.9 if block_m * block_n > 128 * 128 else 1.0
-        if _heuristic_cost(M, N, K, 128, 192, 1, num_sms) <= margin * cost:
-            block_m, block_n = 128, 192
-    num_stages = _heuristic_stages(block_m, block_n, split_k)
-    assert _fits_smem(block_m, block_n, num_stages, split_k)
-    # Row-major tile order only where the full-space prune keeps it (N <= 512,
-    # and split-K, whose configs are all G=1); otherwise the grouped order wins
-    # (706x2560x2560: 23.6 vs 29.2 us, 706x2560x20992: 130 vs 167 us).
-    group_size_m = 1 if split_k > 1 or N <= 512 else 8
-    return [_config(block_m, block_n, num_stages, group_size_m=group_size_m, split_k=split_k)]
+        npot_cost = _heuristic_cost(M, N, K, 128, 192, 1, num_sms)
+        if npot_cost <= margin * cost:
+            cost, block_m, block_n = npot_cost, 128, 192
+    return cost, block_m, block_n, split_k
+
+
+# Swap-AB past skinny M: computing C^T puts the problem's M on the kernel's N,
+# so a tile that fits M (and, for a row-major A, a K-major-B NPOT tile) is
+# reachable when B is row-major. Swapped kernels run whole-K. Model ties keep
+# the direct orientation; the full space times the swap when it is within 5%.
+_WIDE_SWAP_MARGIN = 0.97
+_WIDE_SWAP_COMPETITIVE = 1.05
+
+
+@functools.lru_cache(maxsize=None)
+def _wide_swap_costs(M, N, K, a_row_major, b_row_major):
+    """(swapped, direct) modeled cost for M > 64, or None where swap is not considered."""
+    num_sms = _get_num_sms()
+    if M <= _SWAP_AB_MAX_M or _mn_tiles(M, N, *((256, 128) if M > N else (128, 256))) >= 2 * num_sms:
+        return None
+    direct = _heuristic_pick(M, N, K, b_row_major)[0]
+    # The swapped kernel's B is A^T, K-major exactly when A is row-major.
+    swapped = _heuristic_pick(N, M, K, not a_row_major, swapped=True)[0]
+    return swapped, direct
+
+
+def _use_wide_swap(M, N, K, a_row_major, b_row_major, margin=_WIDE_SWAP_MARGIN):
+    costs = _wide_swap_costs(M, N, K, a_row_major, b_row_major)
+    return costs is not None and costs[0] <= margin * costs[1]
+
+
+def _wide_swap_heuristic_config(M, N, K, b_row_major):
+    """The swapped config for the problem's (M, N, K); `b_row_major` is the kernel's B (A^T)."""
+    _, block_m, block_n, _ = _heuristic_pick(N, M, K, b_row_major, swapped=True)
+    num_stages = _deepest_ring(block_m, block_n, 64, 1, 8 if block_n == 64 else 6)
+    return [_config(block_m, block_n, num_stages, group_size_m=1 if M <= 512 else 8, swap_ab=True)]
+
+
+def _wide_swap_configs():
+    """Full-space swapped configs: the two-consumer tiles and NPOT tiles, whole-K."""
+    configs = []
+    for block_m, block_n, block_k, depths in _TILES:
+        if block_m != 128:
+            continue
+        for num_stages in depths:
+            num_stages = min(num_stages, _deepest_ring(block_m, block_n, block_k, 1, num_stages))
+            for group_size_m in (1, 8):
+                configs.append(_config(block_m, block_n, num_stages, group_size_m, 1, block_k, True))
+    for block_n in _NPOT_BLOCK_NS:
+        for group_size_m in (1, 8):
+            configs.append(_config(128, block_n, _deepest_ring(128, block_n, 64, 1), group_size_m, swap_ab=True))
+    unique = {}
+    for c in configs:
+        unique.setdefault(tuple(sorted(c.kwargs.items())), c)
+    return list(unique.values())
 
 
 @triton.jit
@@ -531,6 +602,8 @@ def _reduce_split_k(workspace, c, M, N, split_k, bias=None, stride_bias=0):
         # runs and waits on it in-kernel, hiding the launch gap (~1 us on H100,
         # 608x512x20992), as cuBLAS's splitKreduce does.
         launch_pdl=True,
+        # Hopper: keep the instruction order this kernel had before upstream #11478 (see _launch_ws).
+        use_slp_vectorizer=True,
     )
 
 
@@ -541,6 +614,15 @@ def _reduce_post_hook(nargs, exception=None):
         bias = nargs["bias_ptr"] if nargs["ADD_BIAS"] else None
         _reduce_split_k(nargs["workspace_desc"].base, c, c.shape[0], c.shape[1], nargs["SPLIT_K"], bias,
                         nargs["stride_bias"])
+
+
+@triton.jit
+def _oriented(acc, SWAP_AB: tl.constexpr):
+    """A kernel tile in C's orientation: transposed under swap-AB."""
+    if SWAP_AB:
+        return tl.trans(acc)
+    else:
+        return acc
 
 
 @triton.jit
@@ -644,7 +726,7 @@ def matmul_kernel_tma_ws_hopper_cooperative(  # noqa: TR001
     N_TAIL: tl.constexpr = _n_piece(BN, 1)
     N_TAIL2: tl.constexpr = _n_piece(BN, 2)
     tl.static_assert(_n_piece(BN, 3) == 0)
-    tl.static_assert(N_TAIL == 0 or (SPLIT_K == 1 and not B_ROW_MAJOR and not SWAP_AB))
+    tl.static_assert(N_TAIL == 0 or (SPLIT_K == 1 and not B_ROW_MAJOR))
     # workspace_desc is fp32 for split-K and aliases c_desc otherwise.
     out_desc = workspace_desc if SPLIT_K > 1 else c_desc
     a, b, bars_empty_a, bars_full_a, bars_empty_b, bars_full_b = _allocate_buffers(
@@ -658,26 +740,34 @@ def matmul_kernel_tma_ws_hopper_cooperative(  # noqa: TR001
         A_ROW_MAJOR,
         B_ROW_MAJOR,
     )
-    NPOT_SUBTILE: tl.constexpr = _npot_subtile(BN)
+    NPOT_SUBTILE: tl.constexpr = _npot_subtile(BN) and not SWAP_AB
     if NPOT_SUBTILE:
         b_tail = tlx.local_alloc((N_TAIL, BK), tlx.dtype_of(b_desc), NUM_STAGES)
         c_smem_sub = tlx.local_alloc((block_m_split, N_TAIL // 2), tlx.dtype_of(c_desc), 2 * NUM_MMA_GROUPS)
     elif N_TAIL > 0:
         b_tail = tlx.local_alloc((N_TAIL, BK), tlx.dtype_of(b_desc), NUM_STAGES)
-        c_smem_p0 = tlx.local_alloc((block_m_split, N0), tlx.dtype_of(c_desc), NUM_MMA_GROUPS)
-        c_smem_p1 = tlx.local_alloc((block_m_split, N_TAIL), tlx.dtype_of(c_desc), NUM_MMA_GROUPS)
+        # Under swap-AB each piece's slot holds its C tile, transposed.
+        if SWAP_AB:
+            c_smem_p0 = tlx.local_alloc((N0, block_m_split), tlx.dtype_of(c_desc), NUM_MMA_GROUPS)
+            c_smem_p1 = tlx.local_alloc((N_TAIL, block_m_split), tlx.dtype_of(c_desc), NUM_MMA_GROUPS)
+        else:
+            c_smem_p0 = tlx.local_alloc((block_m_split, N0), tlx.dtype_of(c_desc), NUM_MMA_GROUPS)
+            c_smem_p1 = tlx.local_alloc((block_m_split, N_TAIL), tlx.dtype_of(c_desc), NUM_MMA_GROUPS)
     else:
         b_tail = None
     if N_TAIL2 > 0:
         b_tail2 = tlx.local_alloc((N_TAIL2, BK), tlx.dtype_of(b_desc), NUM_STAGES)
-        c_smem_p2 = tlx.local_alloc((block_m_split, N_TAIL2), tlx.dtype_of(c_desc), NUM_MMA_GROUPS)
+        if SWAP_AB:
+            c_smem_p2 = tlx.local_alloc((N_TAIL2, block_m_split), tlx.dtype_of(c_desc), NUM_MMA_GROUPS)
+        else:
+            c_smem_p2 = tlx.local_alloc((block_m_split, N_TAIL2), tlx.dtype_of(c_desc), NUM_MMA_GROUPS)
     else:
         b_tail2 = None
     if EPILOGUE_SUBTILE:
         c_smem = tlx.local_alloc((block_m_split, BN // 4), tlx.dtype_of(out_desc), 2 * NUM_MMA_GROUPS)
     else:
         c_smem = None
-    if SWAP_AB:
+    if SWAP_AB and N_TAIL == 0:
         c_smem_t = tlx.local_alloc((BN, block_m_split), tlx.dtype_of(out_desc), NUM_MMA_GROUPS)
     else:
         c_smem_t = None
@@ -739,11 +829,16 @@ def matmul_kernel_tma_ws_hopper_cooperative(  # noqa: TR001
                 offset_cm = offset_am + block_m_split * consumer_id
 
                 if N_TAIL > 0:
-                    # Pieces never run under swap-AB, so the bias runs along the columns.
-                    bias0 = _bias_vec(bias_ptr, offset_bn, N, stride_bias, N0, TILE_BIAS)
-                    bias1 = _bias_vec(bias_ptr, offset_bn + N0, N, stride_bias, N_TAIL, TILE_BIAS)
-                    bias2 = _bias_vec(bias_ptr, offset_bn + N0 + N_TAIL, N, stride_bias, N_TAIL2 if N_TAIL2 > 0 else 8,
-                                      TILE_BIAS and N_TAIL2 > 0)
+                    if SWAP_AB:
+                        # C's N is the kernel's M: one bias vector along the rows serves every piece.
+                        bias0 = _bias_vec(bias_ptr, offset_cm, M, stride_bias, block_m_split, TILE_BIAS)
+                        bias1 = bias0
+                        bias2 = bias0
+                    else:
+                        bias0 = _bias_vec(bias_ptr, offset_bn, N, stride_bias, N0, TILE_BIAS)
+                        bias1 = _bias_vec(bias_ptr, offset_bn + N0, N, stride_bias, N_TAIL, TILE_BIAS)
+                        bias2 = _bias_vec(bias_ptr, offset_bn + N0 + N_TAIL, N, stride_bias,
+                                          N_TAIL2 if N_TAIL2 > 0 else 8, TILE_BIAS and N_TAIL2 > 0)
                     acc0 = tl.zeros((block_m_split, N0), dtype=tl.float32)
                     acc1 = tl.zeros((block_m_split, N_TAIL), dtype=tl.float32)
                     # An unused third piece still needs a placeholder to thread through.
@@ -752,10 +847,10 @@ def matmul_kernel_tma_ws_hopper_cooperative(  # noqa: TR001
                         (k_hi - k_lo) * BK, a, b, b_tail, b_tail2, acc0, acc1, acc2, bars_empty_a, bars_full_a,
                         bars_empty_b, bars_full_b, buf, phase, consumer_id, BK, NUM_STAGES, A_ROW_MAJOR, N_TAIL,
                         N_TAIL2)
-                    acc0 = _add_bias(acc0, bias0, TILE_BIAS, False)
-                    acc1 = _add_bias(acc1, bias1, TILE_BIAS, False)
+                    acc0 = _add_bias(acc0, bias0, TILE_BIAS, SWAP_AB)
+                    acc1 = _add_bias(acc1, bias1, TILE_BIAS, SWAP_AB)
                     if N_TAIL2 > 0:
-                        acc2 = _add_bias(acc2, bias2, TILE_BIAS, False)
+                        acc2 = _add_bias(acc2, bias2, TILE_BIAS, SWAP_AB)
                     if NPOT_SUBTILE:
                         sub: tl.constexpr = N_TAIL // 2
                         s_0 = tlx.local_view(c_smem_sub, 2 * consumer_id)
@@ -773,16 +868,22 @@ def matmul_kernel_tma_ws_hopper_cooperative(  # noqa: TR001
                         tlx.async_descriptor_store_wait(0)
                         slot0 = tlx.local_view(c_smem_p0, consumer_id)
                         slot1 = tlx.local_view(c_smem_p1, consumer_id)
-                        tlx.local_store(slot0, acc0.to(tlx.dtype_of(c_desc)))
-                        tlx.local_store(slot1, acc1.to(tlx.dtype_of(c_desc)))
+                        tlx.local_store(slot0, _oriented(acc0, SWAP_AB).to(tlx.dtype_of(c_desc)))
+                        tlx.local_store(slot1, _oriented(acc1, SWAP_AB).to(tlx.dtype_of(c_desc)))
                         if N_TAIL2 > 0:
                             slot2 = tlx.local_view(c_smem_p2, consumer_id)
-                            tlx.local_store(slot2, acc2.to(tlx.dtype_of(c_desc)))
+                            tlx.local_store(slot2, _oriented(acc2, SWAP_AB).to(tlx.dtype_of(c_desc)))
                         tlx.fence("async_shared")
-                        tlx.async_descriptor_store(c_desc, slot0, [offset_cm, offset_bn])
-                        tlx.async_descriptor_store(c_tail_desc, slot1, [offset_cm, offset_bn + N0])
-                        if N_TAIL2 > 0:
-                            tlx.async_descriptor_store(c_tail2_desc, slot2, [offset_cm, offset_bn + N0 + N_TAIL])
+                        if SWAP_AB:
+                            tlx.async_descriptor_store(c_desc, slot0, [offset_bn, offset_cm])
+                            tlx.async_descriptor_store(c_tail_desc, slot1, [offset_bn + N0, offset_cm])
+                            if N_TAIL2 > 0:
+                                tlx.async_descriptor_store(c_tail2_desc, slot2, [offset_bn + N0 + N_TAIL, offset_cm])
+                        else:
+                            tlx.async_descriptor_store(c_desc, slot0, [offset_cm, offset_bn])
+                            tlx.async_descriptor_store(c_tail_desc, slot1, [offset_cm, offset_bn + N0])
+                            if N_TAIL2 > 0:
+                                tlx.async_descriptor_store(c_tail2_desc, slot2, [offset_cm, offset_bn + N0 + N_TAIL])
                 else:
                     # The bias runs along C's N: the kernel's columns, or its rows under swap-AB.
                     if SWAP_AB:
@@ -1093,26 +1194,35 @@ def _store_tile(acc, out_desc, c_smem, c_smem_t, offset_cm, offset_bn, split_id,
             )
 
 
-def _tuned(space, shape=None, swap_ab=False, add_bias=False, *, invariance=None, dtype=None):
+def _tuned(space, shape=None, swap_ab=False, add_bias=False, *, invariance=None, dtype=None, wide_swap=False):
     """Autotuned kernel per search space, keyed on the effective fixed schedule.
 
     Every non-empty invariance spec currently maps to the same `SPLIT_K`, so
     `dims("M")`, `dims("K")` and `all()` share one autotuner instead of
     retuning identical schedules.
     """
-    return _tuned_for_fixed(space, shape, swap_ab, gemm_fixed_split_k(invariance), add_bias, dtype=dtype)
+    return _tuned_for_fixed(space, shape, swap_ab, gemm_fixed_split_k(invariance), add_bias, dtype=dtype,
+                            wide_swap=wide_swap)
 
 
 @functools.lru_cache(maxsize=None)
-def _tuned_for_fixed(space, shape, swap_ab, fixed, add_bias=False, *, dtype=None):
+def _tuned_for_fixed(space, shape, swap_ab, fixed, add_bias=False, *, dtype=None, wide_swap=False):
     prune_configs_by = None
     if space == "heuristic":
         fixed_spec = None if fixed is None else _FIXED_SPEC
-        configs = _swap_heuristic_config(*shape, invariance=fixed_spec) if swap_ab else heuristic_config(
-            *shape, invariance=fixed_spec)
+        if wide_swap:
+            configs = _wide_swap_heuristic_config(*shape)
+        elif swap_ab:
+            configs = _swap_heuristic_config(*shape, invariance=fixed_spec)
+        else:
+            configs = heuristic_config(*shape, invariance=fixed_spec)
     elif space == "full":
-        configs = _swap_configs() if swap_ab else CONFIGS()
-        prune = _prune_swap_configs if swap_ab else _prune_full_configs
+        if wide_swap:
+            # The full prune applies to kernel dims; B_ROW_MAJOR is the kernel's.
+            configs, prune = _wide_swap_configs(), _prune_full_configs
+        else:
+            configs = _swap_configs() if swap_ab else CONFIGS()
+            prune = _prune_swap_configs if swap_ab else _prune_full_configs
         prune_configs_by = {"early_config_prune": _bias_prune(prune) if add_bias else prune}
     elif space == "smoke":
         configs = SMOKE_CONFIGS()
@@ -1207,7 +1317,7 @@ def _cold_gpu_time(fn, calls=10, reps=5):
     return diffs[reps // 2] / calls
 
 
-def mm(a, b, *, out=None, space="full", invariance=None):
+def mm(a, b, *, out=None, space="full", invariance=None, b_static=False):
     """Compute ``a @ b`` with the Hopper cooperative persistent GEMM.
 
     `invariance` is the resolved spec; a fixed schedule prunes split-K
@@ -1252,10 +1362,16 @@ def _run(a, b, c, M, N, K, space, bias=None, stride_bias=0, invariance=None):
     b_store = b if b_rm else b.T
     args = (a_store, b_store, a_rm, b_rm, c, M, N, K, space, bias, stride_bias)
     launchers = {"ws": functools.partial(_launch_ws, *args, invariance=invariance)}
+    fixed = gemm_fixed_split_k(invariance)
     # A fixed schedule keeps one kernel: the small-K kernel accumulates K in
     # different steps, so mixing the two would break bitwise invariance.
-    if gemm_fixed_split_k(invariance) is None and _small_k_candidate(M, N, K, space):
+    if fixed is None and _small_k_candidate(M, N, K, space):
         launchers["small_k"] = functools.partial(_launch_small_k, *args)
+    # The orientation would flip with M, so a fixed schedule never swaps here.
+    if fixed is None and space == "heuristic" and _use_wide_swap(M, N, K, a_rm, b_rm):
+        launchers["ws"] = functools.partial(_launch_ws, *args, wide_swap=True)
+    elif fixed is None and space == "full" and _use_wide_swap(M, N, K, a_rm, b_rm, _WIDE_SWAP_COMPETITIVE):
+        launchers["ws_swap"] = functools.partial(_launch_ws, *args, wide_swap=True)
     key = (M, N, K, a_rm, b_rm, a.dtype) + (() if bias is None else ("bias", ))
     launchers[_select_path(space, key, launchers)]()
     return c
@@ -1280,8 +1396,9 @@ def _launch_small_k(a_store, b_store, a_rm, b_rm, c, M, N, K, space, bias=None, 
         _reduce_split_k(workspace_desc.base, c, M, N, split_k, bias, stride_bias)
 
 
-def _launch_ws(a_store, b_store, a_rm, b_rm, c, M, N, K, space, bias=None, stride_bias=0, invariance=None):
-    swap_ab = _use_swap_ab(M, space)
+def _launch_ws(a_store, b_store, a_rm, b_rm, c, M, N, K, space, bias=None, stride_bias=0, invariance=None,
+               wide_swap=False):
+    swap_ab = wide_swap or _use_swap_ab(M, space)
     if swap_ab:
         # Run the same kernel on (B^T, A^T) and write C^T tiles back to C. B^T
         # is row-major exactly when B is column-major, and likewise for A^T.
@@ -1308,7 +1425,8 @@ def _launch_ws(a_store, b_store, a_rm, b_rm, c, M, N, K, space, bias=None, strid
 
     # The heuristic picks non-power-of-two tiles only for a K-major B.
     shape = (M, N, K, b_row_major) if space == "heuristic" else None
-    kernel = _tuned(space, shape, swap_ab, bias is not None, invariance=invariance, dtype=a_store.dtype)
+    kernel = _tuned(space, shape, swap_ab, bias is not None, invariance=invariance, dtype=a_store.dtype,
+                    wide_swap=wide_swap)
     kernel[grid](
         _descriptor(a_src),
         _descriptor(b_src),
@@ -1331,6 +1449,9 @@ def _launch_ws(a_store, b_store, a_rm, b_rm, c, M, N, K, space, bias=None, strid
         # Under swap-AB the kernel's A is B, streamed once.
         A_EVICTION="evict_last" if N <= 1024 and not swap_ab else "",
         ADD_BIAS=bias is not None,
+        # Upstream #11478's NVPTX vectorizer emits this kernel in an order that
+        # costs 5-10% on Hopper; SLP keeps the previous instruction order.
+        use_slp_vectorizer=True,
     )
     # post_hook only fires while benchmarking, so reduce here for the real launch.
     split_k = kernel.best_config.kwargs["SPLIT_K"]

@@ -1179,10 +1179,11 @@ def test_manual_platform_allowlist_preserves_requested_work(tmp_path, script, re
         subprocess.run(
             command, cwd=ROOT, env=os.environ | {
                 "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_EVENT_PATH": str(event), "GITHUB_OUTPUT": str(output),
-                "GITHUB_STEP_SUMMARY": str(summary), "GITHUB_REPOSITORY": "facebookexperimental/triton"
+                "GITHUB_STEP_SUMMARY": str(summary), "GITHUB_REPOSITORY": "facebookexperimental/triton",
+                "GPU_CI_SKIP_PLATFORMS": "b200"
             }, check=True, capture_output=True, text=True)
         outputs.append(dict(line.split("=", 1) for line in output.read_text().splitlines()))
-        assert 'this run does not cover B200' in summary.read_text()
+        assert 'GPU_CI_SKIP_PLATFORMS skips b200' in summary.read_text()
         if platforms:
             assert f"Manual platform list: {platforms}" in summary.read_text()
             assert "Other platforms are not covered" in summary.read_text()

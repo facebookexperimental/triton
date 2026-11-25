@@ -306,6 +306,14 @@ while !done:
   *tlx.alloc_barrier* can be set to achieve the desired phase change
   behavior.
 
+  By default (NVIDIA) the arrive is task-collective: one thread of the
+  calling task arrives, and the compiler orders every earlier shared- and
+  tensor-memory access of the task's threads before it, inserting a
+  task-wide barrier and `tcgen05.wait` where needed. A task that reads a
+  TMEM or SMEM buffer and then releases it with *barrier_arrive* needs no
+  barrier of its own. Global-memory writes are not ordered for other CTAs;
+  use a GPU-scope fence or release atomic for those.
+
   With *per_warp=True* (NVIDIA), each warp of the arriving task
   synchronizes its own lanes and one of its lanes arrives with
   *arrive_count*, instead of the whole task synchronizing before one
@@ -326,6 +334,21 @@ while !done:
   every CTA of a cluster. A barrier released by a 4-warp task per warp and
   by a leader arrive in each of two CTAs is allocated with
   `arrive_count=(4 + 1) * 2`. All three wait with `tlx.barrier_wait`.
+
+  `tlx.async_task(..., nvptx_cmp_sink_workaround=True)` (NVIDIA) is a
+  temporary workaround for an NVPTX backend issue. It changes where leader
+  and per-warp arrives in that task compute their `tid == 0` and
+  `lane == 0` predicates, not what the arrives do. NVPTX lets
+  CodeGenPrepare sink compares into the blocks of their users, so the
+  compare of a leader arrive after a loop moves back next to the arrive
+  and keeps the 32-bit thread id live across the loop. A per-warp
+  arrive's lane predicate is instead hoisted out of the loop by LICM and
+  stays live across it. Either can perturb the ptxas schedule of a hot
+  loop: the FA forward softmax is about 3% faster with both avoided, and
+  avoiding only one gains little. With the flag, the task's per-warp
+  arrives test `%laneid` inside their own asm and its leader arrives share
+  one predicate built at the task entry. Only that task's arrives are
+  affected. Remove the flag once NVPTX stops sinking compares.
 
   | TLX [<u>barriers</u>](https://github.com/facebookexperimental/triton/blob/tlx/third_party/tlx/language/tlx/barrier.py) | MLIR | PTX |
   |----|----|----|
@@ -363,6 +386,29 @@ so liveness reflects the actual entry schedule. One initialization release
 fence and one relaxed cluster arrive/wait sequence protect the whole batch.
 A single physical CTA needs no cluster rendezvous, under either the logical or
 physical cluster model.
+
+#### Default-Scope Triggers
+
+Kernels that use only default-scope barriers get the same entry batch, with
+the same "barrier inits before the first TMEM allocation" requirement, when
+there are multiple physical CTAs and the module contains any of:
+
+- a remote barrier arrive: an explicit remote `mapa` (e.g. `barrier_arrive`
+  with `remote_cta_rank`, or `async_remote_shmem_store(..., barrier=...)`), a
+  multicast TMA load, or a CLC try-cancel;
+- a multicast `barrier_arrive`;
+- paired 2-CTA MMA (`two_ctas=True`).
+
+This is not limited to 2-CTA MMA. For example, a K-split cluster whose peers
+reduce partial results onto rank 0's barrier with `async_remote_shmem_store`
+(`tlx.ops.mm` `sm100_skinny.py` with `CLUSTER > 1`) is covered even though its
+MMAs are 1-CTA. The compiler hoists movable initialization ahead of TMEM
+allocation; if an init depends on something it cannot hoist, compilation fails
+with "Barrier init is not before TMEM allocation. Cannot insert cluster sync
+between them." By convention, allocate all barriers before any SMEM/TMEM
+allocation in the kernel prologue so the source matches the compiled order.
+See `ensureEarlyEntryBarInit` and its caller in
+`third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/TritonGPUToLLVM.cpp`.
 
 After inlining, initialization must be unconditional in the kernel entry block
 and before effectful execution. The compiler rejects cluster initialization in

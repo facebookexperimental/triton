@@ -8,7 +8,9 @@ Phase 1 (``_pa_decode_partition_kernel``) has each program handle one
 online softmax, then ``p @ v``, and writes a normalized partial output plus a
 base-2 log-sum-exp for that split. Phase 2 (``_pa_decode_reduce_kernel``) is a
 plain ``@triton.jit`` kernel that merges the per-split partials for each output
-``(token, query_head)`` via the standard LSE trick.
+``(token, query_head)`` via the standard LSE trick. Given ``out_gate``, it also
+applies the attention-output RMSNorm times sigmoid gate (``tlx.ops.rmsnorm_gate``,
+bitwise) to its head, so the norm needs no launch of its own.
 
 For tuned D64 saturated shapes, phase 1 instead vector-loads packed K and V
 while QK/softmax remains register-distributed.  Its qlen1/group8
@@ -230,7 +232,8 @@ def _pa_decode_partition_kernel(
     kv_head = tl.program_id(1)
     split = tl.program_id(2)
 
-    ctx_len = tl.load(CtxLens + seq)
+    # int32 or int64 context lengths (SGLang's seq_lens are int64).
+    ctx_len = tl.load(CtxLens + seq).to(tl.int32)
     num_pages = tl.cdiv(ctx_len, PAGE_SIZE)
     if HAS_WINDOW:
         # Splits cover only the pages some row's window reaches; the first
@@ -672,11 +675,15 @@ def _pa_decode_reduce_kernel(
     stride_lse_h,
     stride_lse_k,
     stride_lse_m,
+    Gate,  # [num_tokens, num_q_heads * HEAD_DIM] BF16 sigmoid gate when NORM_GATE
+    stride_g_t,
+    norm_eps,
     HEAD_DIM: tl.constexpr,
     QUERY_GROUP_SIZE: tl.constexpr,
     GROUP_POW2: tl.constexpr,
     QLEN: tl.constexpr,
     SPLITS_POW2: tl.constexpr,
+    NORM_GATE: tl.constexpr,
 ):
     gt = tl.program_id(0)  # global token = seq * QLEN + qpos
     qh = tl.program_id(1)  # query head
@@ -708,6 +715,19 @@ def _pa_decode_reduce_kernel(
         other=0.0,
     )  # [SPLITS_POW2, HEAD_DIM]
     out = tl.sum(o * w[:, None], 0) / tl.where(wsum > 0, wsum, 1.0)
+    if NORM_GATE:
+        # tlx.ops.rmsnorm_gate of the BF16 head output: adjacent pairs, then the 32 pair sums folded in halves.
+        x = out.to(tl.bfloat16).to(tl.float32)
+        sum_sq = tl.sum(tl.reshape(x * x, (HEAD_DIM // 2, 2)), axis=1)
+        sum_sq = tl.sum(tl.reshape(sum_sq, (2, 16)), axis=0)
+        sum_sq = tl.sum(tl.reshape(sum_sq, (2, 8)), axis=0)
+        sum_sq = tl.sum(tl.reshape(sum_sq, (2, 4)), axis=0)
+        sum_sq = tl.sum(tl.reshape(sum_sq, (2, 2)), axis=0)
+        sum_sq = tl.sum(tl.reshape(sum_sq, (2, 1)), axis=0)
+        rstd = 1.0 / tl.sqrt(sum_sq / HEAD_DIM + norm_eps)
+        g = tl.load(Gate + gt * stride_g_t + qh * HEAD_DIM + offs_d).to(tl.float32)
+        out = x * rstd
+        out = out * tl.sigmoid(g)
 
     tl.store(Out + gt * stride_o_t + qh * stride_o_h + offs_d * stride_o_d, out.to(Out.dtype.element_ty))
 
@@ -1010,8 +1030,10 @@ def kv_cache_geometry(key_cache, value_cache, head_dim, kv_layout="HND"):
 
 def get_pa_decode_config(query, key_cache, value_cache, block_tables, query_length=1, num_splits=None,
                          max_context_len=None, num_warps=None, waves_per_eu=None, streaming_kv=None, block_n=None,
-                         gluon_compat=None, sliding_window=0, kv_layout="HND", direct_kv=None, kv_stages=None):
-    """Select the exact launch and workspace configuration without launching."""
+                         gluon_compat=None, sliding_window=0, kv_layout="HND", direct_kv=None, kv_stages=None,
+                         norm_gate=False):
+    """Select the exact launch and workspace configuration without launching. ``norm_gate`` plans for an output
+    norm and gate, which the reduce kernel applies, so at least two splits."""
     num_tokens, num_q_heads, head_dim = query.shape
     cache_5d = key_cache.ndim == 5
     cache_pack_x = 16 // key_cache.element_size()
@@ -1079,7 +1101,18 @@ def get_pa_decode_config(query, key_cache, value_cache, block_tables, query_leng
     # pipeline. Tile width and pipeline depth were tuned at 2 and 8 KV heads, batch 1-64, context 8K-100K.
     auto_direct = (direct_kv is None and kv_layout == "NHD" and not cache_5d and head_dim == 64 and query_length == 1
                    and not sliding_window and not streaming_kv and not gluon_compat and block_n is None)
-    if auto_direct:
+    # FP8 K/V with <= 2 KV heads (for example 16 Q / 2 KV heads at TP8): direct loads also win on sliding-window layers,
+    # and from 16 sequence x KV-head programs a 256-key tile with ~512 programs beats the 64-key, 3-stage plan (tuned on
+    # MI350X, page 16, contexts 2K-30K under a 32K plan bound, batch 1-64).
+    progs = num_seqs * num_kv_heads
+    fp8_direct = (direct_kv is None and key_cache.dtype == torch.float8_e4m3fn and kv_layout == "NHD" and not cache_5d
+                  and head_dim == 64 and query_length == 1 and num_kv_heads <= 2 and not streaming_kv
+                  and not gluon_compat and block_n is None and (sliding_window or progs >= 16))
+    if fp8_direct:
+        auto_direct = False
+        direct_kv = True
+        block_n, kv_stages = (128, 2) if sliding_window and progs <= 16 else (256, 1)
+    elif auto_direct:
         direct_kv = True
         if num_kv_heads > 2:
             block_n, kv_stages = 128, 1
@@ -1110,6 +1143,7 @@ def get_pa_decode_config(query, key_cache, value_cache, block_tables, query_leng
         assert block_n == expected_block_n, (
             f"packed qlen={query_length} path is specialized for a {expected_block_n}x64 KV tile")
 
+    auto_splits = num_splits is None
     if num_splits is None and packed_qlen1:
         # ~384 programs (1.5 waves on 256 CUs) was within 7% of the per-shape best across GQA-8 D64 page-16 decode shapes.
         num_splits = min(128, _next_pow2(-(-384 // (num_seqs * num_kv_heads))))
@@ -1119,6 +1153,11 @@ def get_pa_decode_config(query, key_cache, value_cache, block_tables, query_leng
             num_splits = 32
         elif small_verify:
             num_splits = min(128, _next_pow2(512 // (num_seqs * num_kv_heads)))
+        elif fp8_direct:
+            # ~512 programs and none walking more than ~64 tiles; a window caps this at one tile per split below.
+            ctx_keys = max_pages * page_size if max_context_len is None else min(max_context_len, max_pages * page_size)
+            tiles = max(1, -(-ctx_keys // block_n))
+            num_splits = min(128, max(_next_pow2(512 // progs) if progs < 512 else 1, _next_pow2(max(1, tiles // 64))))
         elif auto_direct:
             # ~512 programs, plus enough splits that none walks more than ~64 tiles.
             ctx_keys = max_pages * page_size if max_context_len is None else min(max_context_len, max_pages * page_size)
@@ -1148,6 +1187,9 @@ def get_pa_decode_config(query, key_cache, value_cache, block_tables, query_leng
             num_splits = 8 if page_size == 16 else 4
         max_useful_splits = max(1, (max_pages + pages_per_tile - 1) // pages_per_tile)
         num_splits = min(num_splits, max_useful_splits)
+    if norm_gate and auto_splits:
+        num_splits = max(2, num_splits)
+    assert not (norm_gate and num_splits == 1), "the output norm and gate run in the split reduce"
 
     if waves_per_eu is None and packed_qlen1:
         waves_per_eu = 2
@@ -1209,7 +1251,7 @@ def pa_decode_tlx(output,  # [num_tokens, num_q_heads, HEAD_DIM]
                   query,  # [num_tokens, num_q_heads, HEAD_DIM]
                   key_cache,  # 4-D HND/NHD or packed 5-D [block, head, dim/X, page, X]
                   value_cache,  # 4-D HND/NHD or packed 5-D [block, head, page/X, dim, X]
-                  context_lens,  # [num_seqs] int32
+                  context_lens,  # [num_seqs] int32 or int64
                   block_tables,  # [num_seqs, max_pages] int32
                   sm_scale, query_length=1, num_splits=None, max_context_len=None, num_warps=None, waves_per_eu=None,
                   streaming_kv=None,  # None auto-selects the tuned packed K/V register path
@@ -1222,6 +1264,8 @@ def pa_decode_tlx(output,  # [num_tokens, num_q_heads, HEAD_DIM]
                   k_descale=None,  # [1] fp32 dequant scales for a float8_e4m3fn 4-D cache: K/V = stored * descale
                   v_descale=None,  # [1] fp32, as k_descale
                   q_descale=None,  # [1] fp32 dequant scale for a float8_e4m3fn query
+                  out_gate=None,  # [num_tokens, num_q_heads * 64] BF16: output = rmsnorm_gate(attention, out_gate)
+                  out_norm_eps=1e-6,  # eps of the output norm
                   ):
     num_tokens, num_q_heads, head_dim = query.shape
     cache_5d = key_cache.ndim == 5
@@ -1247,6 +1291,7 @@ def pa_decode_tlx(output,  # [num_tokens, num_q_heads, HEAD_DIM]
             gluon_compat=gluon_compat,
             sliding_window=sliding_window,
             kv_layout=kv_layout,
+            norm_gate=out_gate is not None,
         )
     else:
         assert isinstance(config, PagedDecodeConfig)
@@ -1259,6 +1304,9 @@ def pa_decode_tlx(output,  # [num_tokens, num_q_heads, HEAD_DIM]
         assert not gluon_compat or config.gluon_compat
         assert config.sliding_window == sliding_window
         assert config.kv_layout == kv_layout
+    if out_gate is not None:
+        assert head_dim == 64 and output.dtype == out_gate.dtype == torch.bfloat16 and not config.fused
+        assert out_gate.shape == (num_tokens, num_q_heads * 64) and out_gate.stride(1) == 1
 
     page_size = config.page_size
     cache_pack_x = config.cache_pack_x
@@ -1406,18 +1454,22 @@ def pa_decode_tlx(output,  # [num_tokens, num_q_heads, HEAD_DIM]
         lse.stride(1),
         lse.stride(2),
         lse.stride(3),
+        output if out_gate is None else out_gate,
+        0 if out_gate is None else out_gate.stride(0),
+        float(out_norm_eps),
         HEAD_DIM=head_dim,
         QUERY_GROUP_SIZE=query_group_size,
         GROUP_POW2=group_pow2,
         QLEN=query_length,
         SPLITS_POW2=splits_pow2,
+        NORM_GATE=out_gate is not None,
     )
     return output
 
 
 def paged_attention_decode(query, key_cache, value_cache, context_lens, block_tables, sm_scale, query_length,
                            sliding_window, max_context_len, out, workspace, kv_layout, k_descale=None, v_descale=None,
-                           q_descale=None):
+                           q_descale=None, out_gate=None, out_norm_eps=1e-6):
     if out is None:
         # An FP8 query writes the output in BF16.
         out = torch.empty(query.shape, dtype=torch.bfloat16 if query.dtype == torch.float8_e4m3fn else query.dtype,
@@ -1425,13 +1477,14 @@ def paged_attention_decode(query, key_cache, value_cache, context_lens, block_ta
     return pa_decode_tlx(out, query, key_cache, value_cache, context_lens, block_tables, sm_scale,
                          query_length=query_length, max_context_len=max_context_len, workspace=workspace,
                          sliding_window=sliding_window, kv_layout=kv_layout, k_descale=k_descale, v_descale=v_descale,
-                         q_descale=q_descale)
+                         q_descale=q_descale, out_gate=out_gate, out_norm_eps=out_norm_eps)
 
 
 def paged_attention_decode_workspace(query, key_cache, value_cache, block_tables, query_length, sliding_window,
-                                     max_context_len, kv_layout):
+                                     max_context_len, kv_layout, norm_gate=False):
     config = get_pa_decode_config(query, key_cache, value_cache, block_tables, query_length=query_length,
-                                  max_context_len=max_context_len, sliding_window=sliding_window, kv_layout=kv_layout)
+                                  max_context_len=max_context_len, sliding_window=sliding_window, kv_layout=kv_layout,
+                                  norm_gate=norm_gate)
     return allocate_pa_decode_workspace(query, key_cache, config)
 
 

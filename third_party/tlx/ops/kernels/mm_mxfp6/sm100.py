@@ -1,18 +1,18 @@
 """Blackwell (sm100) MXFP6 GEMM -- the ``tlx.ops.mm_mxfp6`` implementation.
 
 TODO(T296778064): parameterize one kernel on constexpr formats and a
-packed-bytes ratio instead of mirroring ``mm_mxfp8``, so MXFP8 fixes
+packed-bytes ratio instead of mirroring ``mm_mxfp``, so MXFP8 fixes
 (including the 2-CTA cluster-size divisibility issue) do not need to
 be applied twice.
 
-Mirrored from ``kernels/mm_mxfp8/sm100.py``: same warp-specialized structure
+Mirrored from ``kernels/mm_mxfp/sm100.py``: same warp-specialized structure
 (TMA producer, scaled-MMA consumer accumulating in TMEM, BF16 epilogue over a
 static persistent tile schedule) and the same config families
 (``COLLAB_2CTA``, split-K with FP32 partials, ``OVERLAP_ACC``, ``B_RESIDENT`` +
 ``FUSE_N_TILES``, ``ASYNC_STORE``).
 
-The kernel computes ``C[M, N] = A[M, K] @ B[N, K].T`` from E2M3 (A) and E3M2
-(B) data with one E8M0 scale per 32 K values, and stores BF16. Operands are
+The kernel computes ``C[M, N] = A[M, K] @ B[N, K].T`` with independently
+selected E2M3 or E3M2 operands, one E8M0 scale per 32 K values, and BF16 output. Operands are
 uint8 with dense LSB-first packing (groups of 16 codes per 12 bytes);
 the K dim is padded to the unpacked width. TMA reads the leading 3/4 of each row and inserts four
 padding bytes after every 16 FP6 values in shared memory. TMA completion
@@ -794,6 +794,8 @@ def _process_tile_mma_overlap(
     BLOCK_SIZE_N: tl.constexpr,
     EPILOGUE_SUBTILE: tl.constexpr,
     TWO_CTAS: tl.constexpr = False,
+    A_FORMAT: tl.constexpr = "e2m3",
+    B_FORMAT: tl.constexpr = "e3m2",
 ):
     ACC_SHIFT: tl.constexpr = BLOCK_SIZE_N - BLOCK_SIZE_N // EPILOGUE_SUBTILE
     smem_buf, smem_phase = get_bufidx_phase(smem_count, NUM_SMEM_BUFFERS)
@@ -813,9 +815,9 @@ def _process_tile_mma_overlap(
             tlx.local_trans(b_tiles[smem_buf]),
             acc,
             a_scale_tmem[0],
-            "e2m3",
+            A_FORMAT,
             b_scale_tmem[0],
-            "e3m2",
+            B_FORMAT,
             use_acc=k_idx > 0,
             out_dtype=tl.float32,
             mBarriers=[smem_empty[smem_buf]],
@@ -853,6 +855,8 @@ def _process_tile_mma_inner(
     b_res_base=0,
     FUSE_N_TILES: tl.constexpr = 1,
     B_RES_K_TILES: tl.constexpr = 1,
+    A_FORMAT: tl.constexpr = "e2m3",
+    B_FORMAT: tl.constexpr = "e3m2",
 ):
     local_k_tiles = k_tile_end - k_tile_start
     smem_buf, smem_phase = get_bufidx_phase(smem_count, NUM_SMEM_BUFFERS)
@@ -879,9 +883,9 @@ def _process_tile_mma_inner(
                         tlx.local_trans(b_tiles[b_idx]),
                         accumulators[tmem_buf * FUSE_N_TILES + n],
                         a_scale_tiles[smem_buf],
-                        "e2m3",
+                        A_FORMAT,
                         b_scale_tiles[b_idx],
-                        "e3m2",
+                        B_FORMAT,
                         use_acc=USE_ACC_INITIAL or k_idx != 0,
                         out_dtype=tl.float32,
                         mBarriers=[smem_empty[smem_buf]],
@@ -893,9 +897,9 @@ def _process_tile_mma_inner(
                         tlx.local_trans(b_tiles[b_idx]),
                         accumulators[tmem_buf * FUSE_N_TILES + n],
                         a_scale_tiles[smem_buf],
-                        "e2m3",
+                        A_FORMAT,
                         b_scale_tiles[b_idx],
-                        "e3m2",
+                        B_FORMAT,
                         use_acc=USE_ACC_INITIAL or k_idx != 0,
                         out_dtype=tl.float32,
                         two_ctas=NUM_CTAS == 2,
@@ -1104,7 +1108,11 @@ def _gemm_mxfp6_ws_kernel(  # noqa: TR001
     B_RES_K_TILES: tl.constexpr = 1,
     FUSE_N_TILES: tl.constexpr = 1,
     NUM_SMS: tl.constexpr = 148,
+    A_FORMAT: tl.constexpr = "e2m3",
+    B_FORMAT: tl.constexpr = "e3m2",
 ):
+    tl.static_assert(A_FORMAT == "e2m3" or A_FORMAT == "e3m2", "unsupported A_FORMAT")
+    tl.static_assert(B_FORMAT == "e2m3" or B_FORMAT == "e3m2", "unsupported B_FORMAT")
     tl.static_assert(BLOCK_SIZE_M == 128, "scaled MMA requires BLOCK_SIZE_M=128")
     tl.static_assert(
         BLOCK_SIZE_N % NUM_CTAS == 0 and BLOCK_SIZE_N // NUM_CTAS <= 256,
@@ -1346,6 +1354,8 @@ def _gemm_mxfp6_ws_kernel(  # noqa: TR001
                                 BLOCK_SIZE_N=BLOCK_SIZE_N,
                                 EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
                                 TWO_CTAS=NUM_CTAS == 2,
+                                A_FORMAT=A_FORMAT,
+                                B_FORMAT=B_FORMAT,
                             )
                             tlx.tcgen05_commit(tmem_full[tmem_buf], two_ctas=NUM_CTAS == 2)
                         else:
@@ -1378,6 +1388,8 @@ def _gemm_mxfp6_ws_kernel(  # noqa: TR001
                                                        B_RES_K_TILES * FUSE_N_TILES),
                                 FUSE_N_TILES=FUSE_N_TILES,
                                 B_RES_K_TILES=B_RES_K_TILES,
+                                A_FORMAT=A_FORMAT,
+                                B_FORMAT=B_FORMAT,
                             )
                             tlx.tcgen05_commit(tmem_full[tmem_buf], two_ctas=True)
                         else:
@@ -1400,9 +1412,9 @@ def _gemm_mxfp6_ws_kernel(  # noqa: TR001
                                 tlx.local_trans(b_tiles[smem_buf]),
                                 accumulators[tmem_buf],
                                 a_scale_tiles[smem_buf],
-                                "e2m3",
+                                A_FORMAT,
                                 b_scale_tiles[smem_buf],
-                                "e3m2",
+                                B_FORMAT,
                                 use_acc=False,
                                 out_dtype=tl.float32,
                                 mBarriers=[smem_empty[smem_buf]],
@@ -1435,6 +1447,8 @@ def _gemm_mxfp6_ws_kernel(  # noqa: TR001
                                                    B_RES_K_TILES * FUSE_N_TILES),
                             FUSE_N_TILES=FUSE_N_TILES,
                             B_RES_K_TILES=B_RES_K_TILES,
+                            A_FORMAT=A_FORMAT,
+                            B_FORMAT=B_FORMAT,
                         )
                         if NUM_CTAS == 1:
                             # Signal accumulator readiness asynchronously so the MMA
@@ -1524,7 +1538,7 @@ def _scale_5d(scale, rows, K, sf_layout):
 def _autotuned(configs, prune=None):
     return triton.autotune(
         configs=configs,
-        key=["M", "N", "K"],
+        key=["M", "N", "K", "A_FORMAT", "B_FORMAT"],
         prune_configs_by={"early_config_prune": prune} if prune is not None else None,
         post_hook=reduce_post_hook,
     )(_gemm_mxfp6_ws_kernel)
@@ -1538,7 +1552,7 @@ def _tuned(space, heuristic_key=None):
     return _autotuned(get_cuda_autotune_config(), preprocess_configs)
 
 
-def _launch(kernel, a, a_scale, b, b_scale, *, out, sf_layout, num_sms):
+def _launch(kernel, a, a_scale, b, b_scale, *, out, sf_layout, num_sms, a_format="e2m3", b_format="e3m2"):
     M, K = a.shape
     N = b.shape[0]
     if out is None:
@@ -1574,6 +1588,8 @@ def _launch(kernel, a, a_scale, b, b_scale, *, out, sf_layout, num_sms):
         N,
         K,
         NUM_SMS=num_sms,
+        A_FORMAT=a_format,
+        B_FORMAT=b_format,
     )
 
     # post_hook only fires while benchmarking, so reduce here for the real launch.
@@ -1593,7 +1609,7 @@ def _launch(kernel, a, a_scale, b, b_scale, *, out, sf_layout, num_sms):
     return out
 
 
-def _run_config(a, a_scale, b, b_scale, meta, *, out=None, sf_layout="natural"):
+def _run_config(a, a_scale, b, b_scale, meta, *, out=None, sf_layout="natural", a_format="e2m3", b_format="e3m2"):
     """Launch one explicit config, bypassing the heuristic. Not part of the op API."""
     M, K = a.shape
     N = b.shape[0]
@@ -1602,13 +1618,14 @@ def _run_config(a, a_scale, b, b_scale, meta, *, out=None, sf_layout="natural"):
         raise ValueError(error)
     with torch.cuda.device(a.device):
         return _launch(_autotuned([_make_config(meta)]), a, a_scale, b, b_scale, out=out, sf_layout=sf_layout,
-                       num_sms=_num_sms(a.device.index))
+                       num_sms=_num_sms(a.device.index), a_format=a_format, b_format=b_format)
 
 
-def mm_mxfp6(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="full"):
+def mm_mxfp6(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="full", a_format="e2m3", b_format="e3m2"):
     """``a @ b.T`` for pre-quantized MXFP6 operands on Blackwell, as BF16.
 
-    ``a`` is E2M3 and ``b`` is E3M2, both dense-packed uint8 (groups of
+    ``a_format`` and ``b_format`` independently select "e2m3" or "e3m2"
+    (defaulting to E2M3 A and E3M2 B), both dense-packed uint8 (groups of
     16 codes per 12 bytes, K padded to the unpacked width). Inputs are
     validated by
     ``tlx.ops.mm_mxfp6``. ``space`` is "full" (autotune, the default) or
@@ -1622,6 +1639,8 @@ def mm_mxfp6(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="fu
     follow-up. The padded form keeps the TMA bandwidth win (only the
     leading 3/4 is read) at FP8-sized host footprint.
     """
+    if a_format not in ("e2m3", "e3m2") or b_format not in ("e2m3", "e3m2"):
+        raise ValueError("a_format and b_format must each be 'e2m3' or 'e3m2'")
     if space not in ("heuristic", "full"):
         raise ValueError(f"unsupported space {space!r}; expected 'heuristic' or 'full'")
     M, K = a.shape
@@ -1629,7 +1648,8 @@ def mm_mxfp6(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="fu
     with torch.cuda.device(a.device):
         num_sms = _num_sms(a.device.index)
         kernel = _tuned(space, (M, N, K, num_sms) if space == "heuristic" else None)
-        return _launch(kernel, a, a_scale, b, b_scale, out=out, sf_layout=sf_layout, num_sms=num_sms)
+        return _launch(kernel, a, a_scale, b, b_scale, out=out, sf_layout=sf_layout, num_sms=num_sms, a_format=a_format,
+                       b_format=b_format)
 
 
 __all__ = ["mm_mxfp6"]

@@ -209,7 +209,7 @@ unsigned getElementBitWidth(RankedTensorType type) {
       isa<PointerType>(type.getElementType())
           ? cast<PointerType>(type.getElementType()).getPointeeType()
           : type.getElementType();
-  return typeForMem.getIntOrFloatBitWidth();
+  return getIntOrFloatOrPtrBitWidth(typeForMem);
 }
 
 static std::optional<unsigned>
@@ -904,6 +904,8 @@ canUseResultEncoding(Operation *op, Attribute targetEncoding) {
 }
 
 bool canBeRematerialized(Operation *op) {
+  if (hasEffect<MemoryEffects::Write>(op))
+    return false;
   if (op->hasAttr("tlx.preserve_layout") ||
       isa<ttg::RequireLayoutOp, ttg::ReleaseLayoutOp>(op))
     return false;
@@ -926,7 +928,7 @@ bool canBeRematerialized(Operation *op) {
   if (isa<scf::WhileOp, scf::ConditionOp>(op))
     return false;
 
-  return !hasEffect<MemoryEffects::Write>(op);
+  return true;
 }
 
 scf::ForOp replaceForOpWithNewSignature(
@@ -1590,7 +1592,7 @@ swizzleDotOperandLike(RankedTensorType type, ttg::CGAEncodingAttr cgaLayout) {
   }
   return ttg::SwizzledSharedEncodingAttr::get(
       ctx, opIdx, kWidth, type.getShape(), order, cgaLayout,
-      type.getElementTypeBitWidth(), false);
+      getIntOrFloatOrPtrBitWidth(type.getElementType()), false);
 }
 
 // If all the transitive uses of the given value have are used by a convert to

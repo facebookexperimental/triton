@@ -479,6 +479,8 @@ class dtype(base_type):
     SINT_TYPES = ["int8", "int16", "int32", "int64"]
     UINT_TYPES = ["int1", "uint8", "uint16", "uint32", "uint64"]
     FP_TYPES = [
+        "fp4e2m1x2",
+        "fp8e8m0fnu",
         "fp8e4b15",
         "fp8e4nv",
         "fp8e4b8",
@@ -514,7 +516,13 @@ class dtype(base_type):
             self.int_signedness = dtype.SIGNEDNESS.UNSIGNED
             self.int_bitwidth = self.primitive_bitwidth
         elif name in dtype.FP_TYPES:
-            if name == "fp8e4b15":
+            if name == "fp4e2m1x2":
+                self.fp_mantissa_width = 1
+                self.exponent_bias = 1
+            elif name == "fp8e8m0fnu":
+                self.fp_mantissa_width = 0
+                self.exponent_bias = 127
+            elif name == "fp8e4b15":
                 self.fp_mantissa_width = 3
                 self.exponent_bias = 15
             elif name == "fp8e4nv":
@@ -680,6 +688,10 @@ class dtype(base_type):
         out.append(self.to_ir(builder))
 
     def to_ir(self, builder: ir.builder) -> ir.type:
+        if self.name == 'fp4e2m1x2':
+            return builder.get_fp4e2m1x2_ty()
+        if self.name == 'fp8e8m0fnu':
+            return builder.get_fp8e8m0fnu_ty()
         if self.name.startswith("fp8"):
             if (hasattr(builder, "options") and self.name not in builder.options.supported_fp8_dtypes):
                 raise ValueError(f"type {self} not supported in this architecture. "
@@ -931,6 +943,8 @@ float8e5b16 = dtype("fp8e5b16")
 float8e4nv = dtype("fp8e4nv")
 float8e4b8 = dtype("fp8e4b8")
 float8e4b15 = dtype("fp8e4b15")
+float4e2m1x2 = dtype("fp4e2m1x2")
+float8e8m0fnu = dtype("fp8e8m0fnu")
 float16 = dtype("fp16")
 bfloat16 = dtype("bf16")
 float32 = dtype("fp32")
@@ -1531,16 +1545,23 @@ class slice:
 
 class tensor_descriptor_base_type(base_type):
 
-    def __init__(self, block_type: block_type):
+    def __init__(self, block_type: block_type, fp6_format=None):
         self.block_type = block_type
+        self.fp6_format = fp6_format
 
     def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[tensor_descriptor_base, int]:
-        value = tensor_descriptor_base(handles[cursor], self.block_type)
+        value = tensor_descriptor_base(handles[cursor], self.block_type, self.fp6_format)
         return value, cursor + 1
 
     def _flatten_ir_types(self, builder: ir.builder, out: List[ir.type]) -> None:
-        is_signed = self.block_type.element_ty.is_int_signed()
-        out.append(builder.create_tensor_descriptor_type(self.block_type.to_ir(builder), is_signed))
+        out.append(self._to_ir(builder))
+
+    def _to_ir(self, builder):
+        if self.fp6_format and (builder.options.backend_name != "cuda"
+                                or builder.options.arch not in ("sm100", "sm103")):
+            raise ValueError("FP6 TMA stores require SM100 or SM103")
+        return builder.create_tensor_descriptor_type(self.block_type.to_ir(builder),
+                                                     self.block_type.element_ty.is_int_signed(), self.fp6_format)
 
     def __str__(self) -> str:
         # ex. "tensor_descriptor<float32[16, 32]>"
@@ -1549,13 +1570,13 @@ class tensor_descriptor_base_type(base_type):
     def __eq__(self, other) -> bool:
         if type(other) is not type(self):
             return False
-        return self.block_type == other.block_type
+        return self.block_type == other.block_type and self.fp6_format == other.fp6_format
 
     def __neq__(self, other) -> bool:
         return not (self == other)
 
     def mangle(self) -> str:
-        return f"TD{self.block_type.mangle()}"
+        return f"TD{self.fp6_format or ''}{self.block_type.mangle()}"
 
 
 class tensor_descriptor_base(base_value):
@@ -1563,12 +1584,12 @@ class tensor_descriptor_base(base_value):
     A tensor descriptor with unknown shape and strides
     """
 
-    def __init__(self, handle, block_type: block_type):
+    def __init__(self, handle, block_type: block_type, fp6_format=None):
         """Not called by user code."""
         super().__init__()
 
         self.handle = handle  # IR handle
-        self.type = tensor_descriptor_base_type(block_type)  # Tensor type (block_type)
+        self.type = tensor_descriptor_base_type(block_type, fp6_format)  # Tensor type (block_type)
 
     def _set_name(self, builder: ir.builder, name: str) -> None:
         self.handle.set_loc(builder.create_name_loc(name, self.handle.get_loc()))
@@ -1674,8 +1695,8 @@ class tensor_descriptor_base(base_value):
 
 class tensor_descriptor_type(tensor_descriptor_base_type):
 
-    def __init__(self, block_type: block_type, shape_type: tuple_type, strides_type: tuple_type):
-        self.block_type = block_type
+    def __init__(self, block_type: block_type, shape_type: tuple_type, strides_type: tuple_type, fp6_format=None):
+        super().__init__(block_type, fp6_format)
         self.shape_type = shape_type
         self.strides_type = strides_type
 
@@ -1686,7 +1707,7 @@ class tensor_descriptor_type(tensor_descriptor_base_type):
         strides, cursor = self.strides_type._unflatten_ir(handles, cursor)
         shape = shape.values
         strides = strides.values
-        value = tensor_descriptor(handle, shape, strides, self.block_type)
+        value = tensor_descriptor(handle, shape, strides, self.block_type, self.fp6_format)
         return value, cursor
 
     def _flatten_ir_types(self, builder: ir.builder, out: List[ir.type]) -> None:
@@ -1702,10 +1723,10 @@ class tensor_descriptor_type(tensor_descriptor_base_type):
 class tensor_descriptor(tensor_descriptor_base):
     """A descriptor representing a tensor in global memory."""
 
-    def __init__(self, handle, shape: List[tensor], strides: List[tensor], block_type: block_type):
+    def __init__(self, handle, shape: List[tensor], strides: List[tensor], block_type: block_type, fp6_format=None):
         """Not called by user code."""
         # IR handle
-        super().__init__(handle, block_type)
+        super().__init__(handle, block_type, fp6_format)
         # Global shape
         self.shape = tuple(shape)
         self.strides = tuple(strides)
@@ -1713,6 +1734,7 @@ class tensor_descriptor(tensor_descriptor_base):
             block_type,
             shape_type=self.shape.type,
             strides_type=self.strides.type,
+            fp6_format=fp6_format,
         )
 
     def _set_name(self, builder: ir.builder, name: str) -> None:
@@ -2227,6 +2249,43 @@ def full(shape, value, dtype, _semantic=None):
     return _semantic.full(shape, value, dtype)
 
 
+@builtin
+def sr_store(pointer, value, logical_index, site, mask=None, cache_modifier="", eviction_policy="", _semantic=None):
+    """Mark one final FP32-to-BF16 global write for stochastic rounding.
+
+    Requires a kernel decorated with ``triton_stochastic_rounding``. Pointer
+    and logical index must be matching, injective affine global indices. ABI
+    v1 supports declared named sites that each occur exactly once, a
+    one-dimensional launch, and seven or ten Philox rounds. Masked lanes never
+    store and do not advance another lane's stream.
+    """
+    pointer = _semantic.to_tensor(pointer)
+    value = _semantic.to_tensor(value)
+    logical_index = _semantic.to_tensor(logical_index)
+    site = _unwrap_if_constexpr(site)
+    if not isinstance(site, str) or not site:
+        raise ValueError("sr_store requires a nonempty compile-time site name")
+    if not pointer.dtype.is_ptr() or not pointer.dtype.element_ty.is_floating() or not value.dtype.is_floating():
+        raise ValueError("sr_store requires ordinary floating-point pointers and values")
+    if pointer.shape != value.shape or pointer.shape != logical_index.shape:
+        raise ValueError("sr_store pointer, value and logical_index must have the same shape")
+    if not logical_index.dtype.is_int():
+        raise ValueError("sr_store logical_index must be integer")
+    index_type = int64 if logical_index.dtype.is_int_signed() else uint64
+    logical_index = _semantic.cast(logical_index, index_type)
+    if mask is not None:
+        mask = _semantic.to_tensor(mask)
+        if mask.dtype != int1:
+            raise ValueError("sr_store mask must be boolean")
+        mask = _semantic.broadcast_impl_shape(mask, pointer.shape)
+    cache = _semantic._str_to_store_cache_modifier(_unwrap_if_constexpr(cache_modifier))
+    eviction = _semantic._str_to_eviction_policy(_unwrap_if_constexpr(eviction_policy))
+    options = getattr(_semantic.builder, "options", None)
+    satfinite = getattr(options, "sr_overflow", "satfinite") == "satfinite"
+    return _semantic.builder.create_sr_store(pointer.handle, value.handle, logical_index.handle,
+                                             None if mask is None else mask.handle, site, cache, eviction, satfinite)
+
+
 # -----------------------
 # Shape Manipulation
 # -----------------------
@@ -2665,6 +2724,7 @@ def dot_scaled(
     rhs_k_pack=True,
     out_dtype=float32,
     two_ctas=False,
+    fp6_packed=False,
     _semantic=None,
 ):
     """
@@ -2701,6 +2761,9 @@ def dot_scaled(
     :param two_ctas: If True, use a 2-CTA collective scaled matmul on Blackwell. Launch with
       ``ctas_per_cga=(2, 1, 1)`` and BLOCK_M >= 128; the compiler splits B across the pair.
     :type two_ctas: bool
+    :param fp6_packed: On AMD, FP6 operands contain per-segment native fragments:
+      24 packed bytes followed by 8 padding bytes per 32 logical values.
+    :type fp6_packed: bool
     """
     lhs_format = _unwrap_if_constexpr(lhs_format)
     rhs_format = _unwrap_if_constexpr(rhs_format)
@@ -2710,6 +2773,7 @@ def dot_scaled(
     lhs_k_pack = _unwrap_if_constexpr(lhs_k_pack)
     rhs_k_pack = _unwrap_if_constexpr(rhs_k_pack)
     two_ctas = _unwrap_if_constexpr(two_ctas)
+    fp6_packed = _unwrap_if_constexpr(fp6_packed)
     assert out_dtype == float32, "Only float32 is supported for out_dtype at the moment"
     return _semantic.dot_scaled(
         lhs,
@@ -2724,6 +2788,7 @@ def dot_scaled(
         rhs_k_pack,
         out_dtype,
         two_ctas,
+        fp6_packed,
     )
 
 
@@ -3015,6 +3080,7 @@ def make_tensor_descriptor(
     strides: List[tensor],
     block_shape: List[constexpr],
     padding_option="zero",
+    fp6_format=None,
     _semantic=None,
 ) -> tensor_descriptor:
     """Make a tensor descriptor object
@@ -3024,6 +3090,8 @@ def make_tensor_descriptor(
     :param strides: A list of tensor strides. Leading dimensions must be multiples
         of 16-byte strides and the last dimension must be contiguous.
     :param block_shape: The shape of block to be loaded/stored from global memory
+    :param fp6_format: For packed FP6 TMA stores, use "e2m3" or "e3m2" with a uint8 base.
+        Shape and offsets count logical values. Outer strides count bytes. Each source uint8 holds one FP6 code.
 
     Notes
     *****
@@ -3066,7 +3134,8 @@ def make_tensor_descriptor(
     """
 
     padding_option = _unwrap_if_constexpr(padding_option)
-    return _semantic.make_tensor_descriptor(base, shape, strides, block_shape, padding_option)
+    fp6_format = _unwrap_if_constexpr(fp6_format)
+    return _semantic.make_tensor_descriptor(base, shape, strides, block_shape, padding_option, fp6_format)
 
 
 # -----------------------
@@ -3635,39 +3704,6 @@ def reduce(
         else:
             ret = tuple(expand_ndims(t, len(input[0].shape)) for t in ret)
     return ret
-
-
-@builtin
-def _reduce_with_indices(
-    input,
-    axis,
-    combine_fn,
-    keep_dims=False,
-    reduction_ordering=None,
-    _semantic=None,
-    _generator=None,
-):
-    axis = _unwrap_if_constexpr(axis)
-    n = input.shape[axis]
-    index = arange(0, n, _semantic=_semantic)
-
-    if len(input.shape) > 1:
-        # Broadcast index across the non-reduced axes
-        axes_to_expand = [constexpr(d) for d in builtins.range(len(input.shape))]
-        del axes_to_expand[axis]
-        index = expand_dims(index, axes_to_expand, _semantic=_semantic)
-        index = broadcast_to(index, input.shape, _semantic=_semantic)
-
-    rvalue, rindices = reduce(
-        (input, index),
-        axis,
-        combine_fn,
-        keep_dims=keep_dims,
-        reduction_ordering=reduction_ordering,
-        _semantic=_semantic,
-        _generator=_generator,
-    )
-    return rvalue, rindices
 
 
 # -----------------------
@@ -4316,6 +4352,8 @@ class AutoWSLoopOptions(base_value):
                                                          metadata=_loop_attr("tt.smem_circular_reuse", "bool_opt"))
     lhs_buffer_depth: int | constexpr | None = field(default=None, metadata=_loop_attr("tt.lhs_buffer_depth", "int32"))
     rhs_buffer_depth: int | constexpr | None = field(default=None, metadata=_loop_attr("tt.rhs_buffer_depth", "int32"))
+    smem_operand_ring_first: bool | constexpr | None = field(
+        default=None, metadata=_loop_attr("tt.smem_operand_ring_first", "bool_opt"))
 
 
 @dataclass(eq=False)
@@ -4454,7 +4492,7 @@ def dispatch(
     num_args = len(list(arg_type_symbol_dict.keys())[0])
     if len(args) != num_args:
         raise ValueError(f"length of input args does not match."
-                         f"Expect {len(args)}, got {num_args}")
+                         f"Expect {num_args}, got {len(args)}")
 
     arg_types = []
     arg_list = []

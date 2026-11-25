@@ -11,7 +11,7 @@ from triton._C.libtriton import ir
 from triton.backends.compiler import GPUTarget
 import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.tutorials import amd_tdm_gemm_pipelined as _gfx1250_gemm
-from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250 import amd_mxfp_gemm_tdm_pipelined as _gfx1250_mxfp
+from triton.tlx.ops.kernels.mm_mxfp import gfx1250 as _gfx1250_mxfp
 from triton.language.extra.tlx.tutorials.amd_grouped_gemm_gfx1250 import (
     amd_grouped_gemm_gfx1250_test as _gfx1250_grouped, )
 from triton._filecheck import run_parser
@@ -29,9 +29,7 @@ from triton.compiler.compiler import ASTSource, compile as triton_compile
 from triton.compiler.errors import CompilationError
 from triton.backends.amd import compiler as amd_compiler
 from triton.tlx.ops.kernels.flash_attn import gfx950 as _amd_fa_cluster_module
-from triton.tlx.ops.kernels.mm_mxfp8 import gfx950 as _amd_mm_mxfp8
-from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250.amd_mxfp_gemm_tdm_pipelined import (
-    mxgemm_tdm_pipelined_kernel as _amd_mxfp_gemm_kernel, )
+from triton.tlx.ops.kernels.mm_mxfp import gfx950 as _amd_mm_mxfp
 from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
     matmul_tdm_pipelined_kernel as _amd_tdm_gemm_kernel, )
 from triton.tlx.ops.kernels.flash_attn.gfx950 import (
@@ -799,9 +797,9 @@ def _mxfp8_gfx950_copy_layout_kernel(A, C, COPY: tl.constexpr, ROWS: tl.constexp
 
 
 @pytest.mark.parametrize("copy", [
-    _amd_mm_mxfp8._n256x192_fly_layout_copy,
-    _amd_mm_mxfp8._ns4_fly_layout_copy,
-    _amd_mm_mxfp8._n256x256_fly_layout_copy,
+    _amd_mm_mxfp._n256x192_fly_layout_copy,
+    _amd_mm_mxfp._ns4_fly_layout_copy,
+    _amd_mm_mxfp._n256x256_fly_layout_copy,
 ])
 @pytest.mark.parametrize("rows", [32, 64, 128, 256])
 def test_mxfp8_gfx950_copy_layout_verifies(copy, rows, tmp_path):
@@ -5773,7 +5771,7 @@ def test_require_amd_wmma_layout_compiles_gfx1250():
 def test_mxgemm_tdm_pipelined_compiles_gfx1250(device):
     """The mxfp GEMM tutorial kernel should lower to TDM + dot_scaled + WMMA."""
     compiled = compile_for_gfx1250(
-        _amd_mxfp_gemm_kernel,
+        _gfx1250_mxfp.mxgemm_tdm_pipelined_kernel,
         signature={
             "a_ptr": "*fp8e5",
             "b_ptr": "*fp8e5",
@@ -5790,6 +5788,7 @@ def test_mxgemm_tdm_pipelined_compiles_gfx1250(device):
             "stride_cm": "i64",
             "stride_cn": "i64",
             "stride_scale": "i64",
+            "stride_b_scale": "i64",
         },
         constexprs={
             "DTYPE_A": "e5m2",
@@ -7405,6 +7404,7 @@ def test_gfx1250_mxgemm_tdm_pipelined_compiles(TDM_FUSION):
             "stride_cm": "i64",
             "stride_cn": "i64",
             "stride_scale": "i64",
+            "stride_b_scale": "i64",
         },
         constexprs={
             "DTYPE_A": "e5m2",
@@ -7557,6 +7557,11 @@ def _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, c_type="*f
                   XCD_REMAP_MODE=0, NUM_XCDS=8, XCD_CHUNK=2, CLUSTER_SIZE=1, CLUSTER_MULTICAST=True,
                   CLUSTER_BARRIER_INTERVAL=1, CLUSTER_LAYOUT="linear")
     config.update(constants)
+    # ASTSource does not apply parameter defaults; constexprs the caller leaves
+    # out would otherwise arrive as None.
+    for param in kernel.params:
+        if param.is_constexpr and param.has_default and param.name not in config:
+            config[param.name] = param.default
     src = ASTSource(kernel, signature=signature, attrs=attrs, constexprs=config)
     compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32),
                               options=dict(num_warps=4, waves_per_eu=1, ctas_per_cga=(config["CLUSTER_SIZE"], 1, 1)))
@@ -7718,7 +7723,11 @@ def test_gfx1250_mxgemm_persistent_staging_overlaps_loads(dtype_b, num_buffers, 
         scales_first = num_buffers == 3
         assert sum("s_add_nc_u64" in inst for inst in body) <= (3 if scales_first else 2)
     wait = next(i for i, inst in enumerate(body) if "s_wait_tensorcnt" in inst)
-    load = next(i for i, inst in enumerate(body) if i > wait and "ds_load_b128" in inst)
+    # Start at the stage wait. A8W4 waits before its split refill barrier, so
+    # the next operand reads can wrap to the top of the loop in assembly order.
+    body = body[wait:] + body[:wait]
+    wait = 0
+    load = next(i for i, inst in enumerate(body) if "ds_load_b128" in inst)
     # A periodic cluster barrier can put the refill block before the compute
     # block in assembly order. Do not count the next iteration's WMMAs as
     # overlap: independent matrix work must remain in the refill block itself.
@@ -7819,6 +7828,7 @@ def test_gfx1250_mxgemm_tdm_split_compiles(DTYPE_B, TDM_SPLIT, BLOCK_M, BLOCK_K)
             "stride_cm": "i64",
             "stride_cn": "i64",
             "stride_scale": "i64",
+            "stride_b_scale": "i64",
         },
         constexprs={
             "DTYPE_A": "e4m3",
@@ -8106,6 +8116,78 @@ def test_amd_scaled_downcast_fp8_constant_scale(block):
     assert "fdiv" not in kernel.asm["llir"]
     assert "v_cvt_scalef32_pk_fp8_f32" in kernel.asm["amdgcn"]
     assert "s_nop" not in kernel.asm["llir"]
+
+
+@triton.jit
+def _amd_scaled_upcast_fp4_kernel(X, S, Y, M: tl.constexpr, K: tl.constexpr, SF: tl.constexpr, F16: tl.constexpr):
+    rows = tl.arange(0, M)[:, None]
+    x = tl.load(X + rows * (K // 2) + tl.arange(0, K // 2)[None, :])
+    s = tl.load(S + rows * (K // SF) + tl.arange(0, K // SF)[None, :])
+    if F16:
+        y = tlx.amd_scaled_upcast_fp4(x, s, tl.float16, axis=1)
+    else:
+        y = tlx.amd_scaled_upcast_fp4(x, s)
+    tl.store(Y + rows * K + tl.arange(0, K)[None, :], y)
+
+
+@triton.jit
+def _amd_scaled_downcast_fp4_kernel(X, S, Y, M: tl.constexpr, K: tl.constexpr, SF: tl.constexpr):
+    rows = tl.arange(0, M)[:, None]
+    v = tl.load(X + rows * K + tl.arange(0, K)[None, :])
+    s = tl.load(S + rows * (K // SF) + tl.arange(0, K // SF)[None, :])
+    q = tlx.amd_scaled_downcast_fp4(v, s, axis=1)
+    tl.store(Y + rows * (K // 2) + tl.arange(0, K // 2)[None, :], q)
+
+
+def _compile_scaled_fp4(kernel, x_ty, y_ty, sf=32, f16=None, arch="gfx1250", warp_size=32):
+    signature = {"X": x_ty, "S": "*u8", "Y": y_ty, "M": "constexpr", "K": "constexpr", "SF": "constexpr"}
+    constexprs = {"M": 32, "K": 128, "SF": sf}
+    if f16 is not None:
+        signature["F16"] = "constexpr"
+        constexprs["F16"] = f16
+    source = ASTSource(kernel, signature=signature, constexprs=constexprs)
+    return triton_compile(source, target=GPUTarget("hip", arch, warp_size), options={"num_warps": 4})
+
+
+_SCALED_FP4_TARGETS = [("gfx1250", 32), ("gfx950", 64)]
+
+
+@pytest.mark.parametrize("arch,warp_size", _SCALED_FP4_TARGETS)
+@pytest.mark.parametrize("f16", [False, True])
+@pytest.mark.parametrize("sf", [32, 8])
+def test_amd_scaled_upcast_fp4(sf, f16, arch, warp_size):
+    kernel = _compile_scaled_fp4(_amd_scaled_upcast_fp4_kernel, "*u8", "*fp16" if f16 else "*bf16", sf=sf, f16=f16,
+                                 arch=arch, warp_size=warp_size)
+    assert "amdg.scaled_upcast_fp4" in kernel.asm["ttgir"]
+    insn = "v_cvt_scale_pk8_{}_fp4" if arch == "gfx1250" else "v_cvt_scalef32_pk_{}_fp4"
+    assert insn.format("f16" if f16 else "bf16") in kernel.asm["amdgcn"]
+    assert "llvm.inline" not in kernel.asm["ttgir"]
+
+
+@pytest.mark.parametrize("arch,warp_size", _SCALED_FP4_TARGETS)
+@pytest.mark.parametrize("x_ty,suffix", [("*fp32", "f32"), ("*bf16", "bf16"), ("*fp16", "f16")])
+def test_amd_scaled_downcast_fp4(x_ty, suffix, arch, warp_size):
+    kernel = _compile_scaled_fp4(_amd_scaled_downcast_fp4_kernel, x_ty, "*u8", arch=arch, warp_size=warp_size)
+    assert "amdg.scaled_downcast_fp4" in kernel.asm["ttgir"]
+    insn = "v_cvt_scalef32_pk8_fp4_{}" if arch == "gfx1250" else "v_cvt_scalef32_pk_fp4_{}"
+    assert insn.format(suffix) in kernel.asm["amdgcn"]
+
+
+def test_amd_scaled_fp4_rejects_other_targets():
+    with pytest.raises(CompilationError, match="requires gfx950 or gfx1250"):
+        _compile_scaled_fp4(_amd_scaled_upcast_fp4_kernel, "*u8", "*bf16", f16=False, arch="gfx942", warp_size=64)
+
+
+def test_amd_scaled_downcast_fp4_rejects_short_scale_block():
+    with pytest.raises(CompilationError, match="multiple of 8"):
+        _compile_scaled_fp4(_amd_scaled_downcast_fp4_kernel, "*fp32", "*u8", sf=4)
+
+
+@pytest.mark.parametrize("sf", [1, 4])
+def test_amd_scaled_upcast_fp4_rejects_short_scale_block(sf):
+    # Both lowerings apply one scale per group of 8 converted values.
+    with pytest.raises(CompilationError, match="multiple of 8"):
+        _compile_scaled_fp4(_amd_scaled_upcast_fp4_kernel, "*u8", "*bf16", sf=sf, f16=False)
 
 
 @triton.jit
