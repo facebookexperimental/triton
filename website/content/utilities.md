@@ -125,49 +125,6 @@ This is an intra-lane packed arithmetic operation. It is distinct from
 `tlx.amd_dot`, which computes a matrix product through MFMA instructions and
 uses distributed matrix/dot-operand layouts.
 
-## AMD scaled FP4 conversion
-
-> `tlx.amd_scaled_upcast_fp4` and `tlx.amd_scaled_downcast_fp4` require **[gfx950, gfx1250]**.
-
-```python
-tlx.amd_scaled_upcast_fp4(x, scale, dtype=tl.bfloat16, axis=-1)
-tlx.amd_scaled_downcast_fp4(x, scale, axis=-1)
-```
-
-Convert between packed E2M1 (FP4) values and BF16, F16 or FP32 with one E8M0
-scale per block of values, the MX block-scaled format. The conversion
-instruction applies the scale, so no separate multiply or divide is needed.
-
-| Argument | Contract |
-|----------|----------|
-| `x` (upcast) | `tl.uint8` block tensor, two E2M1 values per byte along `axis` (the even element in the low nibble) |
-| `x` (downcast) | FP32, BF16 or F16 block tensor |
-| `scale` | Raw E8M0 bytes (value `2^(byte - 127)`), with the unpacked shape except along `axis`, where each scale covers a multiple of 8 consecutive values (32 for MXFP4) |
-| `dtype` (upcast) | Constexpr `tl.bfloat16` (default) or `tl.float16` |
-| `axis` | Constexpr axis of the packed pairs and the scale blocks; default the last |
-
-`amd_scaled_upcast_fp4` returns `x`'s shape with `axis` doubled and computes
-`value * scale` exactly. `amd_scaled_downcast_fp4` returns a `tl.uint8` tensor
-with `axis` halved; it computes `value / scale` and rounds to nearest even,
-saturating at ±6.
-
-```python
-# MXFP4 weights: 32 values per E8M0 scale along K.
-w_packed = tl.load(w_ptr + offs_n[:, None] * (K // 2) + offs_kp[None, :])  # [BLOCK_N, BLOCK_K // 2] uint8
-w_scale = tl.load(s_ptr + offs_n[:, None] * (K // 32) + offs_ks[None, :])  # [BLOCK_N, BLOCK_K // 32] uint8
-w = tlx.amd_scaled_upcast_fp4(w_packed, w_scale, dtype=tl.bfloat16)        # [BLOCK_N, BLOCK_K] bf16
-```
-
-The backend selects the instruction for the target:
-
-| Target | Upcast | Downcast |
-|--------|--------|----------|
-| gfx1250 | `v_cvt_scale_pk8_{bf16,f16}_fp4` (8 values) | `v_cvt_scalef32_pk8_fp4_{f32,bf16,f16}` (8 values) |
-| gfx950 | `v_cvt_scalef32_pk_{bf16,f16}_fp4` (2 values) | `v_cvt_scalef32_pk_fp4_{f32,bf16,f16}` (2 values) |
-
-Both lowerings read one scale per group of 8 values, so a scale block smaller
-than 8 is rejected at compile time.
-
 ## Rubin packed x4 arithmetic
 
 > `tlx.packed_add4`, `tlx.packed_sub4`, `tlx.packed_mul4`, and `tlx.packed_fma4` require **[sm107+]**.

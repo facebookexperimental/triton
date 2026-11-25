@@ -256,20 +256,3 @@ divisor of ``amdg.scaled_downcast_fp8`` (``scale_const = 127 - log2(scale)``), s
 the conversion instruction applies the factor and no separate FP32 multiply is
 needed. Rounding is round-to-nearest-even; NaNs and values beyond the FP8 range
 convert to NaN. The operation preserves tensor ownership.
-
-``triton.language.extra.tlx.amd_scaled_upcast_fp4(x, scale, dtype=tl.bfloat16, axis=-1)``
-converts packed E2M1 (FP4) values times their E8M0 scales to BF16 or F16 on gfx950
-and gfx1250. ``x`` is a uint8 tensor with two E2M1 values per byte along ``axis``
-(the even element in the low nibble); the result doubles that extent. ``scale``
-holds raw E8M0 bytes (value ``2^(byte - 127)``) with the result's shape except along
-``axis``, where each scale covers a multiple of 8 consecutive values (32 for MXFP4).
-The conversion is exact. It lowers to ``amdg.scaled_upcast_fp4``, which applies the
-scale in the conversion instruction (``v_cvt_scale_pk8_*_fp4`` on gfx1250,
-``v_cvt_scalef32_pk_*_fp4`` on gfx950).
-
-``triton.language.extra.tlx.amd_scaled_downcast_fp4(x, scale, axis=-1)`` divides
-FP32, BF16 or F16 values by their E8M0 scales and packs them to E2M1 on gfx950 and
-gfx1250, returning a uint8 tensor with two values per byte along ``axis``. Each
-scale covers a multiple of 8 consecutive values along ``axis``. E2M1 rounding is to
-nearest even, saturating at 6. It lowers to ``amdg.scaled_downcast_fp4``
-(``v_cvt_scalef32_pk8_fp4_*`` on gfx1250, ``v_cvt_scalef32_pk_fp4_*`` on gfx950).
