@@ -2041,7 +2041,7 @@ def _tlx_compute_epilogue(  # type: ignore[no-untyped-def]
                     val_shape[i],
                     i,
                     len(val_shape),
-                    block_name=range_tree.symt.name,
+                    block_name=f"{range_tree.prefix.upper()}BLOCK",
                 )
             )
             intermediate_lines.append(
@@ -2051,7 +2051,7 @@ def _tlx_compute_epilogue(  # type: ignore[no-untyped-def]
                     "xmask" if name == "xindex" else "ymask",
                 )
             )
-            val_shape_copy[i] = range_tree.symt.name
+            val_shape_copy[i] = f"{range_tree.prefix.upper()}BLOCK"
         val_shape = tuple(val_shape_copy)
 
         index_symbols = epilogue_index_symbols
