@@ -36,6 +36,11 @@
 
 #define DEBUG_TYPE "nvgpu-ws-memory-planner"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
+
+// Module attribute: bytes of shared memory a warp-specialized plan needs beyond
+// the device limit. The NVIDIA backend raises OutOfResources for it.
+static constexpr llvm::StringLiteral kWSSharedMemOverflowAttr =
+    "ttg.ws_shared_memory_overflow";
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
 namespace ttnvws = mlir::triton::nvws;
@@ -867,6 +872,10 @@ struct WSBuffer {
   unsigned sizeBytes;
   Interval<size_t> liveness;
   bool isInnermost;
+  // Innermost only because the loop that holds its users has no inner loop,
+  // e.g. a persistent tile loop whose K loop folded to one iteration. Nothing
+  // keeps such a buffer live across an inner loop.
+  bool isInnermostWithoutInnerLoop = false;
   bool isTMA;
   bool isCrossStage;
   unsigned bufferId;
@@ -1243,6 +1252,39 @@ static bool isInnermostSmemChannel(Operation *alloc,
     });
   }
   return numD >= 1;
+}
+
+/// The one loop holding every user of an SMEM channel, or null.
+static scf::ForOp getStagingLoop(Operation *alloc,
+                                 SmallVector<Channel *> &channels) {
+  Channel *ch = findChannelForOp(alloc, channels);
+  if (!ch)
+    return nullptr;
+  DenseSet<Operation *> users;
+  (void)getAllAcutalUsersForChannel(ch, users, alloc);
+  scf::ForOp loop;
+  for (Operation *user : users) {
+    auto userLoop = user->getParentOfType<scf::ForOp>();
+    if (!userLoop || (loop && userLoop != loop))
+      return nullptr;
+    loop = userLoop;
+  }
+  return loop;
+}
+
+/// Whether an innermost SMEM channel sits in the outermost, warp-specialized
+/// loop: its users share a loop with no enclosing loop, so the channel is not
+/// live across an inner loop (e.g. a persistent tile loop whose K loop folded
+/// to one iteration).
+static bool isInnermostWithoutInnerLoop(Operation *alloc,
+                                        SmallVector<Channel *> &channels) {
+  Channel *ch = findChannelForOp(alloc, channels);
+  if (!ch)
+    return false;
+  auto parentLoop = getStagingLoop(alloc, channels);
+  return parentLoop && !parentLoop->getParentOfType<scf::ForOp>() &&
+         !parentLoop->getParentOfType<scf::WhileOp>() &&
+         parentLoop->hasAttr(tt::kWarpSpecializeAttrName);
 }
 
 /// Check if a channel's producer is a TMA operation.
@@ -1989,8 +2031,10 @@ findReuseCandidate(WSBuffer &candidate, SmallVector<WSBuffer> &wsBuffers,
                    SmallVector<Channel *> &channels, int numClusters,
                    DenseMap<unsigned, unsigned> &claimedTargets) {
   // Innermost buffers cannot be reuse candidates — they're live during
-  // the inner loop and would conflict with the reuse target.
-  if (candidate.isInnermost) {
+  // the inner loop and would conflict with the reuse target. TMA staging in a
+  // loop without an inner loop is not, and reuses like non-innermost staging.
+  if (candidate.isInnermost &&
+      !(candidate.tmaStaging > 0 && candidate.isInnermostWithoutInnerLoop)) {
     LDBG("  findReuseCandidate: candidate bufferId="
          << candidate.bufferId << " is innermost — skipping");
     return nullptr;
@@ -2057,6 +2101,18 @@ findReuseCandidate(WSBuffer &candidate, SmallVector<WSBuffer> &wsBuffers,
       LDBG("  findReuseCandidate: target bufferId="
            << buf.bufferId << " already claimed by bufferId=" << it->second
            << " (candidate=" << candidate.bufferId << ") — skip");
+      continue;
+    }
+
+    // In a loop without an inner loop nothing but data flow orders the
+    // staging write after the operand's last reader in the same iteration:
+    // require that the operand's consumers feed the staging (operand -> MMA ->
+    // accumulator -> staging).
+    if (candidate.isInnermost &&
+        !isOrderedDescriptorReuseTarget(candidate, buf, channels)) {
+      LDBG("  findReuseCandidate: target bufferId="
+           << buf.bufferId << " does not feed candidate bufferId="
+           << candidate.bufferId << " in a loop without an inner loop — skip");
       continue;
     }
 
@@ -2427,7 +2483,7 @@ static unsigned allocateSmemBuffers(
     triton::FuncOp funcOp, SmallVector<Channel *> &channels,
     unsigned numBuffers, unsigned smemBudget, bool smemCircularReuse,
     const DenseMap<Operation *, ChannelAnnotation> &allocToAnnotation,
-    unsigned annotationMaxId);
+    unsigned annotationMaxId, unsigned deviceSmemLimit = 0);
 
 static unsigned allocateSmemBuffersViaSearch(
     triton::FuncOp funcOp, SmallVector<Channel *> &channels,
@@ -2595,7 +2651,7 @@ static unsigned allocateSmemBuffers(
     triton::FuncOp funcOp, SmallVector<Channel *> &channels,
     unsigned numBuffers, unsigned smemBudget, bool smemCircularReuse,
     const DenseMap<Operation *, ChannelAnnotation> &allocToAnnotation,
-    unsigned annotationMaxId = 0) {
+    unsigned annotationMaxId, unsigned deviceSmemLimit) {
   // ── Phase 1: Create WSBuffers ───────────────────────────────────────
   SmallVector<WSBuffer> wsBuffers;
   // Start non-pinned buffer IDs past all annotation IDs (SMEM + TMEM)
@@ -2610,6 +2666,8 @@ static unsigned allocateSmemBuffers(
     buf.allocOp = alloc;
     buf.sizeBytes = getSmemAllocSizeBytes(alloc);
     buf.isInnermost = isInnermostSmemChannel(alloc, channels);
+    buf.isInnermostWithoutInnerLoop =
+        buf.isInnermost && isInnermostWithoutInnerLoop(alloc, channels);
     buf.isTMA = buf.isInnermost && isSmemTMAChannel(alloc, channels);
     buf.isCrossStage = isSmemCrossStage(alloc, channels);
     buf.bufferId = nextBufferId++;
@@ -2806,6 +2864,13 @@ static unsigned allocateSmemBuffers(
   // the SMEM savings.
   {
     unsigned baseTotal = computeTotalSmem(wsBuffers);
+    // Aliasing staging in a loop without an inner loop costs that loop its
+    // cross-tile pipelining (see below), so only do it when one copy of every
+    // buffer does not fit; otherwise Phase 4 trims ring depth as before.
+    SmallVector<WSBuffer> oneCopy(wsBuffers);
+    for (auto &buf : oneCopy)
+      buf.numCopies = 1;
+    bool reuseInLoopWithoutInnerLoop = computeTotalSmem(oneCopy) > smemBudget;
     if (baseTotal > smemBudget) {
       LDBG("Phase 3.6: base SMEM " << baseTotal << " > budget " << smemBudget
                                    << " — trying buffer reuse");
@@ -2817,7 +2882,9 @@ static unsigned allocateSmemBuffers(
         auto &buf = wsBuffers[i];
         if (buf.isPinned)
           continue;
-        if (buf.isInnermost)
+        if (buf.isInnermost &&
+            !(buf.tmaStaging > 0 && buf.isInnermostWithoutInnerLoop &&
+              reuseInLoopWithoutInnerLoop))
           continue;
         // Only reclaim genuinely discretionary space. Skip non-staging buffers
         // that are read across the inner loop (e.g. operand buffers like q/k/v
@@ -2861,6 +2928,34 @@ static unsigned allocateSmemBuffers(
         }
       }
       LDBG("Phase 3.6: new total " << computeTotalSmem(wsBuffers));
+
+      // A loop without an inner loop (e.g. a persistent tile loop whose K
+      // loop folded to one iteration) is software-pipelined across tiles: the
+      // epilogue of tile t shares an iteration with the operand loads of tile
+      // t + 1. Staging that aliases an operand would then be overwritten by
+      // those loads, and the cross-tile WAR token that orders the reuse
+      // (Step 7.5 in WSCodePartition) acquires once per iteration. Keep such
+      // a loop at one stage, as a loop with an inner K loop is.
+      for (auto &buf : wsBuffers) {
+        if (buf.reuseTargetBufferId < 0 || !buf.isInnermostWithoutInnerLoop)
+          continue;
+        auto loop = getStagingLoop(buf.allocOp, channels);
+        if (!loop)
+          continue;
+        LDBG("Phase 3.6: WSBuffer[" << buf.bufferId
+                                    << "] reuses SMEM in a loop without an "
+                                       "inner loop; not pipelining it");
+        loop->walk([](Operation *op) {
+          if (op->hasAttr(tt::kLoopStageAttrName))
+            op->setAttr(
+                tt::kLoopStageAttrName,
+                IntegerAttr::get(IntegerType::get(op->getContext(), 32), 0));
+        });
+        if (loop->hasAttr(tt::kScheduledMaxStageAttrName))
+          loop->setAttr(
+              tt::kScheduledMaxStageAttrName,
+              IntegerAttr::get(IntegerType::get(loop->getContext(), 32), 0));
+      }
     }
   }
 
@@ -3103,6 +3198,26 @@ static unsigned allocateSmemBuffers(
   }
 
   LDBG("Phase 4 complete: totalSmem=" << computeTotalSmem(wsBuffers));
+
+  // The budget is soft: correctness floors may keep a plan above it. A plan
+  // above the device limit (the budget plus the auxiliary reservation),
+  // though, can never launch, so say so now rather than at launch.
+  // Record it on the module; the backend raises OutOfResources after the
+  // pipeline, which autotuners skip like the launch-time check.
+  unsigned finalSmem = computeTotalSmem(wsBuffers);
+  if (deviceSmemLimit && finalSmem > deviceSmemLimit) {
+    funcOp.emitWarning() << "warp-specialized buffers need " << finalSmem
+                         << " bytes of shared memory, more than the "
+                         << deviceSmemLimit << " bytes available";
+    auto module = funcOp->getParentOfType<ModuleOp>();
+    auto i32Ty = IntegerType::get(funcOp.getContext(), 32);
+    unsigned prev = 0;
+    if (auto attr =
+            module->getAttrOfType<IntegerAttr>(kWSSharedMemOverflowAttr))
+      prev = attr.getInt();
+    module->setAttr(kWSSharedMemOverflowAttr,
+                    IntegerAttr::get(i32Ty, std::max(prev, finalSmem)));
+  }
 
   // ── Phase 5: Emit buffer.id and buffer.copy attributes ──────────────
   auto i32Type = IntegerType::get(funcOp.getContext(), 32);
@@ -6055,10 +6170,11 @@ LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
                          funcOp, channels, numBuffers, effectiveSmemBudget,
                          effectiveSmemCircularReuse, smemAllocAnnotations,
                          annotationMaxId)
-                   : allocateSmemBuffers(funcOp, channels, numBuffers,
-                                         effectiveSmemBudget,
-                                         effectiveSmemCircularReuse,
-                                         smemAllocAnnotations, annotationMaxId);
+                   : allocateSmemBuffers(
+                         funcOp, channels, numBuffers, effectiveSmemBudget,
+                         effectiveSmemCircularReuse, smemAllocAnnotations,
+                         annotationMaxId,
+                         options.rejectOverDeviceLimit ? smemBudget : 0);
     if (funcOp->hasAttr("ttg.ws_memory_plan_invalid")) {
       funcOp->removeAttr("ttg.ws_memory_plan_invalid");
       return failure();
@@ -6157,6 +6273,7 @@ public:
       options.smemCircularReuse = smemCircularReuse;
       options.smemPlanSearch = smemPlanSearch;
       options.reserveAuxiliarySmem = reserveAuxiliarySmem;
+      options.rejectOverDeviceLimit = rejectOverDeviceLimit;
       if (failed(doMemoryPlanner(funcOp, numBuffers, smemBudget, options)))
         signalPassFailure();
     }
