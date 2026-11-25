@@ -6546,11 +6546,26 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
               acqLoc, acqBuilder.getIntegerType(64), iterIdx);
         auto idxPhase =
             getBufferIdxAndPhase(acqBuilder, acqLoc, ivExt, /*numBuffers=*/1);
-        acqBuilder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
-            acqLoc, reuseToken, idxPhase.first, idxPhase.second,
-            WSBarrierAttr::forDstTask(ctx, drainedStoreTask)
-                .withGuardedBufferIds(ctx, guardedStagingIds)
-                .build(ctx));
+        auto acquire =
+            acqBuilder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
+                acqLoc, reuseToken, idxPhase.first, idxPhase.second,
+                WSBarrierAttr::forDstTask(ctx, drainedStoreTask)
+                    .withGuardedBufferIds(ctx, guardedStagingIds)
+                    .build(ctx));
+        // A loop that is itself scheduled (no inner loop) needs a stage on
+        // every latency op; keep the token with the ops it brackets. The
+        // per-iteration token phase is only right in a single-stage loop,
+        // which the memory planner guarantees when it lets staging alias an
+        // operand in such a loop.
+        auto maxStage = outerLoop->getAttrOfType<IntegerAttr>(
+            tt::kScheduledMaxStageAttrName);
+        bool flatScheduledLoop = maxStage && maxStage.getInt() == 0;
+        for (Operation *op = firstBodyOp; flatScheduledLoop && op;
+             op = op->getNextNode())
+          if (op != acquire && op->hasAttr(tt::kLoopStageAttrName)) {
+            copyLoopScheduleInfo(acquire, op);
+            break;
+          }
 
         // consumer_release at the bottom of the drained-store task, after its
         // TMA store waits have completed.
@@ -6560,11 +6575,18 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
         relBuilder.setAsynTaskIdsFromArray({drainedStoreTask});
         Value bufIdx = relBuilder.createWithAsyncTaskIds<arith::ConstantIntOp>(
             term->getLoc(), 0, 32);
-        relBuilder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
-            term->getLoc(), reuseToken, bufIdx,
-            WSBarrierAttr::forDstTask(ctx, loadTask)
-                .withGuardedBufferIds(ctx, guardedStagingIds)
-                .build(ctx));
+        auto release =
+            relBuilder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
+                term->getLoc(), reuseToken, bufIdx,
+                WSBarrierAttr::forDstTask(ctx, loadTask)
+                    .withGuardedBufferIds(ctx, guardedStagingIds)
+                    .build(ctx));
+        for (Operation *op = release->getPrevNode(); flatScheduledLoop && op;
+             op = op->getPrevNode())
+          if (op->hasAttr(tt::kLoopStageAttrName)) {
+            copyLoopScheduleInfo(release, op);
+            break;
+          }
         LDBG("Step 7.5: inserted cross-tile staging-reuse WAR barrier (load "
              << loadTask << " -> drained store " << drainedStoreTask << ")");
       }
