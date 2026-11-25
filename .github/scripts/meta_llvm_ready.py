@@ -386,6 +386,9 @@ def ensure_candidate_pr(repo, candidate, platforms, base=''):
         if (pull['state'] != 'open' or not pull['draft'] or pull['base']['ref'] != 'main' or match is None
                 or match.groups()[:3] != (kind, sha, str(build))):
             return dict(result, status='handled')
+        parents = github_json(f"repos/{repo}/git/commits/{pull['head']['sha']}")['parents']
+        if [p['sha'] for p in parents] != [match.group(4)]:
+            return dict(result, status='handled')
         old, new = expected_manifest(repo, kind, match.group(4), sha, build, receipt)
         if not bot_head(repo, kind, match.group(4), pull['head']['sha'], new):
             return dict(result, status='handled')
