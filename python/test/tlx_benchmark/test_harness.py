@@ -590,6 +590,77 @@ def test_amd_identity_and_least_used_selection_survive_missing_management_tools(
     assert os.environ["ROCR_VISIBLE_DEVICES"] == selected.uuid
 
 
+class _FakeNvml:
+    """NVML with one H100: what a container without nvidia-smi still has."""
+
+    TEXT = {
+        "nvmlDeviceGetName": "NVIDIA H100", "nvmlDeviceGetUUID": "GPU-nvml-0", "nvmlSystemGetDriverVersion": "580.1"
+    }
+    UINT = {
+        "nvmlDeviceGetIndex": 0, "nvmlDeviceGetMaxClockInfo": 1980, "nvmlDeviceGetPowerUsage": 120000,
+        "nvmlDeviceGetPowerManagementLimit": 650000, "nvmlDeviceGetTemperature": 40, "nvmlDeviceGetPersistenceMode": 1
+    }
+
+    def __init__(self):
+        self.lib = self
+
+    def count(self):
+        return 1
+
+    def by_index(self, index):
+        return "h0" if index == 0 else None
+
+    def handle(self, uuid):
+        return "h0" if uuid == "GPU-nvml-0" else None
+
+    def text(self, fn, *args):
+        return self.TEXT.get(fn)
+
+    def uint(self, fn, *args):
+        return self.UINT.get(fn)
+
+    def sample(self, handle):
+        return 1755, 0x4
+
+    def nvmlDeviceGetMemoryInfo(self, handle, mem):
+        mem._obj.used = 518 * 2**20
+        return 0
+
+    def nvmlDeviceGetPciInfo_v3(self, handle, pci):
+        pci._obj.bus_id = b"00000000:18:00.0"
+        return 0
+
+    def nvmlDeviceGetPowerManagementLimitConstraints(self, handle, lo, hi):
+        hi._obj.value = 700000
+        return 0
+
+
+def test_nvidia_inventory_falls_back_to_nvml_without_nvidia_smi(monkeypatch, tmp_path):
+    # MAST containers mount the driver's libnvidia-ml but not nvidia-smi.
+    from _harness import denoise
+
+    monkeypatch.setattr(denoise.shutil, "which", lambda name: None)
+    monkeypatch.setattr(denoise, "_nvml", _FakeNvml())
+    (tmp_path / "0000:18:00.0").mkdir()
+    (tmp_path / "0000:18:00.0" / "numa_node").write_text("1\n")
+    monkeypatch.setattr(denoise, "_PCI_DEVICES", str(tmp_path))
+    monkeypatch.setattr(denoise, "numa_bound", lambda node: True)
+    assert denoise.vendor() == denoise.NVIDIA
+    (device, ) = denoise.list_devices()
+    assert (device.index, device.name, device.uuid) == (0, "NVIDIA H100", "GPU-nvml-0")
+    assert device.memory_used_mib == pytest.approx(518)
+    assert denoise.select_device().uuid == "GPU-nvml-0"
+    assert denoise.gpu_uuid(0) == "GPU-nvml-0"
+    state = denoise.gpu_state("GPU-nvml-0")
+    assert state.available and state.index == 0 and state.driver == "580.1"
+    assert (state.sm_clock_mhz, state.max_sm_clock_mhz, state.event_reason_names) == (1755, 1980, ["sw_power_cap"])
+    assert (state.power_draw_w, state.power_limit_w, state.max_power_limit_w) == (120, 650, 700)
+    assert (state.temperature_c, state.persistence_mode) == (40, "Enabled")
+    assert denoise.numa_node("GPU-nvml-0") == 1
+    # Other processes on the GPU are visible only to nvidia-smi.
+    assert denoise.check(0) == ["nvidia-smi unavailable: cannot verify tenancy"]
+
+
 def test_required_benchmark_gpu_cannot_be_an_empty_success(monkeypatch):
     from _harness import denoise
 
@@ -850,10 +921,12 @@ def test_focus_suite_can_union_other_suites():
         "triton.tlx.ops.kernels.mm._shapes",
         "triton.tlx.ops.kernels.moe._routing_shapes",
         "triton.tlx.ops.kernels.moe_finalize._shapes",
+        "triton.tlx.ops.kernels.moe_mxfp._shapes",
         "triton.tlx.ops.kernels.norm._shapes",
         "triton.tlx.ops.kernels.fused.qk_norm_rope_kv_cache._shapes",
         "triton.tlx.ops.kernels.router_gemm._shapes",
         "triton.tlx.ops.kernels.swiglu_ffn._shapes",
+        "triton.tlx.ops.kernels.window_attn_varlen._shapes",
     ],
 )
 def test_operator_shape_modules_expose_the_l1_union(module_name):
@@ -921,9 +994,11 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
         "triton.tlx.ops.kernels.fused.moe_mxfp4_sort_quant._shapes": {"gfx950": ("gfx950_all", )},
         "triton.tlx.ops.kernels.moe._routing_shapes": {"gfx950": ("gfx950_all", )},
         "triton.tlx.ops.kernels.moe_finalize._shapes": {"sm100": ("sm100_all", )},
+        "triton.tlx.ops.kernels.moe_mxfp._shapes": {"gfx1250": ("gfx1250_all", )},
         "triton.tlx.ops.kernels.fused.qk_norm_rope_kv_cache._shapes": {"gfx950": ("gfx950_all", )},
         "triton.tlx.ops.kernels.router_gemm._shapes": {"gfx950": ("gfx950_all", )},
         "triton.tlx.ops.kernels.swiglu_ffn._shapes": {"sm90": ("sm90_1", )},
+        "triton.tlx.ops.kernels.window_attn_varlen._shapes": {"sm90": ("sm90_1", )},
     }
     pattern = re.compile(r"^(?:sm|gfx)\d+_(?:[1-9]\d*|all)$")
     for module_name, defaults in expected.items():
@@ -1034,6 +1109,7 @@ BENCH_MODULES = (
     "bench_rmsnorm_cat",
     "bench_rmsnorm_gate",
     "bench_swiglu_ffn",
+    "bench_window_attn_varlen",
 )
 
 

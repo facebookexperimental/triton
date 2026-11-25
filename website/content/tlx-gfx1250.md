@@ -35,7 +35,10 @@ and `matmul` is its config-dictionary form.
   [`grouped_gemm_mxfp/gfx1250.py`](third_party/tlx/ops/kernels/grouped_gemm_mxfp/gfx1250.py).
 - `mxgemm_tdm_persistent_kernel` is a persistent kernel for 256x256 output
   tiles with FP8 E4M3 A and FP8 E4M3 (A8W8) or FP4 E2M1 (A8W4) B. It backs
-  `mm_mxfp` and is described below.
+  `mm_mxfp` and is described below. With `NUM_GROUPS > 0` it also runs the
+  A8W8 and A8W4 grouped GEMMs whose groups average more than 128 rows; smaller
+  groups stream the weights through `mxgemm_grouped_stream_kernel` in
+  [`grouped_gemm_mxfp/gfx1250.py`](third_party/tlx/ops/kernels/grouped_gemm_mxfp/gfx1250.py).
 
 `TILES_PER_WARP=(M, N)` (`--tiles_per_warp M N` on the command line) selects
 the WMMA tiles per warp, `2 2` by default.
@@ -253,6 +256,8 @@ Copy and wait handling are implemented in the
 |---|---|
 | `buffer_load`, `buffer_store` | AMD resource-descriptor global access; see [global memory access](global-memory.html) |
 | `buffer_atomic_add` | FP16/BF16/FP32/FP64/int32/int64 lowering; 16-bit atomics require contiguous pairs and a pair-uniform mask |
+| `amd_scaled_upcast_fp4` | Packed E2M1 (FP4) × E8M0 scales to BF16/F16 with `v_cvt_scale_pk8_*_fp4`, eight values per instruction; each scale covers a multiple of 8 values (32 for MXFP4) |
+| `amd_scaled_downcast_fp4` | FP32/BF16/F16 ÷ E8M0 scales packed to E2M1 with `v_cvt_scalef32_pk8_fp4_*`; round to nearest even, saturating at 6 |
 | `extract_slice`, `rematerialized_range` | AMD slice/range lowering, not gfx950-only APIs |
 | `amd_register_resident`, `amd_register_class_anchor` | Register-allocation annotations; use VGPR for gfx1250, without assuming CDNA AGPR behavior |
 | `cond_barrier` | Conditional workgroup barrier; callers must obey its wave-participation contract |
