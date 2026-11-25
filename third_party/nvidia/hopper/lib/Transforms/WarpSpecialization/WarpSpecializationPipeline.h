@@ -43,6 +43,11 @@ struct MemoryPlannerOptions {
   bool smemCircularReuse = false;
   bool smemPlanSearch = false;
   bool reserveAuxiliarySmem = true;
+  // Bytes of shared memory that passes after warp specialization allocate
+  // alongside the planned buffers; the planner fits its plan in what remains.
+  unsigned reservedSmemBytes = 0;
+  // When set, receives whether the planned SMEM buffers fit the budget.
+  bool *fitsSmemBudget = nullptr;
 };
 
 // Plans SMEM/TMEM allocation (multi-buffering, liveness). Production passes
@@ -57,6 +62,12 @@ LogicalResult doBufferAllocation(triton::FuncOp funcOp);
 // layout, or a descriptor gather, so it would be staged through registers in
 // the MMA's own partition.
 bool hasRegisterStagedMMAOperand(triton::FuncOp funcOp);
+
+// Returns the shared memory that the software pipeliner and layout conversions
+// will add to a kernel with an MMA operand written in the MMA's own task, or 0
+// when there is no such operand. Must be called before doBufferAllocation.
+unsigned estimateSameTaskOperandStagingSmem(triton::FuncOp funcOp,
+                                            unsigned numStages);
 LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp);
 void doHoistLoopInvariantTMEMStore(triton::FuncOp funcOp);
 void removeRedundantTmemZeroStores(triton::FuncOp funcOp);
