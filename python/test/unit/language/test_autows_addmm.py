@@ -647,20 +647,9 @@ def test_autows_addmm_tma_store_short_trip_count(num_warps):
 
 
 @triton.jit
-def addmm_kernel_2cta_tma_bias_ws(
-    bias_ptr,
-    A,
-    B,
-    C,
-    M: tl.constexpr,
-    N: tl.constexpr,
-    K: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    EPILOGUE_SUBTILE: tl.constexpr,
-    NUM_SMS: tl.constexpr,
-):
+def _addmm_2cta_tma_bias_ws_body(bias_ptr, A, B, C, M, N: tl.constexpr, K: tl.constexpr, BLOCK_SIZE_M: tl.constexpr,
+                                 BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, EPILOGUE_SUBTILE: tl.constexpr,
+                                 NUM_SMS: tl.constexpr):
     """Persistent 2-CTA addmm with a subtiled TMA-bias epilogue (the Inductor
     Blackwell autoWS template's shape)."""
     SUB: tl.constexpr = BLOCK_SIZE_N // EPILOGUE_SUBTILE
@@ -690,7 +679,25 @@ def addmm_kernel_2cta_tma_bias_ws(
             c_desc.store([offs_am, offs_cn], (acc_slices[i] + bias.to(tl.float32)).to(tl.bfloat16))
 
 
-def _run_2cta_tma_bias_few_k_tiles(k_tiles):
+@triton.jit
+def addmm_kernel_2cta_tma_bias_ws(bias_ptr, A, B, C, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+                                  BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+                                  EPILOGUE_SUBTILE: tl.constexpr, NUM_SMS: tl.constexpr):
+    _addmm_2cta_tma_bias_ws_body(bias_ptr, A, B, C, M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, EPILOGUE_SUBTILE,
+                                 NUM_SMS)
+
+
+@triton.jit
+def addmm_kernel_2cta_tma_bias_ws_runtime_m(bias_ptr, A, B, C, M, N: tl.constexpr, K: tl.constexpr,
+                                            BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
+                                            BLOCK_SIZE_K: tl.constexpr, EPILOGUE_SUBTILE: tl.constexpr,
+                                            NUM_SMS: tl.constexpr):
+    # M is a runtime argument, as in Inductor's dynamic-batch addmm; K stays constexpr, so the K loop still folds.
+    _addmm_2cta_tma_bias_ws_body(bias_ptr, A, B, C, M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, EPILOGUE_SUBTILE,
+                                 NUM_SMS)
+
+
+def _run_2cta_tma_bias_few_k_tiles(k_tiles, runtime_m=False):
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
         BLOCK_M, BLOCK_N, BLOCK_K, EPILOGUE_SUBTILE = 128, 256, 64, 8
@@ -705,10 +712,10 @@ def _run_2cta_tma_bias_few_k_tiles(k_tiles):
         C = torch.full((M, N), float("nan"), device="cuda", dtype=torch.bfloat16)
         triton.set_allocator(lambda size, align, stream: torch.empty(size, dtype=torch.int8, device="cuda"))
         num_tiles = (triton.cdiv(M, BLOCK_M) + 1) // 2 * 2 * (N // BLOCK_N)
-        kernel = addmm_kernel_2cta_tma_bias_ws[(min(NUM_SMS,
-                                                    num_tiles), )](bias, A, B, C, M, N, K, BLOCK_M, BLOCK_N, BLOCK_K,
-                                                                   EPILOGUE_SUBTILE, NUM_SMS, num_warps=4, num_stages=7,
-                                                                   ctas_per_cga=(2, 1, 1))
+        fn = addmm_kernel_2cta_tma_bias_ws_runtime_m if runtime_m else addmm_kernel_2cta_tma_bias_ws
+        grid = (min(NUM_SMS, num_tiles), )
+        kernel = fn[grid](bias, A, B, C, M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, EPILOGUE_SUBTILE, NUM_SMS, num_warps=4,
+                          num_stages=7, ctas_per_cga=(2, 1, 1))
         torch.cuda.synchronize()
         assert "ttg.warp_specialize" in kernel.asm["ttgir"], "Expected warp specialization in IR"
         assert kernel.metadata.cluster_dims[0] == 2
@@ -727,25 +734,28 @@ def _run_2cta_tma_bias_few_k_tiles(k_tiles):
         assert excess <= 1e-5 * ref.abs().max().item(), excess
 
 
-@pytest.mark.parametrize("k_tiles", [1, 2])
+@pytest.mark.parametrize("k_tiles, runtime_m", [(1, False), (2, False), (1, True)])
 @pytest.mark.skipif(not is_blackwell() or torch.cuda.get_device_capability()[0] != 10, reason="Requires sm_100 2-CTA")
-def test_autows_addmm_2cta_tma_bias_few_k_tiles(k_tiles):
+def test_autows_addmm_2cta_tma_bias_few_k_tiles(k_tiles, runtime_m):
     """With one K tile the K loop folds away and the tile loop is pipelined.
     The producer partition keeps operand loads at stage 0 and bias loads at
     the last stage; that skew must not exceed the operand ring depth, or an
     operand load waits on a slot whose release needs a bias load the loop has
     not issued yet, and the kernel hangs once each CTA runs several tiles.
-    k_tiles=1 hangs without the fix; k_tiles=2 keeps a K loop and is a
+    k_tiles=1 hangs without the fix, with M constexpr or runtime (as in
+    Inductor's dynamic-batch addmm); k_tiles=2 keeps a K loop and is a
     no-regression control. Runs in a subprocess so a hang fails the test
     instead of stalling the suite."""
     import os
     import subprocess
     import sys
-    driver = (f"import sys; sys.path.insert(0, {os.path.dirname(os.path.abspath(__file__))!r}); "
-              f"from test_autows_addmm import _run_2cta_tma_bias_few_k_tiles as run; run({k_tiles}); print('OK')")
+    driver = (
+        f"import sys; sys.path.insert(0, {os.path.dirname(os.path.abspath(__file__))!r}); "
+        f"from test_autows_addmm import _run_2cta_tma_bias_few_k_tiles as run; run({k_tiles}, {runtime_m}); print('OK')"
+    )
     try:
         proc = subprocess.run([sys.executable, "-c", driver], capture_output=True, text=True, timeout=300)
     except subprocess.TimeoutExpired:
-        pytest.fail(f"2-CTA addmm with k_tiles={k_tiles} hung (no result in 300 s)")
+        pytest.fail(f"2-CTA addmm with k_tiles={k_tiles} runtime_m={runtime_m} hung (no result in 300 s)")
     assert proc.returncode == 0 and "OK" in proc.stdout, (f"rc={proc.returncode}\n--- stdout ---\n{proc.stdout}\n"
                                                           f"--- stderr ---\n{proc.stderr}")
