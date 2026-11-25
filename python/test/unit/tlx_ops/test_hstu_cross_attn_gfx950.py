@@ -200,7 +200,48 @@ def test_hstu_cross_attn_stream_k_shared_kv_short_kv(dtype, monkeypatch):
     a["v"] = a["k"]
     first = hstu_cross_attn(**a, shared_kv=True)
     for _ in range(3):
-        torch.testing.assert_close(hstu_cross_attn(**a, shared_kv=True), first, atol=_fwd_atol(1), rtol=FWD_RTOL)
+        # Split tiles merge in a fixed order, so repeated calls are bitwise equal; a difference means a race.
+        assert torch.equal(hstu_cross_attn(**a, shared_kv=True), first)
+
+
+@requires_gfx950
+def test_hstu_cross_attn_stream_k_long_kv_reads_landed_keys(monkeypatch):
+    # Long KV runs the stream-K softmax pipeline, where all eight waves copy each K tile into LDS and the leading
+    # ping-pong group reads it one stage ahead of the lagging group. Peaked attention makes a read of a key whose copy
+    # has not landed visible: K and V rows are random +-1 and q row r is 1.5 * K[t(r)], so out[r] is about V[t(r)] and
+    # a stale key at t(r) moves it by about 1 (the uniform inputs of the other tests move it by about 1e-5). With
+    # the K wait after dot2 instead of before it in `_softmax_lazy_pipeline_step`, about 90% of these launches had
+    # wrong rows.
+    from triton.tlx.ops import hstu_cross_attn
+    from triton.tlx.ops.kernels.hstu_cross_attn import gfx950
+    from triton.tlx.ops.kernels.hstu_cross_attn._reference import pytorch_hstu_cross_mha
+
+    calls = []
+    stream_k_fwd = gfx950.stream_k_fwd
+    monkeypatch.setattr(gfx950, "stream_k_fwd", lambda *args: calls.append(args) or stream_k_fwd(*args))
+    device = torch.device("cuda")
+    batch, heads, dim, kv_len, q_len = 32, 2, 128, 8192, 256
+    alpha = dim**-0.5
+    seq_offsets = torch.arange(batch + 1, device=device) * kv_len
+    seq_offsets_q = torch.arange(batch + 1, device=device) * q_len
+    attn_scale = torch.tensor(1.0 / (kv_len + q_len), device=device)
+    b = torch.arange(batch, device=device)[:, None, None]
+    h = torch.arange(heads, device=device)[None, :, None]
+    torch.manual_seed(1051)
+    for _ in range(3):
+        k = torch.randint(0, 2, (batch * kv_len, heads, dim), device=device).to(torch.bfloat16) * 2 - 1
+        v = torch.randint(0, 2, (batch * kv_len, heads, dim), device=device).to(torch.bfloat16) * 2 - 1
+        # One target key per q row; every 64 consecutive rows cover all 64 offsets within a KV block.
+        offset = (torch.arange(q_len, device=device) + torch.randint(0, 64, (batch, heads, 1), device=device)) % 64
+        target = torch.randint(0, kv_len // 64, (batch, heads, q_len), device=device) * 64 + offset
+        keys = k.view(batch, kv_len, heads, dim)[b, target, h]
+        q = (1.5 * keys).transpose(1, 2).reshape(batch * q_len, heads, dim)
+        out = hstu_cross_attn(q, k, v, seq_offsets, kv_len, attn_scale, alpha=alpha, seq_offsets_q=seq_offsets_q,
+                              max_q_len=q_len, num_softmax_heads=heads)
+        ref = pytorch_hstu_cross_mha(q_len, kv_len, alpha, q, k, v, attn_scale, seq_offsets_q, seq_offsets,
+                                     num_softmax_heads=heads)
+        torch.testing.assert_close(out, ref, atol=2e-2, rtol=0)
+    assert calls
 
 
 def _inference_inputs(lengths_kv, lengths_q, heads=2, dim=128, dtype=torch.bfloat16):
