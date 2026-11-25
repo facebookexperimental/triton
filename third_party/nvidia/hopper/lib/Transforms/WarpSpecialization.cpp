@@ -340,12 +340,13 @@ public:
 
     if (preWSFuncOp && !fitsSmemBudget) {
       funcOp.getBody().takeBody(preWSFuncOp->getBody());
-      Operation *mmaOp = nullptr;
+      // Attach the remark to the MMA if there is one, else to the function.
+      Operation *remarkOp = funcOp;
       funcOp.walk([&](triton::nvidia_gpu::MMAv5OpInterface op) {
-        mmaOp = op;
+        remarkOp = op;
         return WalkResult::interrupt();
       });
-      mmaOp->emitRemark()
+      remarkOp->emitRemark()
           << "meta autoWS cannot fit its buffers plus " << stagingSmemBytes
           << " bytes of pipelined loads and conversion scratch for an MMA "
              "operand written in the MMA's own partition in the "
