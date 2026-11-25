@@ -136,9 +136,7 @@ from .types import (
     TMemCTAMode,
 )
 from .utility import (
-    amd_scaled_downcast_fp4,
     amd_scaled_downcast_fp8,
-    amd_scaled_upcast_fp4,
     async_task_replica_id,
     clock64,
     cluster_cta_rank,
@@ -287,9 +285,7 @@ __all__ = [
     "release_layout",
     "tcgen05_commit",
     # utility
-    "amd_scaled_downcast_fp4",
     "amd_scaled_downcast_fp8",
-    "amd_scaled_upcast_fp4",
     "cluster_cta_rank",
     "cluster_size_1d",
     "thread_id",

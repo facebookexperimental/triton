@@ -30,7 +30,6 @@
 <a href="clusters.html">Clusters and Cluster Launch Control</a>
 <a href="layouts.html">Layout control and diagnostics</a>
 <a href="utilities.html" aria-current="page">Other operations</a>
-<a class="sub" href="#amd-scaled-fp4-conversion">AMD scaled FP4 conversion</a>
 <a class="sub" href="#rubin-packed-x4-arithmetic">Rubin packed x4 arithmetic</a>
 <a class="sub" href="#tlx-assume-uniform">`tlx.assume_uniform`</a>
 <a href="kernels.html">Tutorial kernels</a>
@@ -92,20 +91,6 @@
 
         # Apply stochastic rounding
         y = tlx.stoch_round(x, tlx.dtype_of(y_ptr), rbits)</code></pre>
-<h2 id="amd-scaled-fp4-conversion">AMD scaled FP4 conversion</h2>
-<blockquote><p><code>tlx.amd_scaled_upcast_fp4</code> and <code>tlx.amd_scaled_downcast_fp4</code> require <strong>[gfx950, gfx1250]</strong>.</p></blockquote>
-<pre><code class="language-python">tlx.amd_scaled_upcast_fp4(x, scale, dtype=tl.bfloat16, axis=-1)
-tlx.amd_scaled_downcast_fp4(x, scale, axis=-1)</code></pre>
-<p>Convert between packed E2M1 (FP4) values and BF16, F16 or FP32 with one E8M0 scale per block of values, the MX block-scaled format. The conversion instruction applies the scale, so no separate multiply or divide is needed.</p>
-<table><thead><tr><th>Argument</th><th>Contract</th></tr></thead><tbody><tr><td><code>x</code> (upcast)</td><td><code>tl.uint8</code> block tensor, two E2M1 values per byte along <code>axis</code> (the even element in the low nibble)</td></tr><tr><td><code>x</code> (downcast)</td><td>FP32, BF16 or F16 block tensor</td></tr><tr><td><code>scale</code></td><td>Raw E8M0 bytes (value <code>2^(byte - 127)</code>), with the unpacked shape except along <code>axis</code>, where each scale covers a multiple of 8 consecutive values (32 for MXFP4)</td></tr><tr><td><code>dtype</code> (upcast)</td><td>Constexpr <code>tl.bfloat16</code> (default) or <code>tl.float16</code></td></tr><tr><td><code>axis</code></td><td>Constexpr axis of the packed pairs and the scale blocks; default the last</td></tr></tbody></table>
-<p><code>amd_scaled_upcast_fp4</code> returns <code>x</code>'s shape with <code>axis</code> doubled and computes <code>value * scale</code> exactly. <code>amd_scaled_downcast_fp4</code> returns a <code>tl.uint8</code> tensor with <code>axis</code> halved; it computes <code>value / scale</code> and rounds to nearest even, saturating at ±6.</p>
-<pre><code class="language-python"># MXFP4 weights: 32 values per E8M0 scale along K.
-w_packed = tl.load(w_ptr + offs_n[:, None] * (K // 2) + offs_kp[None, :])  # [BLOCK_N, BLOCK_K // 2] uint8
-w_scale = tl.load(s_ptr + offs_n[:, None] * (K // 32) + offs_ks[None, :])  # [BLOCK_N, BLOCK_K // 32] uint8
-w = tlx.amd_scaled_upcast_fp4(w_packed, w_scale, dtype=tl.bfloat16)        # [BLOCK_N, BLOCK_K] bf16</code></pre>
-<p>The backend selects the instruction for the target:</p>
-<table><thead><tr><th>Target</th><th>Upcast</th><th>Downcast</th></tr></thead><tbody><tr><td>gfx1250</td><td><code>v_cvt_scale_pk8_{bf16,f16}_fp4</code> (8 values)</td><td><code>v_cvt_scalef32_pk8_fp4_{f32,bf16,f16}</code> (8 values)</td></tr><tr><td>gfx950</td><td><code>v_cvt_scalef32_pk_{bf16,f16}_fp4</code> (2 values)</td><td><code>v_cvt_scalef32_pk_fp4_{f32,bf16,f16}</code> (2 values)</td></tr></tbody></table>
-<p>Both lowerings read one scale per group of 8 values, so a scale block smaller than 8 is rejected at compile time.</p>
 <h2 id="rubin-packed-x4-arithmetic">Rubin packed x4 arithmetic</h2>
 <blockquote><p><code>tlx.packed_add4</code>, <code>tlx.packed_sub4</code>, <code>tlx.packed_mul4</code>, and <code>tlx.packed_fma4</code> require <strong>[sm107+]</strong>.</p></blockquote>
 <p>These operations apply one Rubin packed-arithmetic instruction to four low-precision lanes at a time. Operands must be block tensors containing FP8 E4M3/E5M2 values or packed FP4 E2M1 values represented as <code>tl.int8</code>.</p>

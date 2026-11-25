@@ -1496,34 +1496,6 @@ void init_triton_ir(py::module_ &m) {
              return self.create<triton::amdgpu::ScaledDowncastFp8Op>(
                  src, elemType, scaleConst);
            })
-      // Packed E2M1 <-> BF16/F16/F32 with E8M0 scales. In TTIR the operands
-      // carry no encoding, so the result type is built from the shape alone;
-      // TritonToTritonGPU assigns the encodings.
-      .def("create_amd_scaled_upcast_fp4",
-           [](TritonOpBuilder &self, Value src, Value scale, Type elemType,
-              int axis) -> Value {
-             auto srcTy = cast<RankedTensorType>(src.getType());
-             if (srcTy.getEncoding())
-               return self.create<triton::amdgpu::ScaledUpcastFp4Op>(
-                   src, scale, elemType, axis);
-             SmallVector<int64_t> shape(srcTy.getShape());
-             shape[axis] *= 2;
-             return self.create<triton::amdgpu::ScaledUpcastFp4Op>(
-                 RankedTensorType::get(shape, elemType), src, scale, axis);
-           })
-      .def(
-          "create_amd_scaled_downcast_fp4",
-          [](TritonOpBuilder &self, Value src, Value scale, int axis) -> Value {
-            auto srcTy = cast<RankedTensorType>(src.getType());
-            if (srcTy.getEncoding())
-              return self.create<triton::amdgpu::ScaledDowncastFp4Op>(
-                  src, scale, axis);
-            SmallVector<int64_t> shape(srcTy.getShape());
-            shape[axis] /= 2;
-            return self.create<triton::amdgpu::ScaledDowncastFp4Op>(
-                RankedTensorType::get(shape, self.getBuilder().getI8Type()),
-                src, scale, axis);
-          })
       // Conversions for custom FP types (FP8 and non-standard rounding
       // modes)
       .def(

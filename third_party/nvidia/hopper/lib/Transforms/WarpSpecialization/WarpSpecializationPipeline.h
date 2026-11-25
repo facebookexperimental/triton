@@ -57,6 +57,9 @@ LogicalResult doBufferAllocation(triton::FuncOp funcOp);
 // layout, or a descriptor gather, so it would be staged through registers in
 // the MMA's own partition.
 bool hasRegisterStagedMMAOperand(triton::FuncOp funcOp);
+// Whether this MMAv5 operand's shared-memory copy is filled from registers
+// rather than by a TMA copy (see hasRegisterStagedMMAOperand), ignoring tasks.
+bool isRegisterStagedMMAOperand(Value operand);
 LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp);
 void doHoistLoopInvariantTMEMStore(triton::FuncOp funcOp);
 void removeRedundantTmemZeroStores(triton::FuncOp funcOp);
