@@ -36,16 +36,20 @@ _MIN_K_STEPS = 4
 @triton.jit
 def skinny_mm_kernel(a_desc, w_desc, c_ptr, M, N, stride_cm, BN: tl.constexpr, BK: tl.constexpr, BMP: tl.constexpr,
                      CLUSTER: tl.constexpr, K_ITERS: tl.constexpr, NUM_STAGES: tl.constexpr):
-    w_bufs = tlx.local_alloc((BN, BK), tlx.dtype_of(w_desc), NUM_STAGES)
-    a_bufs = tlx.local_alloc((BMP, BK), tlx.dtype_of(a_desc), NUM_STAGES)
-    acc_tmem = tlx.local_alloc((BN, BMP), tl.float32, 1, tlx.storage_kind.tmem)
+    # Not 2-CTA MMA, but with CLUSTER > 1 the peers arrive on rank 0's red_bar remotely, so entry-block barrier inits
+    # must precede the first TMEM alloc so a cluster sync fits between them (the compiler hoists them and errors if
+    # it cannot). Not required for CLUSTER == 1. Allocate all barriers first.
     full_bars = tlx.alloc_barriers(num_barriers=NUM_STAGES, arrive_count=1)
     empty_bars = tlx.alloc_barriers(num_barriers=NUM_STAGES, arrive_count=1)
     acc_bar = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+    if CLUSTER > 1:
+        red_bar = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+    w_bufs = tlx.local_alloc((BN, BK), tlx.dtype_of(w_desc), NUM_STAGES)
+    a_bufs = tlx.local_alloc((BMP, BK), tlx.dtype_of(a_desc), NUM_STAGES)
+    acc_tmem = tlx.local_alloc((BN, BMP), tl.float32, 1, tlx.storage_kind.tmem)
     STAGE_BYTES: tl.constexpr = (BN * BK + BMP * BK) * 2
     if CLUSTER > 1:
         redbuf = tlx.local_alloc((BN, BMP), tl.float32, CLUSTER)
-        red_bar = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
         rank = tlx.cluster_cta_rank()
     else:
         rank = 0
