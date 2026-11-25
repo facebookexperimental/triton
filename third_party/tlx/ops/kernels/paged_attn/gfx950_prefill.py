@@ -1,4 +1,5 @@
-"""Paged-KV causal prefill attention for gfx950 (MI350). BF16/FP16, inference only.
+"""Paged-KV causal prefill attention for gfx950 (MI350). BF16/FP16 Q; BF16/FP16 K/V of Q's dtype, or FP8 (e4m3fn) K/V
+with per-tensor dequant scales. Inference only.
 
 Q is packed ``(tokens, q_heads, D)``; sequence ``b`` owns query rows
 ``cu_seqlens_q[b]:cu_seqlens_q[b + 1]``, which are the last ``q_len`` of its
@@ -171,8 +172,9 @@ def paged_attention_prefill_triton(query, key_cache, value_cache, cu_seqlens_q, 
 
 
 @triton.jit
-def _read_k(k_slot, col: tl.constexpr, MFMA32: tl.constexpr):
-    # 32 head-dim columns of every key in the LDS K block, transposed into the B operand of a QK dot.
+def _read_k(k_slot, col: tl.constexpr, dtype: tl.constexpr, MFMA32: tl.constexpr):
+    # 32 head-dim columns of every key in the LDS K block, transposed into the B operand of a QK dot (FP8 K is
+    # upcast here, after the LDS read; its scale is folded into qk_scale).
     if MFMA32:
         mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 16], transposed=True,
                                                 warps_per_cta=[4, 1])
@@ -180,12 +182,28 @@ def _read_k(k_slot, col: tl.constexpr, MFMA32: tl.constexpr):
         mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True,
                                                 warps_per_cta=[4, 1])
     n: tl.constexpr = k_slot.shape[0]
-    return tlx.require_layout(tlx.local_load(tlx.local_trans(tlx.local_slice(k_slot, [0, col], [n, 32])), relaxed=True),
-                              tlx.dot_operand_layout(1, mma, k_width=8), pin=False)
+    kt = tlx.local_load(tlx.local_trans(tlx.local_slice(k_slot, [0, col], [n, 32])), relaxed=True)
+    if k_slot.dtype == tl.float8e4nv:
+        # Pinned, so the FP8 bytes are read from LDS straight into the operand layout (8 contiguous bytes of D
+        # per lane) instead of into an intermediate layout and a second LDS round trip.
+        kt = tlx.require_layout(kt, tlx.dot_operand_layout(1, mma, k_width=8))
+    else:
+        kt = tlx.require_layout(kt, tlx.dot_operand_layout(1, mma, k_width=8), pin=False)
+    return kt.to(dtype)
 
 
 @triton.jit
-def _read_v(v_slot, col: tl.constexpr, MFMA32: tl.constexpr):
+def _pv_k_width(v_slot):
+    # PV operands hold 4 keys per lane chunk; an FP8 V needs 8 (8 bytes) for the LDS transpose read.
+    if v_slot.dtype == tl.float8e4nv:
+        kw: tl.constexpr = 8
+    else:
+        kw: tl.constexpr = 4
+    return kw
+
+
+@triton.jit
+def _read_v(v_slot, col: tl.constexpr, dtype: tl.constexpr, MFMA32: tl.constexpr):
     # 32 head-dim columns of every key in the LDS V block, as the B operand of the PV dot into one accumulator.
     if MFMA32:
         mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 16], transposed=True,
@@ -194,8 +212,12 @@ def _read_v(v_slot, col: tl.constexpr, MFMA32: tl.constexpr):
         mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True,
                                                 warps_per_cta=[4, 1])
     n: tl.constexpr = v_slot.shape[0]
-    return tlx.require_layout(tlx.local_load(tlx.local_slice(v_slot, [0, col], [n, 32]), relaxed=True),
-                              tlx.dot_operand_layout(1, mma, k_width=4), pin=False)
+    v = tlx.local_load(tlx.local_slice(v_slot, [0, col], [n, 32]), relaxed=True)
+    if v_slot.dtype == tl.float8e4nv:
+        v = tlx.require_layout(v, tlx.dot_operand_layout(1, mma, k_width=8))
+    else:
+        v = tlx.require_layout(v, tlx.dot_operand_layout(1, mma, k_width=4), pin=False)
+    return v.to(dtype)
 
 
 @triton.jit
@@ -207,8 +229,8 @@ def _qk(q0, q1, k_slot, BLOCK_N: tl.constexpr, MFMA32: tl.constexpr):
         mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True,
                                                 warps_per_cta=[4, 1])
     s = tlx.zeros((q0.shape[0], BLOCK_N), tl.float32, layout=mma)
-    s = tl.dot(q0, _read_k(k_slot, 0, MFMA32), s)
-    return tl.dot(q1, _read_k(k_slot, 32, MFMA32), s)
+    s = tl.dot(q0, _read_k(k_slot, 0, q0.dtype, MFMA32), s)
+    return tl.dot(q1, _read_k(k_slot, 32, q0.dtype, MFMA32), s)
 
 
 @triton.jit
@@ -219,12 +241,12 @@ def _pv(p, v_slot, acc0, acc1, MFMA32: tl.constexpr):
     else:
         mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True,
                                                 warps_per_cta=[4, 1])
-    p = tlx.require_layout(p, tlx.dot_operand_layout(0, mma, k_width=4), pin=False)
-    return tl.dot(p, _read_v(v_slot, 0, MFMA32), acc0), tl.dot(p, _read_v(v_slot, 32, MFMA32), acc1)
+    p = tlx.require_layout(p, tlx.dot_operand_layout(0, mma, k_width=_pv_k_width(v_slot)), pin=False)
+    return tl.dot(p, _read_v(v_slot, 0, p.dtype, MFMA32), acc0), tl.dot(p, _read_v(v_slot, 32, p.dtype, MFMA32), acc1)
 
 
 @triton.jit
-def _qk_interleaved(q0, q1, k_slot, v_src, v_dst, BLOCK_N: tl.constexpr, MFMA32: tl.constexpr):
+def _qk_interleaved(q0, q1, k_slot, V, v_offs, v_dst, BLOCK_N: tl.constexpr, MFMA32: tl.constexpr):
     # QK of the first unmasked block, with the V copy of that block riding the first dot.
     if MFMA32:
         mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 16], transposed=True,
@@ -233,17 +255,17 @@ def _qk_interleaved(q0, q1, k_slot, v_src, v_dst, BLOCK_N: tl.constexpr, MFMA32:
         mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True,
                                                 warps_per_cta=[4, 1])
     s = tlx.zeros((q0.shape[0], BLOCK_N), tl.float32, layout=mma)
-    k0 = _read_k(k_slot, 0, MFMA32)
+    k0 = _read_k(k_slot, 0, q0.dtype, MFMA32)
     with tlx.warp_pipeline_stage("v_copy_read_k1", scope="intra_wave", pair=0):
-        tlx.async_load_commit_group([tlx.async_load(v_src, v_dst)])
-        k1 = _read_k(k_slot, 32, MFMA32)
+        tlx.async_load_commit_group([_kv_copy(V, v_offs, v_dst)])
+        k1 = _read_k(k_slot, 32, q0.dtype, MFMA32)
     with tlx.warp_pipeline_stage("qk0", scope="intra_wave", pair=0):
         s = tl.dot(q0, k0, s)
     return tl.dot(q1, k1, s)
 
 
 @triton.jit
-def _qk_pv_interleaved(q0, q1, p, k_slot, v_slot, acc0, acc1, v_src, v_dst, k_src, k_dst, BLOCK_N: tl.constexpr,
+def _qk_pv_interleaved(q0, q1, p, k_slot, v_slot, acc0, acc1, V, v_offs, v_dst, K, k_offs, k_dst, BLOCK_N: tl.constexpr,
                        MFMA32: tl.constexpr):
     # QK of the next key block and PV of the current one. Each dot is paired with the LDS read the next
     # dot needs, and the next K and V copies ride with the first two dots. The caller waits only for this
@@ -254,24 +276,24 @@ def _qk_pv_interleaved(q0, q1, p, k_slot, v_slot, acc0, acc1, v_src, v_dst, k_sr
     else:
         mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True,
                                                 warps_per_cta=[4, 1])
-    p = tlx.require_layout(p, tlx.dot_operand_layout(0, mma, k_width=4), pin=False)
+    p = tlx.require_layout(p, tlx.dot_operand_layout(0, mma, k_width=_pv_k_width(v_slot)), pin=False)
     s = tlx.zeros((q0.shape[0], BLOCK_N), tl.float32, layout=mma)
-    k0 = _read_k(k_slot, 0, MFMA32)
+    k0 = _read_k(k_slot, 0, q0.dtype, MFMA32)
     with tlx.warp_pipeline_stage("k_copy_read_k1", scope="intra_wave", pair=0):
-        tlx.async_load_commit_group([tlx.async_load(k_src, k_dst)])
-        k1 = _read_k(k_slot, 32, MFMA32)
+        tlx.async_load_commit_group([_kv_copy(K, k_offs, k_dst)])
+        k1 = _read_k(k_slot, 32, q0.dtype, MFMA32)
     with tlx.warp_pipeline_stage("qk0", scope="intra_wave", pair=0):
         s = tl.dot(q0, k0, s)
     # Everything but the K copy just issued: this block's V.
     tlx.async_load_wait_group(1)
     tl.debug_barrier()
     with tlx.warp_pipeline_stage("v_copy_read_v0", scope="intra_wave", pair=1):
-        tlx.async_load_commit_group([tlx.async_load(v_src, v_dst)])
-        v0 = _read_v(v_slot, 0, MFMA32)
+        tlx.async_load_commit_group([_kv_copy(V, v_offs, v_dst)])
+        v0 = _read_v(v_slot, 0, p.dtype, MFMA32)
     with tlx.warp_pipeline_stage("qk1", scope="intra_wave", pair=1):
         s = tl.dot(q1, k1, s)
     with tlx.warp_pipeline_stage("read_v1", scope="intra_wave", pair=2):
-        v1 = _read_v(v_slot, 32, MFMA32)
+        v1 = _read_v(v_slot, 32, p.dtype, MFMA32)
     with tlx.warp_pipeline_stage("pv0", scope="intra_wave", pair=2):
         acc0 = tl.dot(p, v0, acc0)
     acc1 = tl.dot(p, v1, acc1)
@@ -291,10 +313,10 @@ def _softmax(s, m_i, l_i, acc0, acc1, qk_scale, dtype: tl.constexpr):
 
 
 @triton.jit
-def _kv_ptrs(Base, bt_row, kv_head, blk, lo, ctx, stride_p, stride_s, stride_h, BLOCK_N: tl.constexpr,
-             HEAD_DIM: tl.constexpr, PAGE: tl.constexpr):
-    return _kv_page_ptrs(Base, _kv_pages(bt_row, blk, lo, ctx, BLOCK_N, PAGE), kv_head, blk, stride_p, stride_s,
-                         stride_h, BLOCK_N, HEAD_DIM, PAGE)
+def _kv_offs(bt_row, kv_head, blk, lo, ctx, stride_p, stride_s, stride_h, BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr,
+             PAGE: tl.constexpr):
+    return _kv_page_offs(_kv_pages(bt_row, blk, lo, ctx, BLOCK_N, PAGE), kv_head, blk, stride_p, stride_s, stride_h,
+                         BLOCK_N, HEAD_DIM, PAGE)
 
 
 @triton.jit
@@ -305,11 +327,31 @@ def _kv_pages(bt_row, blk, lo, ctx, BLOCK_N: tl.constexpr, PAGE: tl.constexpr):
 
 
 @triton.jit
-def _kv_page_ptrs(Base, page, kv_head, blk, stride_p, stride_s, stride_h, BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr,
+def _kv_page_offs(page, kv_head, blk, stride_p, stride_s, stride_h, BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr,
                   PAGE: tl.constexpr):
     kpos = blk * BLOCK_N + tl.arange(0, BLOCK_N)
     rows = page * stride_p + (kpos % PAGE) * stride_s + kv_head * stride_h
-    return Base + rows[:, None] + tl.arange(0, HEAD_DIM)[None, :]
+    return rows[:, None] + tl.arange(0, HEAD_DIM)[None, :]
+
+
+@triton.jit
+def _kv_copy(Base, offs, dst):
+    # An FP8 row is 64 bytes: the page-table load hides its 16-byte alignment from the compiler, so FP8 tiles go
+    # through buffer_load_to_local with that alignment asserted (checked on the host); BF16/FP16 keep async_load.
+    if Base.dtype.element_ty == tl.float8e4nv:
+        tok = tlx.buffer_load_to_local(dst, Base, offs.to(tl.int32), contiguity=16)
+    else:
+        tok = tlx.async_load(Base + offs, dst)
+    return tok
+
+
+@triton.jit
+def _kv_copy_masked(Base, offs, dst, ok):
+    if Base.dtype.element_ty == tl.float8e4nv:
+        tok = tlx.buffer_load_to_local(dst, Base, offs.to(tl.int32), mask=ok, other=0.0, contiguity=16)
+    else:
+        tok = tlx.async_load(Base + offs, dst, mask=ok)
+    return tok
 
 
 @triton.jit
@@ -320,10 +362,10 @@ def _masked_step(q0, q1, qpos, K, V, k_slot, v_slot, bt_row, kv_head, blk, k_lo,
     kpos = blk * BLOCK_N + tl.arange(0, BLOCK_N)
     # Keys before the tile's earliest window start may sit in recycled pages; never read them.
     ok = ((kpos >= k_lo) & (kpos < ctx))[:, None]
-    k_src = _kv_ptrs(K, bt_row, kv_head, blk, k_lo, ctx, stride_kp, stride_ks, stride_kh, BLOCK_N, HEAD_DIM, PAGE)
-    v_src = _kv_ptrs(V, bt_row, kv_head, blk, k_lo, ctx, stride_vp, stride_vs, stride_vh, BLOCK_N, HEAD_DIM, PAGE)
+    k_offs = _kv_offs(bt_row, kv_head, blk, k_lo, ctx, stride_kp, stride_ks, stride_kh, BLOCK_N, HEAD_DIM, PAGE)
+    v_offs = _kv_offs(bt_row, kv_head, blk, k_lo, ctx, stride_vp, stride_vs, stride_vh, BLOCK_N, HEAD_DIM, PAGE)
     # Masked rows land as zeros, so unread keys never put NaN into PV.
-    tlx.async_load_commit_group([tlx.async_load(k_src, k_slot, mask=ok), tlx.async_load(v_src, v_slot, mask=ok)])
+    tlx.async_load_commit_group([_kv_copy_masked(K, k_offs, k_slot, ok), _kv_copy_masked(V, v_offs, v_slot, ok)])
     tlx.async_load_wait_group(0)
     tl.debug_barrier()
     s = _qk(q0, q1, k_slot, BLOCK_N, MFMA32)
@@ -338,15 +380,17 @@ def _masked_step(q0, q1, qpos, K, V, k_slot, v_slot, bt_row, kv_head, blk, k_lo,
 
 
 @triton.jit
-def _paged_prefill_tlx_kernel(Q, K, V, Out, CuQ, CtxLens, BlockTables, stride_qt, stride_qh, stride_kp, stride_ks,
-                              stride_kh, stride_vp, stride_vs, stride_vh, stride_ot, stride_oh, stride_bt, qk_scale,
-                              window, num_kv_heads, num_m_blocks, n_items, zig, GROUP: tl.constexpr, ROWS: tl.constexpr,
-                              BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr, PAGE: tl.constexpr,
-                              HAS_WINDOW: tl.constexpr, SEQ_MAJOR: tl.constexpr, K_LAYOUT: tl.constexpr,
-                              V_LAYOUT: tl.constexpr, MFMA32: tl.constexpr):
+def _paged_prefill_tlx_kernel(Q, K, V, Out, CuQ, CtxLens, BlockTables, KDescale, VDescale, stride_qt, stride_qh,
+                              stride_kp, stride_ks, stride_kh, stride_vp, stride_vs, stride_vh, stride_ot, stride_oh,
+                              stride_bt, qk_scale, window, num_kv_heads, num_m_blocks, n_items, zig,
+                              GROUP: tl.constexpr, ROWS: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr,
+                              PAGE: tl.constexpr, HAS_WINDOW: tl.constexpr, SEQ_MAJOR: tl.constexpr,
+                              K_LAYOUT: tl.constexpr, V_LAYOUT: tl.constexpr, MFMA32: tl.constexpr,
+                              KV_FP8: tl.constexpr):
     tl.static_assert(HEAD_DIM == 64)
     BLOCK_M: tl.constexpr = ROWS * GROUP
     dtype: tl.constexpr = Q.dtype.element_ty
+    kv_dtype: tl.constexpr = K.dtype.element_ty
     pid = tl.program_id(0)
     if zig > 0:
         # Reverse every other chunk of zig tiles, so the tiles that land on one CU pair long with short.
@@ -376,6 +420,10 @@ def _paged_prefill_tlx_kernel(Q, K, V, Out, CuQ, CtxLens, BlockTables, stride_qt
     ctx = tl.load(CtxLens + b)
     q_off = ctx - q_len
     bt_row = BlockTables + b.to(tl.int64) * stride_bt
+    if KV_FP8:
+        # Per-tensor dequant scales, read on device so the launch stays graph-capturable. K's scale folds into the
+        # softmax scale, V's into the final normalization.
+        qk_scale = qk_scale * tl.load(KDescale)
 
     if MFMA32:
         mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 16], transposed=True,
@@ -407,11 +455,11 @@ def _paged_prefill_tlx_kernel(Q, K, V, Out, CuQ, CtxLens, BlockTables, stride_qt
 
     q_buf = tlx.local_alloc((BLOCK_M, HEAD_DIM), dtype, 1)
     if K_LAYOUT is None:
-        k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), dtype, 2)
-        v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), dtype, 2)
+        k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), kv_dtype, 2)
+        v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), kv_dtype, 2)
     else:
-        k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), dtype, 2, layout=K_LAYOUT)
-        v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), dtype, 2, layout=V_LAYOUT)
+        k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), kv_dtype, 2, layout=K_LAYOUT)
+        v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), kv_dtype, 2, layout=V_LAYOUT)
     q_slot = tlx.local_view(q_buf, 0)
     tlx.async_load_commit_group(
         [tlx.async_load(Q + q_base[:, None] + tl.arange(0, HEAD_DIM)[None, :], q_slot, mask=row_ok[:, None])])
@@ -440,20 +488,20 @@ def _paged_prefill_tlx_kernel(Q, K, V, Out, CuQ, CtxLens, BlockTables, stride_qt
         pg_a = _kv_pages(bt_row, f_lo, k_lo, ctx, BLOCK_N, PAGE)
         pg_b = _kv_pages(bt_row, f_lo + tl.minimum(1, last), k_lo, ctx, BLOCK_N, PAGE)
         tlx.async_load_commit_group([
-            tlx.async_load(
-                _kv_page_ptrs(K, pg_a, kv_head, f_lo, stride_kp, stride_ks, stride_kh, BLOCK_N, HEAD_DIM, PAGE),
-                tlx.local_view(k_buf, 0))
+            _kv_copy(K, _kv_page_offs(pg_a, kv_head, f_lo, stride_kp, stride_ks, stride_kh, BLOCK_N, HEAD_DIM, PAGE),
+                     tlx.local_view(k_buf, 0))
         ])
         tlx.async_load_commit_group([
-            tlx.async_load(
-                _kv_page_ptrs(K, pg_b, kv_head, f_lo + tl.minimum(1, last), stride_kp, stride_ks, stride_kh, BLOCK_N,
+            _kv_copy(
+                K,
+                _kv_page_offs(pg_b, kv_head, f_lo + tl.minimum(1, last), stride_kp, stride_ks, stride_kh, BLOCK_N,
                               HEAD_DIM, PAGE), tlx.local_view(k_buf, 1))
         ])
         pg_c = _kv_pages(bt_row, f_lo + tl.minimum(2, last), k_lo, ctx, BLOCK_N, PAGE)
-        v_src = _kv_page_ptrs(V, pg_a, kv_head, f_lo, stride_vp, stride_vs, stride_vh, BLOCK_N, HEAD_DIM, PAGE)
+        v_offs = _kv_page_offs(pg_a, kv_head, f_lo, stride_vp, stride_vs, stride_vh, BLOCK_N, HEAD_DIM, PAGE)
         tlx.async_load_wait_group(1)
         tl.debug_barrier()
-        s = _qk_interleaved(q0, q1, tlx.local_view(k_buf, 0), v_src, tlx.local_view(v_buf, 0), BLOCK_N, MFMA32)
+        s = _qk_interleaved(q0, q1, tlx.local_view(k_buf, 0), V, v_offs, tlx.local_view(v_buf, 0), BLOCK_N, MFMA32)
         m_i, l_i, p, acc0, acc1 = _softmax(s, m_i, l_i, acc0, acc1, qk_scale, dtype)
         for i in tl.range(0, last, num_stages=1):
             cur = i % 2
@@ -461,14 +509,14 @@ def _paged_prefill_tlx_kernel(Q, K, V, Out, CuQ, CtxLens, BlockTables, stride_qt
             # In flight: K(i + 1), page numbers of block i + 2, then V(i). Wait for the first two only.
             tlx.async_load_wait_group(1)
             tl.debug_barrier()
-            v_next = _kv_page_ptrs(V, pg_b, kv_head, f_lo + i + 1, stride_vp, stride_vs, stride_vh, BLOCK_N, HEAD_DIM,
+            v_next = _kv_page_offs(pg_b, kv_head, f_lo + i + 1, stride_vp, stride_vs, stride_vh, BLOCK_N, HEAD_DIM,
                                    PAGE)
-            k_next = _kv_page_ptrs(K, pg_c, kv_head, f_lo + tl.minimum(i + 2, last), stride_kp, stride_ks, stride_kh,
+            k_next = _kv_page_offs(pg_c, kv_head, f_lo + tl.minimum(i + 2, last), stride_kp, stride_ks, stride_kh,
                                    BLOCK_N, HEAD_DIM, PAGE)
             pg_b = pg_c
             pg_c = _kv_pages(bt_row, f_lo + tl.minimum(i + 3, last), k_lo, ctx, BLOCK_N, PAGE)
             s, acc0, acc1 = _qk_pv_interleaved(q0, q1, p, tlx.local_view(k_buf, nxt), tlx.local_view(v_buf, cur), acc0,
-                                               acc1, v_next, tlx.local_view(v_buf, nxt), k_next,
+                                               acc1, V, v_next, tlx.local_view(v_buf, nxt), K, k_next,
                                                tlx.local_view(k_buf, cur), BLOCK_N, MFMA32)
             m_i, l_i, p, acc0, acc1 = _softmax(s, m_i, l_i, acc0, acc1, qk_scale, dtype)
         tlx.async_load_wait_group(0)
@@ -483,6 +531,8 @@ def _paged_prefill_tlx_kernel(Q, K, V, Out, CuQ, CtxLens, BlockTables, stride_qt
                                             HEAD_DIM, PAGE, HAS_WINDOW, dtype, MFMA32)
 
     inv = (1.0 / tl.where(l_i == 0.0, 1.0, l_i))[:, None]
+    if KV_FP8:
+        inv = inv * tl.load(VDescale)
     o_ptrs = Out + (q_rows * stride_ot + head * stride_oh)[:, None] + tl.arange(0, 32)[None, :]
     out_ty = Out.dtype.element_ty
     tl.store(o_ptrs, tlx.release_layout((acc0 * inv).to(out_ty)), mask=row_ok[:, None])
@@ -500,14 +550,28 @@ def _kv_layout(pad):
 
 
 @lru_cache(maxsize=None)
+def _kv_layout_fp8(pad, interleave_rows=False):
+    """LDS layout of a 64x64 FP8 K/V block: 64-byte rows, each wavefront's 16-byte direct-to-LDS writes landing in
+    one contiguous 1024-byte group (16 rows), with ``pad`` bytes after each group. With ``interleave_rows`` a group
+    holds rows {r, r+1, r+2, r+3, r+16, ..., r+51}: a K^T read takes one column of 32 consecutive keys, which then
+    spans 8 groups and 4 bank offsets instead of 2 groups, cutting the read's bank conflicts 4x."""
+    rows = [[1, 0], [2, 0], [16, 0], [32, 0], [4, 0], [8, 0]] if interleave_rows else \
+        [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0]]
+    bases = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]] + rows
+    return tlx.padded_shared_layout_encoding.with_bases([(1024, pad)], bases, [64, 64])
+
+
+@lru_cache(maxsize=None)
 def _num_cus(device):
     return torch.cuda.get_device_properties(device).multi_processor_count
 
 
 def paged_attention_prefill(query, key_cache, value_cache, cu_seqlens_q, context_lens, block_tables, max_seqlen_q,
-                            sm_scale=None, sliding_window=0, out=None, *, max_context_len=None, rows=None,
-                            waves_per_eu=2, seq_major=None, k_pad=32, v_pad=32, mfma32=True, zig=None):
-    """Launch the TLX forward (head dim 64); inputs are validated by ``tlx.ops.paged_attention_prefill``."""
+                            sm_scale=None, sliding_window=0, out=None, *, max_context_len=None, k_descale=None,
+                            v_descale=None, rows=None, waves_per_eu=2, seq_major=None, k_pad=32, v_pad=32, mfma32=True,
+                            zig=None):
+    """Launch the TLX forward (head dim 64); inputs are validated by ``tlx.ops.paged_attention_prefill``. An FP8
+    (e4m3fn) cache takes one-element float32 ``k_descale`` / ``v_descale`` tensors: K/V = stored value * descale."""
     num_q_heads, head_dim = query.shape[1], query.shape[2]
     page_size, num_kv_heads = key_cache.shape[1], key_cache.shape[2]
     group = num_q_heads // num_kv_heads
@@ -532,26 +596,39 @@ def paged_attention_prefill(query, key_cache, value_cache, cu_seqlens_q, context
         # Past two rounds, dispatch already balances the tail.
         num_cus = _num_cus(query.device)
         zig = num_cus if not seq_major and num_cus < n_items <= 2 * num_cus else 0
+    kv_fp8 = key_cache.dtype == torch.float8_e4m3fn
+    if kv_fp8:
+        k_layout, v_layout = _kv_layout_fp8(16, interleave_rows=True), _kv_layout_fp8(16)
+    else:
+        k_layout, v_layout = _kv_layout(k_pad), _kv_layout(v_pad)
+    # The scale pointers are only read on the FP8 path; any tensor stands in otherwise.
+    k_descale = k_descale if kv_fp8 else out
+    v_descale = v_descale if kv_fp8 else out
     _paged_prefill_tlx_kernel[(n_items, )](query, key_cache, value_cache, out, cu_seqlens_q, context_lens, block_tables,
-                                           query.stride(0), query.stride(1), key_cache.stride(0), key_cache.stride(1),
-                                           key_cache.stride(2), value_cache.stride(0), value_cache.stride(1),
-                                           value_cache.stride(2), out.stride(0), out.stride(1), block_tables.stride(0),
-                                           sm_scale * 1.4426950408889634, sliding_window, num_kv_heads, num_m_blocks,
-                                           n_items, zig, GROUP=group, ROWS=rows, BLOCK_N=64, HEAD_DIM=head_dim,
-                                           PAGE=page_size, HAS_WINDOW=sliding_window > 0, SEQ_MAJOR=seq_major,
-                                           K_LAYOUT=_kv_layout(k_pad), V_LAYOUT=_kv_layout(v_pad), MFMA32=mfma32,
-                                           num_warps=4, num_stages=1, **extra)
+                                           k_descale, v_descale, query.stride(0), query.stride(1), key_cache.stride(0),
+                                           key_cache.stride(1), key_cache.stride(2), value_cache.stride(0),
+                                           value_cache.stride(1), value_cache.stride(2), out.stride(0), out.stride(1),
+                                           block_tables.stride(0), sm_scale * 1.4426950408889634, sliding_window,
+                                           num_kv_heads, num_m_blocks, n_items, zig, GROUP=group, ROWS=rows, BLOCK_N=64,
+                                           HEAD_DIM=head_dim, PAGE=page_size, HAS_WINDOW=sliding_window > 0,
+                                           SEQ_MAJOR=seq_major, K_LAYOUT=k_layout, V_LAYOUT=v_layout, MFMA32=mfma32,
+                                           KV_FP8=kv_fp8, num_warps=4, num_stages=1, **extra)
     return out
 
 
 def ref_prefill(query, key_cache, value_cache, cu_seqlens_q, context_lens, block_tables, sm_scale=None,
-                sliding_window=0):
-    """FP32 reference: gathers each sequence's pages and applies the causal (and window) mask."""
+                sliding_window=0, k_descale=None, v_descale=None):
+    """FP32 reference: gathers each sequence's pages and applies the causal (and window) mask. FP8 caches are
+    dequantized with ``k_descale`` / ``v_descale`` first."""
     num_q_heads, head_dim = query.shape[1], query.shape[2]
     page_size, num_kv_heads = key_cache.shape[1], key_cache.shape[2]
     group = num_q_heads // num_kv_heads
     if sm_scale is None:
         sm_scale = head_dim**-0.5
+    k_mul = float(k_descale.item()) if k_descale is not None else 1.0
+    v_mul = float(v_descale.item()) if v_descale is not None else 1.0
+    if key_cache.dtype == torch.float8_e4m3fn:
+        key_cache, value_cache = key_cache.float(), value_cache.float()
     out = torch.empty_like(query)
     cu = cu_seqlens_q.tolist()
     for b, ctx in enumerate(context_lens.tolist()):
@@ -559,8 +636,8 @@ def ref_prefill(query, key_cache, value_cache, cu_seqlens_q, context_lens, block
         if q_len == 0:
             continue
         pages = block_tables[b, :triton.cdiv(ctx, page_size)].long()
-        k = key_cache[pages].reshape(-1, num_kv_heads, head_dim)[:ctx].float()
-        v = value_cache[pages].reshape(-1, num_kv_heads, head_dim)[:ctx].float()
+        k = key_cache[pages].reshape(-1, num_kv_heads, head_dim)[:ctx].float() * k_mul
+        v = value_cache[pages].reshape(-1, num_kv_heads, head_dim)[:ctx].float() * v_mul
         k, v = k.repeat_interleave(group, 1), v.repeat_interleave(group, 1)
         q = query[cu[b]:cu[b + 1]].float()
         s = torch.einsum("qhd,khd->hqk", q, k) * sm_scale
@@ -575,8 +652,10 @@ def ref_prefill(query, key_cache, value_cache, cu_seqlens_q, context_lens, block
 
 
 def build_inputs(q_lens, ctx_lens, num_q_heads, num_kv_heads, head_dim, page_size, dtype=torch.bfloat16, device="cuda",
-                 extra_pages=0, seed=0):
-    """Random packed Q and a paged cache with each sequence's pages scattered across the pool."""
+                 extra_pages=0, seed=0, kv_dtype=None, kv_scale=1.0):
+    """Random packed Q and a paged cache with each sequence's pages scattered across the pool. ``kv_dtype`` (default
+    ``dtype``) may be ``torch.float8_e4m3fn``: K/V are then stored as value / ``kv_scale``, so ``kv_scale`` is the
+    descale a kernel multiplies back."""
     gen = torch.Generator(device="cpu").manual_seed(seed)
     pages_per_seq = [triton.cdiv(c, page_size) for c in ctx_lens]
     num_pages = sum(pages_per_seq) + extra_pages
@@ -589,8 +668,9 @@ def build_inputs(q_lens, ctx_lens, num_q_heads, num_kv_heads, head_dim, page_siz
         used += n
     tokens = sum(q_lens)
     query = (torch.randn((tokens, num_q_heads, head_dim), generator=gen) * 0.5).to(dtype)
-    key_cache = torch.randn((num_pages, page_size, num_kv_heads, head_dim), generator=gen).to(dtype)
-    value_cache = torch.randn((num_pages, page_size, num_kv_heads, head_dim), generator=gen).to(dtype)
+    kv_dtype = dtype if kv_dtype is None else kv_dtype
+    key_cache = (torch.randn((num_pages, page_size, num_kv_heads, head_dim), generator=gen) / kv_scale).to(kv_dtype)
+    value_cache = (torch.randn((num_pages, page_size, num_kv_heads, head_dim), generator=gen) / kv_scale).to(kv_dtype)
     cu = torch.zeros(len(q_lens) + 1, dtype=torch.int32)
     cu[1:] = torch.tensor(q_lens).cumsum(0)
     return (query.to(device), key_cache.to(device), value_cache.to(device), cu.to(device),

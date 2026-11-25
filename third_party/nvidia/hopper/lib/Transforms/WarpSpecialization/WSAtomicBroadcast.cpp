@@ -410,6 +410,21 @@ untagPreLoopAtomics(triton::FuncOp funcOp,
     }
   if (!wsLoop)
     return success();
+  // Check every candidate before touching the IR, so a reject leaves the
+  // function unchanged. A candidate accepted earlier is untagged below and
+  // stays ahead of the loop, so later candidates may follow or read it.
+  SmallVector<tt::AtomicRMWOp> candidates;
+  auto isCandidate = [&](Operation *op) {
+    auto atomic = dyn_cast<tt::AtomicRMWOp>(op);
+    return atomic && llvm::is_contained(candidates, atomic);
+  };
+  auto operandSlice = [](tt::AtomicRMWOp atomicOp) {
+    SetVector<Operation *> slice;
+    BackwardSliceOptions opts;
+    opts.inclusive = false;
+    (void)getBackwardSlice(atomicOp.getOperation(), &slice, opts);
+    return slice;
+  };
   for (tt::AtomicRMWOp atomicOp :
        llvm::to_vector(body.getOps<tt::AtomicRMWOp>())) {
     if (!atomicOp->isBeforeInBlock(wsLoop) ||
@@ -417,25 +432,29 @@ untagPreLoopAtomics(triton::FuncOp funcOp,
       continue;
     // Earlier ops that move into the partitions would run after the atomic.
     for (Operation *op = &body.front(); op != atomicOp; op = op->getNextNode())
-      if (!getAsyncTaskIds(op).empty() && !isMemoryEffectFree(op)) {
+      if (!getAsyncTaskIds(op).empty() && !isMemoryEffectFree(op) &&
+          !isCandidate(op)) {
         LDBG(
             "reject: pre-loop atomic follows a partition op with side effects");
         return failure();
       }
-    // Operand defs that move into the partitions are cloned next to the atomic.
-    SetVector<Operation *> slice;
-    BackwardSliceOptions opts;
-    opts.inclusive = false;
-    (void)getBackwardSlice(atomicOp.getOperation(), &slice, opts);
-    IRMapping mapping;
-    OpBuilder b(atomicOp);
-    for (Operation *op : slice) {
-      if (getAsyncTaskIds(op).empty())
-        continue;
-      if (!isMemoryEffectFree(op) || op->getNumRegions()) {
+    // Operand defs that move into the partitions must be pure to be cloned.
+    for (Operation *op : operandSlice(atomicOp))
+      if (!getAsyncTaskIds(op).empty() && !isCandidate(op) &&
+          (!isMemoryEffectFree(op) || op->getNumRegions())) {
         LDBG("reject: pre-loop atomic reads a non-pure partition op");
         return failure();
       }
+    candidates.push_back(atomicOp);
+  }
+  // Clone the operand defs that move into the partitions next to each atomic,
+  // then untag the atomic.
+  for (tt::AtomicRMWOp atomicOp : candidates) {
+    IRMapping mapping;
+    OpBuilder b(atomicOp);
+    for (Operation *op : operandSlice(atomicOp)) {
+      if (getAsyncTaskIds(op).empty())
+        continue;
       Operation *clone = b.clone(*op, mapping);
       clone->removeAttr(kAsyncTaskIdAttrName);
       clone->removeAttr(tt::gpu::kPartitionAttrName);

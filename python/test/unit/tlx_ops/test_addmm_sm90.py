@@ -6,8 +6,16 @@ import torch
 from triton._internal_testing import is_hopper
 from triton.tlx.ops.kernels.addmm import sm90
 from triton.tlx.ops.kernels.addmm._shapes import CORRECTNESS_SHAPES, inputs
+from triton.tlx.ops.kernels.mm import sm90 as mm_sm90
 
 pytestmark = pytest.mark.skipif(not is_hopper(), reason="requires an sm90 GPU")
+
+
+@pytest.fixture(autouse=True)
+def _pin_num_sms(monkeypatch):
+    # addmm runs on the mm kernels, whose heuristics assume a full H100 (132
+    # SMs); CI workers may be MIG slices with fewer.
+    monkeypatch.setattr(mm_sm90, "_get_num_sms", lambda: 132)
 
 
 @pytest.mark.parametrize("m,n,k,a_strides,b_strides,bias_strides,dtype_name", CORRECTNESS_SHAPES)

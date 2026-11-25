@@ -172,6 +172,35 @@ def test_umulhi_truncated_input(seed_type, dtype):
         pytest.fail("PTX stage not found")
 
 
+@pytest.mark.parametrize("instrumentation_mode", ["", "fpsan"])
+def test_compile_only_nvptx_fabs_preserves_nan_payload(instrumentation_mode):
+    from triton._C.libtriton import llvm
+    from triton.backends.nvidia.compiler import CUDABackend
+
+    llvm.init_targets()
+    backend = CUDABackend(GPUTarget("cuda", 90, 32))
+    options = backend.parse_options({"ptx_version": 93, "instrumentation_mode": instrumentation_mode})
+    source = """
+target triple = "nvptx64-nvidia-cuda"
+declare <4 x float> @llvm.fabs.v4f32(<4 x float>)
+define ptx_kernel void @abs_kernel(ptr addrspace(1) %input, ptr addrspace(1) %output) {
+  %value = load <4 x float>, ptr addrspace(1) %input, align 16
+  %absolute = call <4 x float> @llvm.fabs.v4f32(<4 x float> %value)
+  store <4 x float> %absolute, ptr addrspace(1) %output, align 16
+  ret void
+}
+"""
+    ptx = backend.make_ptx(source, {}, options, 90)
+    if instrumentation_mode == "fpsan":
+        assert "abs.f32" not in ptx
+        masks = re.findall(r"\band\.b32\s+[^;]+,\s*(0x[0-9a-fA-F]+|\d+)\s*;", ptx)
+        assert len(masks) == 4
+        assert all(int(mask, 0) == 0x7FFFFFFF for mask in masks)
+    else:
+        assert len(re.findall(r"\babs\.f32\b", ptx)) == 4
+        assert "and.b32" not in ptx
+
+
 @pytest.mark.parametrize("element_type", ["f32", "f16", "bf16"])
 def test_compile_only_packed_arith_chains(element_type, tmp_path) -> None:
     packed_type = f"{element_type}x2"
@@ -590,10 +619,11 @@ def test_compile_only_dot_mxfp6_sm100(block_k: int, monkeypatch) -> None:
 
 @pytest.mark.parametrize("nonkdim", [16, 32])
 def test_compile_only_dot_mxfp6_gfx950(nonkdim: int) -> None:
-    # MXFP6 decomposes to a plain bf16 dot on gfx950: native
-    # v_mfma_scale_*_f8f6f4 cannot tile the factor-3 packed K. The kernel must
-    # still reach plain v_mfma_f32 instructions. Storage is dense (4 values
-    # per 3 bytes); BLOCK_K is the logical width.
+    # Dense MXFP6 without `fp6_packed` decomposes to a plain bf16 dot on
+    # gfx950: only the TLX native kernel (which passes `fp6_packed=True`
+    # for per-segment packed fragments) lowers to native
+    # v_mfma_scale_*_f8f6f4. Storage is dense (4 values per 3 bytes);
+    # BLOCK_K is the logical width.
 
     k = triton.compile(
         triton.compiler.ASTSource(
@@ -708,3 +738,25 @@ def test_fp8_compiles_for_multiple_architectures_cuda():
     src = ASTSource(fn=fp8_convert, signature={"src": "*fp32", "dst": "*fp8e5"}, constexprs={})
     triton.compile(src, target=GPUTarget("cuda", 90, 32))
     triton.compile(src, target=GPUTarget("cuda", 80, 32))
+
+
+def test_compile_only_use_slp_vectorizer_option(monkeypatch) -> None:
+    # The per-kernel option must select the same LLVM vectorizer as the
+    # TRITON_USE_SLP_VECTORIZER knob, and differ from the default
+    # target-aware NVPTX vectorizer on a kernel where the two disagree.
+
+    @triton.jit
+    def bf16_mad_kernel(x_ptr, y_ptr):
+        offsets = tl.arange(0, 512)
+        x = tl.load(x_ptr + offsets).to(tl.float32)
+        tl.store(y_ptr + offsets, (x * 1.5 + x).to(tl.bfloat16))
+
+    monkeypatch.setenv("TRITON_ALWAYS_COMPILE", "1")
+    src = ASTSource(fn=bf16_mad_kernel, signature={"x_ptr": "*bf16", "y_ptr": "*bf16"})
+    target = GPUTarget("cuda", 90, 32)
+    default = triton.compile(src, target=target).asm["llir"]
+    option = triton.compile(src, target=target, options={"use_slp_vectorizer": True}).asm["llir"]
+    monkeypatch.setenv("TRITON_USE_SLP_VECTORIZER", "1")
+    knob = triton.compile(src, target=target).asm["llir"]
+    assert option == knob
+    assert option != default

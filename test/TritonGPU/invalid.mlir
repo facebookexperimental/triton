@@ -1093,6 +1093,22 @@ module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32}
 
 // -----
 
+// NVIDIA lowering relies on the body staying a single block.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @warp_predicate_multiple_blocks(%predicate: tensor<64xi1, #blocked>) {
+    // expected-error @+1 {{region with 1 blocks}}
+    ttg.warp_predicate %predicate () {
+      cf.br ^bb1
+    ^bb1:
+      ttg.predicate_yield
+    } : (tensor<64xi1, #blocked>) -> ()
+    tt.return
+  }
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
   tt.func @warp_predicate_cta_barrier(

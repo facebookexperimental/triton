@@ -7,7 +7,7 @@
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @mma_64x96
-  // CHECK-COUNT-48: mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+  // CHECK-COUNT-48: nvvm.mma.sync {{.*}}shape = <m = 16, n = 8, k = 16>, layout_a = row, layout_b = col : (vector<2xf16>, vector<2xf16>, f32)
   // CHECK-NOT: mma.sync
   tt.func @mma_64x96(%am: !ttg.memdesc<64x64xf16, #s, #smem>, %bm: !ttg.memdesc<64x96xf16, #s, #smem>) {
     %a = ttg.local_load %am : !ttg.memdesc<64x64xf16, #s, #smem> -> tensor<64x64xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>>
@@ -17,7 +17,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
   // CHECK-LABEL: @mma_64x128
-  // CHECK-COUNT-64: mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+  // CHECK-COUNT-64: nvvm.mma.sync {{.*}}shape = <m = 16, n = 8, k = 16>, layout_a = row, layout_b = col : (vector<2xf16>, vector<2xf16>, f32)
   // CHECK-NOT: mma.sync
   tt.func @mma_64x128(%am: !ttg.memdesc<64x64xf16, #s, #smem>, %bm: !ttg.memdesc<64x128xf16, #s, #smem>) {
     %a = ttg.local_load %am : !ttg.memdesc<64x64xf16, #s, #smem> -> tensor<64x64xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>>

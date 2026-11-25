@@ -2510,26 +2510,83 @@ def test_flash_attn_mxfp8_gfx950_determinism(warn_only, causal):
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
-@pytest.mark.parametrize("kind", ("head", "v"))
+@pytest.mark.parametrize("kind", ("head", "v", "qkv", "qkv_pingpong"))
 def test_flash_attn_mxfp8_gfx950_quantization_large_head_offset_codegen(kind):
     import re
-    from triton.tlx.ops.kernels.flash_attn_mxfp8.gfx950_train import (_quantize_mxfp8_kernel, _quantize_mxfp8_v_kernel)
+    from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950, gfx950_train
 
     x = torch.empty((1, 1, 64, 128), device="cuda", dtype=torch.bfloat16)
     y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
     scales = torch.empty((1, 1, 64, 4), device="cuda", dtype=torch.uint8)
     # Compile only: head 2's source offset would be 2**31 elements. Dummy
     # tensors stay tiny and the deliberately oversized strides are never run.
-    args = (x, y, scales, 2**30, 2**30, 128, 1, 3, 64)
+    strides = (2**30, 2**30, 128, 1)
+    args = (x, y, scales, *strides, 3, 64)
     if kind == "head":
-        kernel = _quantize_mxfp8_kernel.warmup(*args, HEAD_DIM=128, BLOCK_N=64, num_warps=4, grid=(1, 3))
+        kernel = gfx950_train._quantize_mxfp8_kernel.warmup(*args, HEAD_DIM=128, BLOCK_N=64, num_warps=4, grid=(1, 3))
+    elif kind == "v":
+        kernel = gfx950_train._quantize_mxfp8_v_kernel.warmup(*args, HEAD_DIM=128, BLOCK_N=64, num_warps=1, grid=(1, 3))
     else:
-        kernel = _quantize_mxfp8_v_kernel.warmup(*args, HEAD_DIM=128, BLOCK_N=64, num_warps=1, grid=(1, 3))
+        # Inference quantizes Q, K and V in one launch; each reads the head index.
+        kernel = gfx950._quantize_mxfp8_qkv_kernel.warmup(x, x, x, y, scales, y, scales, y, scales, *(strides * 3), 3,
+                                                          64, HEAD_DIM=128, BLOCK_N=64, PINGPONG=kind == "qkv_pingpong",
+                                                          num_warps=1, grid=(1, 3, 3))
     ir = kernel.asm["ttir"]
-    pid = re.search(r"(%[\w]+) = tt.get_program_id y : i32", ir).group(1)
-    widened = re.search(rf"(%[\w]+) = arith.extsi {re.escape(pid)} : i32 to i64", ir)
-    assert widened is not None, "widen head index before multiplying tensor strides"
+    pids = re.findall(r"(%[\w]+) = tt.get_program_id y : i32", ir)
+    assert pids
+    for pid in pids:
+        uses = [line for line in ir.splitlines() if re.search(rf"{re.escape(pid)}\b(?! =)", line)]
+        assert uses and all(f"arith.extsi {pid} : i32 to i64" in line for line in uses), \
+            "widen head index before multiplying tensor strides"
     assert re.search(r"arith.muli .* : i64", ir)
+
+
+# The attention kernels' head bases need int64 once an offset can reach 2**31
+# elements: from 64 batches of 32 heads x 8192 tokens, where the ping-pong
+# kernel forms the offset of the tile past the last head's last one, and from
+# 67 batches of 32 x 7936 (causal, the loop kernel).
+@pytest.mark.parametrize("causal,n_ctx,batch", [(False, 8192, 64), (True, 7936, 67)])
+def test_flash_attn_mxfp8_gfx950_attention_i64_offsets_threshold(causal, n_ctx, batch):
+    from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950
+
+    pingpong = gfx950._default_config(causal, n_ctx)["pingpong"]
+    assert pingpong == (not causal)
+
+    def uses_i64(z):
+        # Metadata only: the attention kernel is mocked.
+        q8 = torch.empty((z, 32, n_ctx, 128), device="meta", dtype=torch.float8_e4m3fn)
+        v8 = q8.transpose(2, 3).contiguous() if pingpong else q8
+        scale = torch.empty((z, 32, n_ctx, 4), device="meta", dtype=torch.uint8)
+        v_scale = scale if pingpong else torch.empty((z, 32, n_ctx // 32, 128), device="meta", dtype=torch.uint8)
+        with mock.patch.object(gfx950, "_mxfp8_fa_fwd_pingpong" if pingpong else "_mxfp8_fa_fwd") as kernel:
+            gfx950._launch_quantized(q8, q8, v8, scale, scale, v_scale, causal, 0.5)
+        return kernel.__getitem__.return_value.call_args.kwargs.get("USE_I64_OFFSETS", False)
+
+    assert uses_i64(batch) and not uses_i64(batch - 1)
+
+
+# Q, K and V are views into one 2 GiB buffer with a batch stride of 2**30, so
+# the third batch's head bases pass 2**31 elements while the tensors stay
+# small. N_CTX 256 runs the ping-pong kernel, and causal 256 the loop kernel.
+# Each batch must match a launch on contiguous copies.
+@pytest.mark.parametrize("causal,n_ctx", [(False, 256), (True, 256)])
+def test_flash_attn_mxfp8_gfx950_attention_large_head_offset(causal, n_ctx):
+    from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950
+
+    torch.manual_seed(20)
+    shape = (3, 2, n_ctx, 128)
+    pingpong = gfx950._default_config(causal, n_ctx)["pingpong"]
+    q8, k8, v8, qs, ks, vs = gfx950._quantize_qkv(*_qkv(shape), pingpong)
+    expected = gfx950._launch_quantized(q8, k8, v8, qs, ks, vs, causal, 0.5)
+    head = math.prod(shape[1:])
+    storage = torch.empty(2 * 2**30 + 3 * head, device="cuda", dtype=torch.float8_e4m3fn)
+    views = []
+    for i, x in enumerate((q8, k8, v8)):
+        view = storage.as_strided(x.shape, (2**30, *x.stride()[1:]), i * head)
+        view.copy_(x)
+        views.append(view)
+    actual = gfx950._launch_quantized(*views, qs, ks, vs, causal, 0.5)
+    assert torch.equal(actual, expected)
 
 
 # Grad-enabled calls use the hardware-exp2 training forward, which saves the

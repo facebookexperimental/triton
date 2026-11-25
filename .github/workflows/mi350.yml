@@ -70,7 +70,7 @@ jobs:
         uses: ./.github/actions/run-selected-tests
         with:
           suite: ${{ toJSON(fromJSON(inputs.plan).core) }}
-          workers: "4"
+          workers: "12"
           junit: /tmp/tlx-core.xml
       - name: Run TLX tutorial correctness tests
         id: run_correctness_tests
@@ -79,7 +79,7 @@ jobs:
         uses: ./.github/actions/run-selected-tests
         with:
           suite: ${{ toJSON(fromJSON(inputs.plan).correctness) }}
-          workers: "4"
+          workers: "12"
           junit: /tmp/tlx-correctness.xml
       - name: Parse test failures (TLX)
         id: parse

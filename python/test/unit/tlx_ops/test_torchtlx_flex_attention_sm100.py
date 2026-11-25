@@ -90,7 +90,7 @@ def test_flex_adapter_preserves_blackwell_choice_space(monkeypatch, benchmark):
         choices.append(kwargs)
 
     monkeypatch.setattr(templates, "_use_amd_flex_template", lambda: False)
-    monkeypatch.setattr(templates, "_blackwell_flex_fwd_configs", lambda configs: configs)
+    monkeypatch.setattr(templates, "_flex_fwd_base_configs", lambda configs: configs)
     monkeypatch.setattr(templates, "current_target",
                         lambda: SimpleNamespace(num_sms=148, is_blackwell=True, is_gfx1250=False))
     monkeypatch.setattr(torch._inductor.utils, "can_use_tma", lambda *args: True)

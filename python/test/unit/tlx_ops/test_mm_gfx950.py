@@ -1,5 +1,6 @@
 """gfx950 correctness coverage for ``tlx.ops.mm``."""
 
+import re
 import time
 
 import pytest
@@ -20,6 +21,12 @@ MAX_SECONDS_PER_CASE = 60
 
 # TODO: Re-enable shapes here when their direct-TLX correctness failures are fixed.
 FAILED_SHAPES = set()
+
+
+@pytest.mark.parametrize("block_m,block_k,num_warps", [(48, 64, 4), (16, 20, 4), (16, 64, 3)])
+def test_register_a_load_layout_rejects_non_power_of_two_ownership(block_m, block_k, num_warps):
+    with pytest.raises(AssertionError):
+        _gfx950._register_a_load_layout(block_m, block_k, num_warps)
 
 
 def _assert_range_result(actual, expected):
@@ -122,6 +129,63 @@ def test_mm_split_register_graph_replay():
     for _ in range(3):
         graph.replay()
     torch.testing.assert_close(out, (a.float() @ b.float()).to(a.dtype), atol=0, rtol=0)
+
+
+_DECODE_PROJECTIONS = [(2304, 8192), (8192, 1024), (4096, 8192), (8192, 4096)]
+
+
+@pytest.mark.parametrize("n,k", _DECODE_PROJECTIONS)
+@pytest.mark.parametrize("m", [2, 3, 8, 13, 16, 17, 31, 32, 48, 64])
+def test_mm_bf16_decode_projection_dispatch_exact(m, n, k):
+    """Decode-sized projections take the measured plan, and integer inputs give the exactly rounded product."""
+    torch.manual_seed(m * 7 + n)
+    a = torch.randint(-2, 3, (m, k), device="cuda").to(torch.bfloat16)
+    b = torch.randint(-2, 3, (n, k), device="cuda").to(torch.bfloat16).T
+    assert _gfx950._dispatch_for(a, b) == _gfx950._decode_projection_dispatch(m, n, k)
+    backing = torch.full((m, 2 * n), float("nan"), device="cuda", dtype=a.dtype)
+    out = backing[:, ::2]
+    assert tlx_ops.mm(a, b, out=out) is out
+    torch.testing.assert_close(out, (a.float() @ b.float()).to(a.dtype), atol=0, rtol=0)
+    assert backing[:, 1::2].isnan().all()
+
+
+@pytest.mark.parametrize("n,k", _DECODE_PROJECTIONS)
+def test_mm_bf16_decode_projection_plan_buckets(n, k):
+    """Every M in 2..64 has a plan, M = 1 and 27 keep their dedicated plans, and M > 64 is outside the table."""
+    rows = (k, 1), (1, k)
+    for m in range(2, 65):
+        dispatch = _gfx950._range_family_candidates(m, n, k, torch.bfloat16, 2, *rows)[0]
+        if m == 27 and (n, k) in _gfx950._BF16_M27_REGISTER_CONFIGS:
+            continue
+        assert dispatch == _gfx950._decode_projection_dispatch(m, n, k) is not None
+    assert _gfx950._decode_projection_dispatch(1, n, k) is None
+    assert _gfx950._decode_projection_dispatch(65, n, k) is None
+    assert _gfx950._decode_projection_dispatch(16, n + 16, k) is None
+
+
+def test_mm_bf16_decode_projection_unaligned_input_falls_back():
+    m, n, k = 16, 2304, 8192
+    torch.manual_seed(173)
+    a = torch.randn(m * k + 1, device="cuda", dtype=torch.bfloat16)[1:].view(m, k)
+    b = torch.randn((n, k), device="cuda", dtype=a.dtype).T
+    assert _gfx950._decode_projection_dispatch(m, n, k)[0] == "split_register"
+    assert _gfx950._dispatch_for(a, b)[0] != "split_register"
+    out = tlx_ops.mm(a, b)
+    expected = (a.float() @ b.float()).to(a.dtype)
+    torch.testing.assert_close(out, expected, atol=8e-3 * expected.abs().max().item(), rtol=8e-3)
+
+
+@pytest.mark.parametrize("m,n,k", [(16, 2304, 8192), (32, 4096, 8192), (48, 8192, 4096)])
+def test_addmm_bf16_decode_projection_split_bucket_uses_fixed_plan(m, n, k, monkeypatch):
+    """addmm with a bias on a split-register bucket runs one fixed unsplit plan, not the register autotuner."""
+    torch.manual_seed(m + n)
+    a = torch.randint(-2, 3, (m, k), device="cuda").to(torch.bfloat16)
+    b = torch.randint(-2, 3, (n, k), device="cuda").to(torch.bfloat16).T
+    bias = torch.randint(-4, 5, (n, ), device="cuda").to(torch.bfloat16)
+    assert _gfx950._dispatch_for(a, b)[0] == "split_register"
+    monkeypatch.setattr(_gfx950, "_launch_register", lambda *args, **kwargs: pytest.fail("autotuned register launch"))
+    out = tlx_ops.addmm(bias, a, b)
+    torch.testing.assert_close(out, (a.float() @ b.float() + bias.float()).to(a.dtype), atol=0, rtol=0)
 
 
 def test_mm_split_register_cached_public_dispatch():
@@ -504,7 +568,14 @@ def test_mm_full_dense_tn_candidates_accuracy(m, n, k):
 @pytest.mark.parametrize(
     "m,n,k",
     [
+        (256, 282, 282),
         (3072, 2048, 797),
+        (256, 2048, 359),
+        (3072, 2048, 3965),
+        (4096, 242432, 1894),
+        (3072, 38848, 607),
+        (3072, 242176, 1892),
+        (128, 224, 20926),
         (3072, 128, 44536),
         (3072, 1024, 2048),
         (3072, 4096, 2048),
@@ -551,6 +622,64 @@ def test_mm_bf16_odd_k_production_shape():
     _assert_range_result(actual, a @ b)
 
 
+@pytest.mark.parametrize("n,k,min_m", [(2560, 8192, 4096), (8192, 2048, 2048), (4096, 8192, 3072), (8192, 4096, 2048)])
+def test_mm_bf16_prefill_inter_wave_m_range(n, k, min_m):
+    for m in (min_m - 1, 32769):
+        assert _gfx950._dispatch_plan(m, n, k, torch.bfloat16, 2)[0] != "inter_wave"
+    for m in (min_m, 8354):
+        path, plan = _gfx950._dispatch_plan(m, n, k, torch.bfloat16, 2)
+        assert path == "inter_wave"
+        assert plan["SPLIT_K"] == 1
+        torch.manual_seed(m + n + k)
+        a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+        b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16).T
+        if _gfx950._bf16_k8192_prefill_wave_grid_plan(m, n) is None or k != 8192:
+            assert _gfx950._dispatch_for(a, b) == (path, plan)
+        _assert_range_result(tlx_ops.mm(a, b), a @ b)
+    m = min_m
+    a = torch.randn((m, k + 8), device="cuda", dtype=torch.bfloat16)[:, 8:]
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16).T
+    assert a.data_ptr() % 16 == 0 and a.stride(0) == k + 8
+    _assert_range_result(tlx_ops.mm(a, b), a @ b)
+
+
+@pytest.mark.parametrize("m,n,tile", [
+    (8354, 2560, 6400),
+    (6401, 2560, 6400),
+    (8192, 2560, 6400),
+    (4096, 2560, (256, 160)),
+    (5120, 2560, None),
+    (9728, 2560, (192, 256)),
+    (8354, 4096, 8192),
+    (4097, 4096, 4096),
+    (9216, 4096, 8192),
+    (8192, 4096, None),
+    (4608, 4096, 4096),
+    (6144, 4096, 4096),
+    (7168, 4096, None),
+])
+def test_mm_bf16_k8192_prefill_wave_grid_selector(m, n, tile):
+    k = 8192
+    torch.manual_seed(m + n)
+    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16).T
+    path, plan = _gfx950._dispatch_for(a, b)
+    if tile is None:
+        assert path == "inter_wave"
+    elif isinstance(tile, int):
+        assert path == "row_split"
+        assert plan[0] == tile
+    else:
+        assert path == "wave_grid"
+        assert (16 * plan["mi_wave_tile_m"] * plan["warps_m"], 16 * plan["mi_wave_tile_n"] * plan["warps_n"]) == tile
+    _assert_range_result(tlx_ops.mm(a, b), a @ b)
+    bias = torch.randn((n, ), device="cuda", dtype=torch.bfloat16)
+    _assert_range_result(tlx_ops.addmm(bias, a, b), torch.addmm(bias, a, b))
+    unaligned = torch.randn((m * k + 1, ), device="cuda", dtype=torch.bfloat16)[1:].view(m, k)
+    assert _gfx950._dispatch_for(unaligned, b)[0] == "inter_wave"
+    _assert_range_result(tlx_ops.mm(unaligned, b), unaligned @ b)
+
+
 def test_mm_split_k_production_plans_keep_fp32_workspace():
     tables = (
         _gfx950._wg_REGULAR_WAVE_GRID_SPECIALIZATIONS,
@@ -585,7 +714,7 @@ def test_mm_n192_uses_bk128_register_plan(dtype):
     _assert_range_result(actual, a @ b)
 
 
-def test_mm_fp16_m256_n2048_uses_untransposed_register_tile():
+def test_mm_fp16_m256_n2048_uses_transposed_compact_pgr2_tile():
     torch.manual_seed(107)
     a = torch.randn((256, 359), device="cuda", dtype=torch.float16)
     b = torch.randn((2048, 359), device="cuda", dtype=torch.float16).T
@@ -598,10 +727,16 @@ def test_mm_fp16_m256_n2048_uses_untransposed_register_tile():
         a.stride(),
         b.stride(),
     )
-    assert path == "register"
-    assert plan["BLOCK_M"] == 64
-    assert plan["BLOCK_N"] == 32
-    assert plan["BLOCK_K"] == 64
+    assert path == "transposed_wave_grid"
+    assert (plan["mi_wave_tile_m"], plan["mi_wave_tile_n"]) == (1, 2)
+    assert (plan["warps_m"], plan["warps_n"]) == (2, 2)
+    assert plan["block_k"] == 64
+    assert plan["local_stages"] == 1
+    assert plan["pgr2_operands"]
+    assert plan["row_wise_epilogue"]
+    assert plan["exact_lds"]
+    assert plan["dot_mode"] == "persistent"
+    assert plan["waves_per_eu"] == 1
     actual = tlx_ops.mm(a, b)
     _assert_range_result(actual, a @ b)
 
@@ -691,6 +826,212 @@ def test_mm_fp16_m3072_n2048_uses_rectangular_wave_grid():
     _assert_range_result(actual, a @ b)
 
 
+def test_mm_fp16_m4096_n2048_k4096_uses_eight_by_four_wave_grid():
+    torch.manual_seed(110)
+    a = torch.randn((4096, 4096), device="cuda", dtype=torch.float16)
+    b = torch.randn((2048, 4096), device="cuda", dtype=torch.float16).T
+    path, plan = _gfx950._optimized_geometry_config(
+        4096,
+        2048,
+        4096,
+        torch.float16,
+        2,
+        a.stride(),
+        b.stride(),
+    )
+    assert path == "transposed_wave_grid"
+    assert plan["mi_wave_tile_m"] == 8
+    assert plan["mi_wave_tile_n"] == 4
+    assert plan["num_warps"] == 4
+    assert plan["direct_to_lds"]
+    assert plan["workgroup_mapping"] == 6
+    assert plan["reverse_local_assignment"]
+    assert plan["dot_mode"] == "logical"
+    assert plan["num_xcds"] == 1
+    assert plan["llvm_fn_attrs"] == ""
+    actual = tlx_ops.mm(a, b)
+    _assert_range_result(actual, a @ b)
+
+
+def test_mm_production_compiled_wave_grid_launches():
+    torch.manual_seed(112)
+    a = torch.randn((128, 4416), device="cuda", dtype=torch.float16)
+    b = torch.randn((2688, 4416), device="cuda", dtype=torch.float16).T
+    actual = tlx_ops.mm(a, b)
+    _assert_range_result(actual, a @ b)
+
+
+def test_mm_fp16_wide_n_uses_persistent_dot_with_reversed_assignment():
+    path, plan = _gfx950._optimized_geometry_config(
+        3072,
+        242176,
+        1892,
+        torch.float16,
+        2,
+        (1892, 1),
+        (1, 1892),
+    )
+    assert path == "transposed_wave_grid"
+    assert plan["dot_mode"] == "persistent"
+    assert plan["reverse_local_assignment"]
+    assert plan["num_xcds"] == 8
+
+
+def test_mm_fp16_row_major_m61440_uses_transient_wave_grid():
+    path, plan = _gfx950._optimized_geometry_config(
+        61440,
+        3840,
+        4096,
+        torch.float16,
+        2,
+        (4096, 1),
+        (3840, 1),
+    )
+    assert path == "wave_grid"
+    assert plan["mi_wave_tile_m"] == 6
+    assert plan["mi_wave_tile_n"] == 8
+    assert plan["num_warps"] == 4
+    assert plan["row_major_b_lds"]
+    assert plan["direct_to_lds"]
+    assert plan["dot_mode"] == "transient"
+    assert plan["num_xcds"] == 8
+
+
+def test_mm_fp16_row_major_m61440_n5120_k7744_uses_logical_dot():
+    path, plan = _gfx950._optimized_geometry_config(
+        61440,
+        5120,
+        7744,
+        torch.float16,
+        2,
+        (7744, 1),
+        (5120, 1),
+    )
+    assert path == "wave_grid"
+    assert plan["mi_wave_tile_m"] == 6
+    assert plan["mi_wave_tile_n"] == 8
+    assert plan["row_major_b_lds"]
+    assert plan["dot_mode"] == "logical"
+    assert plan["num_xcds"] == 2
+    assert plan["workgroup_mapping"] == 1
+
+
+def test_mm_fp16_row_major_m4096_n242432_k1894_uses_logical_wave_grid():
+    path, plan = _gfx950._optimized_geometry_config(
+        4096,
+        242432,
+        1894,
+        torch.float16,
+        2,
+        (1894, 1),
+        (242432, 1),
+    )
+    assert path == "wave_grid"
+    assert plan["mi_wave_tile_m"] == 6
+    assert plan["mi_wave_tile_n"] == 8
+    assert plan["row_major_b_lds"]
+    assert plan["dot_mode"] == "logical"
+    assert plan["num_xcds"] == 8
+    assert plan["workgroup_mapping"] == 4
+
+
+def test_mm_fp16_m3072_n2048_k2048_uses_two_stage_wave_grid():
+    path, plan = _gfx950._optimized_geometry_config(
+        3072,
+        2048,
+        2048,
+        torch.float16,
+        2,
+        (2048, 1),
+        (1, 2048),
+    )
+    assert path == "wave_grid"
+    assert plan["mi_wave_tile_m"] == 6
+    assert plan["mi_wave_tile_n"] == 4
+    assert plan["local_stages"] == 2
+    assert not plan["exact_lds"]
+    assert plan["dot_mode"] == "logical"
+    assert plan["workgroup_mapping"] == 4
+
+
+@pytest.mark.parametrize("k,direct", [(797, True), (3965, False)])
+def test_mm_fp16_m3072_n2048_odd_k_uses_two_stage_wave_grid(k, direct):
+    path, plan = _gfx950._optimized_geometry_config(
+        3072,
+        2048,
+        k,
+        torch.float16,
+        2,
+        (k, 1),
+        (1, k),
+    )
+    assert path == "wave_grid"
+    assert plan["mi_wave_tile_m"] == 6
+    assert plan["mi_wave_tile_n"] == 4
+    assert plan["local_stages"] == 2
+    assert not plan["exact_lds"]
+    assert plan["direct_to_lds"] is direct
+    assert plan["pack_direct_chunks"] is direct
+    assert plan["dot_mode"] == "logical"
+
+
+def test_mm_fp16_m3072_n4096_k797_uses_two_stage_wave_grid():
+    path, plan = _gfx950._optimized_geometry_config(
+        3072,
+        4096,
+        797,
+        torch.float16,
+        2,
+        (797, 1),
+        (1, 797),
+    )
+    assert path == "wave_grid"
+    assert plan["mi_wave_tile_m"] == 6
+    assert plan["mi_wave_tile_n"] == 8
+    assert plan["local_stages"] == 2
+    assert not plan["exact_lds"]
+    assert plan["dot_mode"] == "logical"
+
+
+def test_mm_fp16_tn_m4096_n242432_k1894_uses_no_sink():
+    path, plan = _gfx950._optimized_geometry_config(
+        4096,
+        242432,
+        1894,
+        torch.float16,
+        2,
+        (1894, 1),
+        (1, 1894),
+    )
+    assert path == "transposed_wave_grid"
+    assert plan["mi_wave_tile_m"] == 8
+    assert plan["mi_wave_tile_n"] == 8
+    assert not plan["sink_insts_to_avoid_spills"]
+    assert plan["dot_mode"] == "logical"
+
+
+def test_mm_fp16_m1024_n6144_k4096_uses_two_stage_wave_grid():
+    torch.manual_seed(111)
+    a = torch.randn((1024, 4096), device="cuda", dtype=torch.float16)
+    b = torch.randn((6144, 4096), device="cuda", dtype=torch.float16).T
+    path, plan = _gfx950._optimized_geometry_config(
+        1024,
+        6144,
+        4096,
+        torch.float16,
+        2,
+        a.stride(),
+        b.stride(),
+    )
+    assert path == "transposed_wave_grid"
+    assert plan["mi_wave_tile_m"] == 6
+    assert plan["mi_wave_tile_n"] == 4
+    assert plan["local_stages"] == 2
+    assert plan["dot_mode"] == "transient"
+    actual = tlx_ops.mm(a, b)
+    _assert_range_result(actual, a @ b)
+
+
 def test_mm_fp16_addmm_derived_deep_k_shape():
     torch.manual_seed(83)
     a = torch.randn((1024, 6144), device="cuda", dtype=torch.float16)
@@ -741,7 +1082,13 @@ def test_mm_fp16_addmm_derived_split_k_shape():
         b.stride(),
     )
     assert path == "transposed_wave_grid"
-    assert plan["split_k"] == 4
+    assert plan["mi_wave_tile_m"] == 7
+    assert plan["mi_wave_tile_n"] == 7
+    assert plan["local_stages"] == 2
+    assert plan["read_cover_sixteenths"] == 15
+    assert plan["reverse_local_assignment"]
+    assert plan["split_k"] == 2
+    assert plan["reduce_tile"] == (32, 32)
     actual = tlx_ops.mm(a, b)
     _assert_range_result(actual, a @ b)
 
@@ -793,7 +1140,7 @@ def test_mm_fp16_addmm_derived_inter_wave_dispatch():
         assert plan["TILE"] == (256, 256)
         assert plan["SPLIT_K"] == 1
         assert plan["STORE_CACHE"] == ".cs"
-        assert plan["GROUP_M_OVERRIDE"] == (1 if n == 65536 else None)
+        assert plan["GROUP_M_OVERRIDE"] == (6 if n == 65536 else None)
     for n in (19584, 19968, 22240):
         path, plan = _gfx950._optimized_geometry_config(
             3072,
@@ -1353,7 +1700,7 @@ def test_mm_small_m_deep_k_preserves_incumbent_dispatch(m, n, k):
 @pytest.mark.parametrize("m,n,k", [
     (1, 1024, 512),
     (16, 8192, 512),
-    (16, 8192, 4096),
+    (16, 8192, 2048),
     (27, 1536, 1024),
     (27, 8192, 512),
     (32, 4096, 4096),
@@ -1837,6 +2184,16 @@ def test_mm_register_plan_int64_operand_offsets(b_layout, launcher):
     out = launch(a, b, config=plan)
     expected = (a_values.float() @ b_values.float()).to(torch.bfloat16)
     torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+
+def test_mm_tiny_bf16_k160_uses_two_wave_range_plan():
+    a = torch.empty((16, 160), device="cuda", dtype=torch.bfloat16)
+    b = torch.empty_strided((160, 512), (1, 160), device="cuda", dtype=torch.bfloat16)
+    path, plan = _gfx950._dispatch_for(a, b)
+    assert path == "range_register"
+    assert (plan["BLOCK_M"], plan["BLOCK_N"], plan["BLOCK_K"]) == (16, 16, 256)
+    assert (plan["NUM_XCDS"], plan["num_warps"], plan["num_stages"]) == (4, 2, 3)
+    assert plan["waves_per_eu"] == 0
 
 
 def test_mm_tuned_rectangular_register_plans():
@@ -3257,6 +3614,97 @@ def test_mm_large_2d_streamk_grid_uses_wide_locality_band():
     assert _gfx950._iw_streamk_mapping(7088, 5552, 32768, 256, 256) == (4, 8)
 
 
+def _record_streamk_launches(monkeypatch):
+    compiled = []
+    kernel = _gfx950._iw_streamk_kernel
+
+    class StreamKRecorder:
+
+        def __getitem__(self, grid):
+
+            def launch(*args, **kwargs):
+                compiled.append(kernel.run(*args, grid=grid, warmup=False, **kwargs))
+                return compiled[-1]
+
+            return launch
+
+    monkeypatch.setattr(_gfx950, "_iw_streamk_kernel", StreamKRecorder())
+    return compiled
+
+
+@pytest.mark.parametrize(
+    "m,n,k,tile",
+    [(1024, 1024, 8192, (128, 128)), (4096, 4352, 8192, (256, 256)), (4096, 5120, 8192, (256, 256))],
+    ids=["mt128-owner-fixup", "mt256-owner-fixup", "mt256-distributed-fixup"],
+)
+def test_mm_streamk_publish_waits_for_every_wave_partial_stores(m, n, k, tile, monkeypatch):
+    """Every wave completes its partial-tile stores before the barrier that precedes the ready flag.
+
+    The ``.wt`` partial stores lower to ``buffer_store ... sc0 sc1`` with no completion wait, and ``s_barrier`` does
+    not wait for global stores. Without ``s_waitcnt vmcnt(0)`` in every wave before the barrier, the flag that wave 0
+    stores after it can become visible before another wave's partial lines, and the reducing program adds stale data
+    to the tile.
+    """
+    assert _gfx950._iw_choose_streamk_tile(m, n) == tile
+    compiled = _record_streamk_launches(monkeypatch)
+    torch.manual_seed(m + n + k)
+    a = torch.randn((m, k), device="cuda", dtype=torch.float16)
+    b = torch.randn((n, k), device="cuda", dtype=torch.float16).T
+    torch.testing.assert_close(_gfx950._iw_streamk_matmul(a, b), torch.matmul(a, b), atol=2e-2, rtol=2e-2)
+    assert len(compiled) == 1
+    asm = compiled[0].asm["amdgcn"].splitlines()
+    partial_stores = [i for i, line in enumerate(asm) if re.match(r"\s+buffer_store_dwordx4\s.*\bsc0 sc1\b", line)]
+    flag_stores = [i for i, line in enumerate(asm) if re.match(r"\s+global_store_dword\s.*\bsc0 sc1\b", line)]
+    publishes = []
+    for flag in flag_stores:
+        earlier_partial_stores = [i for i in partial_stores if i < flag]
+        if earlier_partial_stores:
+            publishes.append((earlier_partial_stores[-1], flag))
+    assert publishes, "expected write-through partial-tile stores followed by the ready-flag store"
+    for last_partial, flag in publishes:
+        barrier = next((i for i in range(last_partial, flag) if re.match(r"\s+s_barrier\b", asm[i])), None)
+        assert barrier is not None, "expected a barrier between the partial-tile stores and the ready-flag store"
+        assert any(re.match(r"\s+s_waitcnt\s+vmcnt\(0\)", line) for line in asm[last_partial + 1:barrier]), (
+            "the waves do not complete their partial-tile stores before the barrier that precedes the ready flag:\n" +
+            "\n".join(asm[last_partial:flag + 1]))
+
+
+def test_mm_streamk_fixup_never_reads_unpublished_partials(monkeypatch):
+    """A reducing program never reads a partial tile before every wave's stores of it have landed.
+
+    The partial workspace is NaN-filled on every call, so a partial line read too early shows up as NaN in the
+    output. The MT128 owner-fixup build with a cross-XCD handoff mapping and a concurrent copy on a side stream is
+    where the unordered publish was observed, in about 1e-4 to 8e-4 of calls on MI350X.
+    """
+    m, n, k, calls = 1024, 1024, 8192, 50000
+    assert _gfx950._iw_choose_streamk_tile(m, n) == (128, 128)
+    assert _gfx950._iw_streamk_schedule(m, n, k, block_m=128, block_n=128)["HAS_STREAMK"]
+    empty = torch.empty
+    partials_shape = (_gfx950._iw_NUM_CU, 128, 128)
+
+    def poisoned_empty(*size, **kwargs):
+        tensor = empty(*size, **kwargs)
+        if tensor.shape == partials_shape and tensor.dtype == torch.float32:
+            tensor.fill_(float("nan"))
+        return tensor
+
+    monkeypatch.setattr(torch, "empty", poisoned_empty)
+    generator = torch.Generator(device="cuda").manual_seed(2026)
+    inputs = [(torch.randn((m, k), device="cuda", dtype=torch.float16, generator=generator),
+               torch.randn((n, k), device="cuda", dtype=torch.float16, generator=generator).T) for _ in range(4)]
+    copy_src = torch.randn((64 << 20, ), device="cuda", generator=generator)
+    copy_dst = torch.empty_like(copy_src)
+    side_stream = torch.cuda.Stream()
+    bad_calls = torch.zeros((), device="cuda", dtype=torch.int64)
+    for call in range(calls):
+        with torch.cuda.stream(side_stream):
+            copy_dst.copy_(copy_src)
+        a, b = inputs[call % len(inputs)]
+        bad_calls += torch.isnan(_gfx950._iw_streamk_matmul(a, b, _num_xcds=1)).any()
+    torch.cuda.synchronize()
+    assert bad_calls.item() == 0, f"{bad_calls.item()} of {calls} calls read a partial tile before it was published"
+
+
 @pytest.mark.parametrize(
     "m,n,k,expected_path",
     [
@@ -4389,17 +4837,18 @@ def test_mm_cached_b_rejects_i32_offset_overflow():
     assert _gfx950.heuristic_config(m, n, k, torch.bfloat16, 2, (k, 1), b_strides)[0] == "register"
 
 
-@pytest.mark.parametrize("m,n,k,dtype,b_strides,store_cache", [
-    (819200, 1024, 192, torch.bfloat16, (1, 192), ""),
-    (819200, 1024, 192, torch.float16, (1, 192), ""),
-    (2252800, 256, 256, torch.float16, (256, 1), ""),
-    (2252800, 256, 256, torch.float16, (1, 256), ""),
-    (524288, 512, 192, torch.bfloat16, (512, 1), ".cs"),
+@pytest.mark.parametrize("m,n,k,dtype,b_strides,store_cache,cache_a_cg", [
+    (819200, 1024, 192, torch.bfloat16, (1, 192), "", True),
+    (819200, 1024, 192, torch.float16, (1, 192), "", True),
+    (2252800, 256, 256, torch.float16, (256, 1), "", True),
+    (2252800, 256, 256, torch.float16, (1, 256), "", True),
+    (524288, 512, 192, torch.bfloat16, (512, 1), ".cs", False),
 ])
-def test_mm_cached_b_store_cache(m, n, k, dtype, b_strides, store_cache):
+def test_mm_cached_b_store_cache(m, n, k, dtype, b_strides, store_cache, cache_a_cg):
     path, plan = _gfx950._optimized_geometry_config(m, n, k, dtype, 2, (k, 1), b_strides)
     assert path == "cached_b_lds"
     assert plan.get("STORE_CACHE", ".cs") == store_cache
+    assert plan.get("CACHE_A_CG", False) is cache_a_cg
 
 
 @pytest.mark.parametrize("m,n,k", [

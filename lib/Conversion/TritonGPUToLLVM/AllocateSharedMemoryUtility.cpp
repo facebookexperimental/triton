@@ -139,6 +139,7 @@ void attachAllocationSizeAndOffsetAttr(ModuleOp mod,
   mod->setAttr("ttg.shared",
                mlir::IntegerAttr::get(mlir::IntegerType::get(ctx, 32),
                                       allocation.getSharedMemorySize()));
+  triton::attachSharedMemoryBreakdown(mod, allocation);
 }
 
 static bool lacksNpotPow2AllocShape(Type type) {

@@ -13,7 +13,10 @@
 #include "triton/Tools/GenericSwizzling.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
 
 #define DEBUG_TYPE "allocation-shared-memory"
@@ -975,5 +978,174 @@ Allocation::getLiveBuffers() {
   rootOperation->walk(analyzeOperation);
   return liveBuffers;
 }
+
+namespace triton {
+namespace {
+
+std::string diagnosticJsonString(std::string value) {
+  if (!llvm::json::isUTF8(value))
+    value = llvm::json::fixUTF8(value);
+  return value;
+}
+
+llvm::json::Object describeSharedMemoryRange(StringRef kind, size_t offset,
+                                             size_t size, Operation *owner) {
+  std::string location;
+  llvm::raw_string_ostream os(location);
+  owner->getLoc().print(os);
+  return llvm::json::Object{
+      {"kind", kind},
+      {"offset", static_cast<int64_t>(offset)},
+      {"size", static_cast<int64_t>(size)},
+      {"operation", owner->getName().getStringRef()},
+      {"location", diagnosticJsonString(std::move(location))}};
+}
+
+constexpr llvm::StringLiteral kSharedMemoryBreakdownEncoding = "hex-v1:";
+
+void storeSharedMemoryBreakdown(ModuleOp mod, const llvm::json::Value &report,
+                                bool encoded = false) {
+  std::string value = llvm::formatv("{0}", report).str();
+  if (encoded)
+    value = kSharedMemoryBreakdownEncoding.str() + llvm::toHex(value);
+  mod->setAttr(kSharedMemoryBreakdownAttr,
+               StringAttr::get(mod.getContext(), value));
+}
+
+} // namespace
+
+std::optional<std::string> getSharedMemoryBreakdown(ModuleOp mod) {
+  auto attr = mod->getAttrOfType<StringAttr>(kSharedMemoryBreakdownAttr);
+  if (!attr)
+    return std::nullopt;
+  StringRef value = attr.getValue();
+  if (!value.consume_front(kSharedMemoryBreakdownEncoding))
+    return value.str();
+  if (value.size() % 2 != 0 ||
+      !std::all_of(value.begin(), value.end(),
+                   [](char c) { return llvm::isHexDigit(c); }))
+    return std::nullopt;
+  return llvm::fromHex(value);
+}
+
+void encodeSharedMemoryBreakdown(ModuleOp mod) {
+  auto attr = mod->getAttrOfType<StringAttr>(kSharedMemoryBreakdownAttr);
+  if (!attr || attr.getValue().starts_with(kSharedMemoryBreakdownEncoding))
+    return;
+  // Preserve readable allocator snapshots, but transport original identifiers
+  // opaquely once downstream transformations start changing the IR.
+  mod->setAttr(
+      kSharedMemoryBreakdownAttr,
+      StringAttr::get(mod.getContext(), kSharedMemoryBreakdownEncoding.str() +
+                                            llvm::toHex(attr.getValue())));
+}
+
+void attachSharedMemoryBreakdown(ModuleOp mod, ModuleAllocation &allocation) {
+  constexpr size_t maxAllocations = 32;
+  auto roots = allocation.getRoots();
+  llvm::sort(roots, [](auto lhs, auto rhs) {
+    return SymbolTable::getSymbolName(lhs).getValue() <
+           SymbolTable::getSymbolName(rhs).getValue();
+  });
+
+  llvm::json::Array functions;
+  for (auto root : roots) {
+    auto *funcAllocation = allocation.getFuncData(root);
+    struct Record {
+      Allocation::BufferId id;
+      Operation *owner;
+      size_t size;
+      size_t offset;
+    };
+    SmallVector<Record> records;
+    DenseSet<Allocation::BufferId> seen;
+    auto record = [&](Allocation::BufferId id, Operation *owner) {
+      if (id != Allocation::InvalidBufferId && seen.insert(id).second)
+        records.push_back({id, owner, funcAllocation->getAllocatedSize(id),
+                           funcAllocation->getOffset(id)});
+    };
+    root.walk<WalkOrder::PreOrder>([&](Operation *op) {
+      record(funcAllocation->getBufferId(op), op);
+      for (Value result : op->getResults())
+        for (auto id : funcAllocation->getBufferIds(result))
+          record(id, op);
+    });
+    llvm::stable_sort(records, [](const Record &lhs, const Record &rhs) {
+      if (lhs.size != rhs.size)
+        return lhs.size > rhs.size;
+      return lhs.offset < rhs.offset;
+    });
+
+    llvm::json::Array buffers;
+    for (const Record &record : ArrayRef(records).take_front(maxAllocations)) {
+      bool explicitBuffer = funcAllocation->isExplicitBuffer(record.id);
+      StringRef kind = explicitBuffer                               ? "explicit"
+                       : funcAllocation->isVirtualBuffer(record.id) ? "virtual"
+                                                                    : "scratch";
+      auto entry = describeSharedMemoryRange(kind, record.offset, record.size,
+                                             record.owner);
+      entry["barrier_backed"] =
+          explicitBuffer &&
+          hasOpOfAnyTypeInForwardSlice<ttng::InitBarrierOp>(record.owner);
+      buffers.push_back(std::move(entry));
+    }
+    functions.push_back(llvm::json::Object{
+        {"name", diagnosticJsonString(
+                     SymbolTable::getSymbolName(root).getValue().str())},
+        {"reserved_bytes",
+         static_cast<int64_t>(funcAllocation->getSharedMemorySize())},
+        {"allocations", std::move(buffers)},
+        {"omitted_allocations",
+         static_cast<int64_t>(records.size() -
+                              std::min(records.size(), maxAllocations))}});
+  }
+  storeSharedMemoryBreakdown(
+      mod, llvm::json::Object{
+               {"version", 1},
+               {"reserved_bytes",
+                static_cast<int64_t>(allocation.getSharedMemorySize())},
+               {"functions", std::move(functions)},
+               {"reservations", llvm::json::Array{}}});
+}
+
+void appendSharedMemoryReservations(
+    ModuleOp mod, ArrayRef<SharedMemoryReservation> reservations) {
+  if (reservations.empty())
+    return;
+  auto attr = mod->getAttrOfType<StringAttr>(kSharedMemoryBreakdownAttr);
+  if (!attr)
+    return;
+  bool encoded = attr.getValue().starts_with(kSharedMemoryBreakdownEncoding);
+  auto value = getSharedMemoryBreakdown(mod);
+  if (!value) {
+    mod->removeAttr(kSharedMemoryBreakdownAttr);
+    return;
+  }
+  auto report = llvm::json::parse(*value);
+  if (!report) {
+    llvm::consumeError(report.takeError());
+    mod->removeAttr(kSharedMemoryBreakdownAttr);
+    return;
+  }
+  auto *object = report->getAsObject();
+  auto reserved = object ? object->getInteger("reserved_bytes") : std::nullopt;
+  auto *entries = object ? object->getArray("reservations") : nullptr;
+  if (!reserved || *reserved < 0 || !entries ||
+      object->getInteger("version") != 1) {
+    mod->removeAttr(kSharedMemoryBreakdownAttr);
+    return;
+  }
+  for (const auto &reservation : reservations) {
+    entries->push_back(
+        describeSharedMemoryRange(reservation.kind, reservation.offset,
+                                  reservation.size, reservation.owner));
+    *reserved = std::max(
+        *reserved, static_cast<int64_t>(reservation.offset + reservation.size));
+  }
+  (*object)["reserved_bytes"] = *reserved;
+  storeSharedMemoryBreakdown(mod, *report, encoded);
+}
+
+} // namespace triton
 
 } // namespace mlir

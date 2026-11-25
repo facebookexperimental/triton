@@ -35,7 +35,9 @@ cancel runs already queued. B200 is currently paused in the selector itself.
 
 Use **GPU tests** as the aggregate required check: it fails when any job in the
 run failed or was cancelled. Skipped jobs (unselected or turned-off platforms) do
-not fail it. Reusable workflows
+not fail it. On pull requests each test step stops at its first failure, so a red
+PR reports sooner and shows only its first failures; pushes, schedules and manual
+runs run every selected test, which issue filing needs. Reusable workflows
 prefix individual check names, for example `h100 / h100-tlx-test`; branch rules
 that require the old bare job names need to use the new names or the aggregate.
 The nightly publisher accepts both old and new TLX check names during migration.

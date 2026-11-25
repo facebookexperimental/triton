@@ -1,10 +1,12 @@
 import argparse
+from functools import partial
 
 import torch
 import triton
 from triton._internal_testing import is_blackwell, is_hip_cdna4
-from triton.tlx.ops import mm_mxfp6, mm_mxfp8
+from triton.tlx.ops import mm_mxfp6, mm_mxfp
 from triton.tlx.ops.kernels.mm._shapes import FOCUS, SYNTHETIC
+from triton.tlx.ops.kernels.mm_mxfp6.gfx950 import mm_mxfp6 as mm_mxfp6_gfx950
 
 # Benchmarks for the TLX MXFP6 GEMM op (A=E2M3, B=E3M2).
 # On Blackwell (B200/GB200), from the fbsource root:
@@ -13,8 +15,8 @@ from triton.tlx.ops.kernels.mm._shapes import FOCUS, SYNTHETIC
 #       fbsource//third-party/triton/beta/triton:py_tlx_mm_mxfp6_perf -- \
 #       --shapes small --compare-mxfp8
 # On gfx950 (MI350X), the same binary dispatches to the CDNA4 backend;
-# use the imported AMD shape set:
-#   ... :py_tlx_mm_mxfp6_perf -- --shapes external
+# use the upstream README performance shapes:
+#   ... :py_tlx_mm_mxfp6_perf -- --shapes readme --split-k 4
 #
 # Prefix with third_party/tlx/denoise.sh for clock-locked numbers.
 
@@ -96,7 +98,7 @@ def _check_mxfp8_ones(m, n, k, device):
     a_scale = torch.full((m, k // 32), 127, device=device, dtype=torch.uint8).view(torch.float8_e8m0fnu)
     b_scale = torch.full((n, k // 32), 127, device=device, dtype=torch.uint8).view(torch.float8_e8m0fnu)
     out = torch.empty((m, n), device=device, dtype=torch.bfloat16)
-    actual = mm_mxfp8(a, a_scale, b, b_scale, out=out, space="heuristic")
+    actual = mm_mxfp(a, a_scale, b, b_scale, out=out, space="heuristic")
     print(f"mxfp8-ones[{m},{n},{k}]: min={actual.float().min().item()} "
           f"max={actual.float().max().item()} mean={actual.float().mean().item()} (expect {k})")
     torch.testing.assert_close(actual.float(), torch.full((m, n), float(k), device=device), atol=1e-1, rtol=1e-2)
@@ -121,7 +123,7 @@ def _check_probe(m, n, k, device, space, kpos, *, side="both", a_code=8, b_code=
     a_scale = torch.full((m, k // 32), 127, device=device, dtype=torch.uint8).view(torch.float8_e8m0fnu)
     b_scale = torch.full((n, k // 32), 127, device=device, dtype=torch.uint8).view(torch.float8_e8m0fnu)
     out = torch.empty((m, n), device=device, dtype=torch.bfloat16)
-    actual = mm_mxfp6(a, a_scale, b, b_scale, out=out, space=space).float()
+    actual = _mxfp6_op()(a, a_scale, b, b_scale, out=out, space=space).float()
     rest = actual.clone()
     if side == "a":
         # C[0,:] must be 1, everything else 0.
@@ -143,7 +145,15 @@ def _check_probe(m, n, k, device, space, kpos, *, side="both", a_code=8, b_code=
               f"max|rest|={rest.abs().max().item():8.3f} (expect 1.0 / 0.0)")
 
 
-def _check_ones(m, n, k, device, space, *, negate_b=False):
+def _mxfp6_op(split_k=1):
+    if is_hip_cdna4():
+        return partial(mm_mxfp6_gfx950, split_k=split_k)
+    if split_k != 1:
+        raise ValueError("--split-k is only supported on gfx950")
+    return mm_mxfp6
+
+
+def _check_ones(m, n, k, device, space, *, negate_b=False, split_k=1):
     # All-ones data (e2m3 code 8, e3m2 code 12) with unit scales (E8M0 127):
     # every output must equal +/-K exactly.
     b_code = 12 | 32 if negate_b else 12
@@ -153,16 +163,16 @@ def _check_ones(m, n, k, device, space, *, negate_b=False):
     a_scale = torch.full((m, k // 32), 127, device=device, dtype=torch.uint8).view(torch.float8_e8m0fnu)
     b_scale = torch.full((n, k // 32), 127, device=device, dtype=torch.uint8).view(torch.float8_e8m0fnu)
     out = torch.empty((m, n), device=device, dtype=torch.bfloat16)
-    actual = mm_mxfp6(a, a_scale, b, b_scale, out=out, space=space)
+    actual = _mxfp6_op(split_k)(a, a_scale, b, b_scale, out=out, space=space)
     print(f"ones[{m},{n},{k}]neg_b={negate_b}: min={actual.float().min().item()} "
           f"max={actual.float().max().item()} mean={actual.float().mean().item()} (expect {expect})")
     torch.testing.assert_close(actual.float(), torch.full((m, n), float(expect), device=device), atol=1e-1, rtol=1e-2)
 
 
-def _check_correct(m, n, k, device, space, compare_mxfp8=False):
+def _check_correct(m, n, k, device, space, compare_mxfp8=False, split_k=1):
     a, a_scale, b, b_scale, out = _make_inputs(m, n, k, device)
     reference = _dequantize(a, a_scale, ebits=2, bias=1) @ _dequantize(b, b_scale, ebits=3, bias=3).T
-    actual = mm_mxfp6(a, a_scale, b, b_scale, out=out, space=space)
+    actual = _mxfp6_op(split_k)(a, a_scale, b, b_scale, out=out, space=space)
     assert actual.shape == reference.shape, (actual.shape, reference.shape)
     assert actual.dtype == torch.bfloat16, actual.dtype
     err = (actual.float() - reference).abs()
@@ -177,9 +187,9 @@ def _check_correct(m, n, k, device, space, compare_mxfp8=False):
           f"{(actual.float() - reference).abs().max().item():.4f}")
     if compare_mxfp8:
         a, b = _to_mxfp8(a, b)
-        actual = mm_mxfp8(a, a_scale, b, b_scale, out=out, space=space)
+        actual = mm_mxfp(a, a_scale, b, b_scale, out=out, space=space)
         torch.testing.assert_close(actual.float(), reference, atol=1e-1, rtol=1e-2)
-        print(f"OK  mm_mxfp8[{m}, {n}, {k}] space={space}: max err "
+        print(f"OK  mm_mxfp[{m}, {n}, {k}] space={space}: max err "
               f"{(actual.float() - reference).abs().max().item():.4f}")
 
 
@@ -220,9 +230,41 @@ EXTERNAL_M2048 = [
 ]
 SHAPE_SETS["external"] = EXTERNAL_M2048
 
+# Performance-table dimensions from the upstream README:
+# https://github.com/eeezio/mxfp6-gemm/blob/53d78c5d0f78d165bcb9aaf51e8d14b4b5d064cc/README.md
+# README timings use E2M3 x E2M3 inputs and FP16 output.
+SHAPE_SETS["readme"] = [
+    (2048, 4096, 8192),
+    (2048, 8192, 8192),
+    (4096, 4096, 8192),
+    (4096, 8192, 8192),
+    (8192, 8192, 8192),
+    (2048, 1024, 12288),
+    (2048, 1024, 16128),
+    (2048, 1024, 105728),
+    (2048, 512, 6144),
+    (2048, 6144, 16128),
+    (2048, 6144, 512),
+    (2048, 6144, 4096),
+    (2048, 6144, 105728),
+    (1024, 12288, 105728),
+    (4096, 3072, 105728),
+]
+SHAPE_SETS["split_k"] = [
+    (256, 256, 16384),
+    (128, 1024, 64512),
+    (384, 3072, 64512),
+    (2048, 512, 6144),
+    (2048, 1024, 12288),
+    (2048, 1024, 16128),
+    (2048, 1024, 105728),
+]
 
-def create_benchmark(shapes, space, warmup, rep, compare_mxfp8=False):
+
+def create_benchmark(shapes, space, warmup, rep, compare_mxfp8=False, split_k=1):
     providers = ["tlx_mxfp6", "tlx_mxfp8"] if compare_mxfp8 else ["tlx_mxfp6"]
+    if split_k > 1:
+        providers.append(f"tlx_mxfp6_split_k_{split_k}")
 
     @triton.testing.perf_report(
         triton.testing.Benchmark(
@@ -237,11 +279,14 @@ def create_benchmark(shapes, space, warmup, rep, compare_mxfp8=False):
         ))
     def benchmark(M, N, K, provider, space):
         device = triton.runtime.driver.active.get_active_torch_device()
+        provider_split_k = split_k if provider.startswith("tlx_mxfp6_split_k_") else 1
+        if provider_split_k > K // (128 if K % 128 == 0 else 64):
+            return float("nan"), float("nan"), float("nan")
         a, a_scale, b, b_scale, out = _make_inputs(M, N, K, device)
-        op = mm_mxfp6
+        op = _mxfp6_op(provider_split_k)
         if provider == "tlx_mxfp8":
             a, b = _to_mxfp8(a, b)
-            op = mm_mxfp8
+            op = mm_mxfp
         # With space="full" the first call autotunes (slow); do_bench warmup
         # covers it so only the best config is timed.
         fn = lambda: op(a, a_scale, b, b_scale, out=out, space=space)
@@ -260,9 +305,13 @@ if __name__ == "__main__":
     parser.add_argument("--M", type=int, default=None)
     parser.add_argument("--N", type=int, default=None)
     parser.add_argument("--K", type=int, default=None)
-    parser.add_argument("--shapes", type=str, default="small", choices=list(SHAPE_SETS),
-                        help="full includes all supported synthetic and Blackwell GEMM focus shapes")
+    parser.add_argument(
+        "--shapes", type=str, default="small", choices=list(SHAPE_SETS),
+        help="full includes supported synthetic and Blackwell focus shapes; "
+        "readme uses the upstream mxfp6-gemm README performance tables")
     parser.add_argument("--space", type=str, default="full", choices=["full", "heuristic"])
+    parser.add_argument("--split-k", type=int, default=1, choices=[1, 2, 4, 8, 16],
+                        help="compare an opt-in gfx950 native split-K candidate; --check/--ones check that candidate")
     parser.add_argument("--warmup", type=int, default=25)
     parser.add_argument("--rep", type=int, default=100)
     parser.add_argument("--compare-mxfp8", action="store_true",
@@ -273,7 +322,7 @@ if __name__ == "__main__":
     parser.add_argument("--negate-b", action="store_true",
                         help="with --ones, fill B with -1 (every output must equal -K)")
     parser.add_argument("--mxfp8-sanity", action="store_true",
-                        help="run the known-good mm_mxfp8 ones check instead (harness validation)")
+                        help="run the known-good mm_mxfp ones check instead (harness validation)")
     parser.add_argument("--probe", action="store_true", help="sweep single-element probes across K to map coverage")
     parser.add_argument("--probe-side", type=str, default="both", choices=["both", "a", "b"],
                         help="probe one side at a time (other side all ones)")
@@ -287,8 +336,12 @@ if __name__ == "__main__":
         print("Skipping benchmarks, no Blackwell or gfx950 GPU found.")
         raise SystemExit(0)
     if on_gfx950 and args.compare_mxfp8:
-        print("Skipping --compare-mxfp8 on gfx950: mm_mxfp8 has no gfx950 backend.")
+        print("Skipping --compare-mxfp8 on gfx950: mm_mxfp has no gfx950 backend.")
         raise SystemExit(0)
+    if args.split_k != 1 and not on_gfx950:
+        parser.error("--split-k is only supported on gfx950")
+    if args.split_k != 1 and (args.probe or args.mxfp8_sanity):
+        parser.error("--split-k correctness checks use --check or --ones")
 
     if args.M is not None and args.N is not None and args.K is not None:
         shapes = [(args.M, args.N, args.K)]
@@ -316,10 +369,10 @@ if __name__ == "__main__":
                     if kpos < k:
                         _check_probe(m, n, k, device, args.space, kpos, side=args.probe_side)
             elif args.ones:
-                _check_ones(m, n, k, device, args.space, negate_b=args.negate_b)
+                _check_ones(m, n, k, device, args.space, negate_b=args.negate_b, split_k=args.split_k)
             else:
-                _check_correct(m, n, k, device, args.space, args.compare_mxfp8)
+                _check_correct(m, n, k, device, args.space, args.compare_mxfp8, args.split_k)
         raise SystemExit(0)
 
-    benchmark = create_benchmark(shapes, args.space, args.warmup, args.rep, args.compare_mxfp8)
+    benchmark = create_benchmark(shapes, args.space, args.warmup, args.rep, args.compare_mxfp8, args.split_k)
     benchmark.run(print_data=True)

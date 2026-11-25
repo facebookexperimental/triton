@@ -86,6 +86,14 @@ def report_lines(log_text: str, limit: int = MAX_REPORT_LINES) -> list[str]:
     return [match.group(1) for match in _REPORT_LINE_RE.finditer(log_text)][:limit]
 
 
+def _access_location(access) -> str:
+    """``file:line``, or the SASS site ``function+offset`` when racecheck printed
+    no source location (CUDA 13, for kernels built without line info)."""
+    if access.file is not None and access.line is not None:
+        return f"{access.file}:{access.line}"
+    return f"{access.function}+{access.offset}"
+
+
 def racecheck_findings(log_text: str, kernel: str | None) -> list[dict]:
     """Racecheck hazards from CUTracer's parser, flagged when in ``kernel``."""
     from cutracer.compute_sanitizer.parser import parse_racecheck_log
@@ -96,7 +104,7 @@ def racecheck_findings(log_text: str, kernel: str | None) -> list[dict]:
             "role": access.role,
             "type": access.access_type,
             "function": access.function,
-            "location": f"{access.file}:{access.line}",
+            "location": _access_location(access),
         } for access in finding.accesses]
         findings.append({
             "severity": finding.severity.value,

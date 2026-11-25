@@ -7,6 +7,9 @@
 #include "CallGraph.h"
 #include "Function.h"
 
+#include "mlir/Analysis/CFGLoopInfo.h"
+#include "mlir/IR/Dominance.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cstdint>
@@ -212,8 +215,12 @@ struct BlockInfo {
 
   // Thread ordering is independent of which physical addresses are accessed.
   struct ThreadSyncState {
+    // Issuers of pending effects that carry a payload.
     IssuerSummary effectIssuers;
     CompletionSync completion = CompletionSync::None;
+    // Issuers of pending waits, proxy fences and mbarrier arrivals. They carry
+    // no payload, so a later publication only needs them finished.
+    IssuerSummary syncIssuers;
     bool peerWaitNeedsSync = false;
 
     bool operator==(const ThreadSyncState &) const = default;
@@ -225,6 +232,9 @@ struct BlockInfo {
     // Only publication demands contribute to this issuer summary.
     IssuerSummary publicationIssuers;
     bool mayNotifyPeer = false;
+    // Some demand can take effect before every thread of its region reaches
+    // it.
+    bool mayIssueAhead = false;
 
     bool operator==(const ThreadDemandState &) const = default;
   } threadDemands;
@@ -232,7 +242,8 @@ struct BlockInfo {
   BlockInfo() = default;
 
   bool hasEffects() const {
-    return !threadSync.effectIssuers.empty() || !syncReadSlices.empty() ||
+    return !threadSync.effectIssuers.empty() ||
+           !threadSync.syncIssuers.empty() || !syncReadSlices.empty() ||
            !syncWriteSlices.empty();
   }
 
@@ -450,6 +461,44 @@ protected:
                               Block *to) const;
 };
 
+/// Branches that can send some threads of an execution region one way and
+/// the rest the other, so that a barrier under them deadlocks. A condition can
+/// differ between the threads only if it depends on a thread, lane or warp ID,
+/// on a warp vote or ballot, on inline assembly, on a call or on an argument of
+/// a device function. Every thread of a region is assumed to run a loop equally
+/// often, so a branch that can leave a loop never splits it. A branch whose
+/// paths all stay in the loop can, even when one of them returns straight to
+/// the header.
+class DivergentControlFlow {
+public:
+  explicit DivergentControlFlow(Operation *function)
+      : function(function), dominance(function), postDominance(function) {}
+
+  /// Whether `op` is an scf.if, scf.index_switch, cf.cond_br or cf.switch that
+  /// is not a loop branch and whose condition can differ between threads.
+  bool isDivergentBranch(Operation *op);
+
+  /// Visits each operation that the divergent branch `op` may skip.
+  void walkSkippable(Operation *op, function_ref<void(Operation *)> visit);
+
+  /// Whether a divergent branch of its execution region may skip `op`.
+  bool isUnderDivergentBranch(Operation *op);
+
+private:
+  bool isLoopBranch(Operation *branch);
+  ArrayRef<Block *> getSkippableBlocks(Operation *branch);
+  bool mayDiverge(Value value);
+  void findDivergentValues();
+
+  Operation *function;
+  DominanceInfo dominance;
+  PostDominanceInfo postDominance;
+  DenseMap<Region *, std::unique_ptr<CFGLoopInfo>> loops;
+  DenseMap<Operation *, SmallVector<Block *>> skippableBlocks;
+  std::optional<DenseSet<Value>> divergentValues;
+  std::optional<DenseSet<Block *>> divergentBlocks;
+};
+
 // Common class to analyze fence placement with BlockInfo state.
 class MembarOrFenceAnalysis
     : public triton::PostOrderFunctionAnalysis<BlockInfo>,
@@ -495,6 +544,7 @@ public:
                  MembarSliceFilterFn sliceFilter = nullptr,
                  AccessMode accessMode = AccessMode::AllSharedAccesses)
       : allocation(allocation), filter(std::move(filter)), regions(regions),
+        divergence(allocation.getOperation()),
         scratchSync(std::move(scratchSync)),
         sliceFilter(std::move(sliceFilter)), accessMode(accessMode),
         bufferIndexAnalysis(
@@ -540,8 +590,13 @@ protected:
   Allocation &allocation;
   MembarFilterFn filter;
   triton::BufferRegionAnalysis &regions;
+  DivergentControlFlow divergence;
 
 private:
+  /// Whether pending thread effects must rendezvous before a divergent branch
+  /// because an operation it may skip needs them finished.
+  bool requiresSyncBeforeBranch(Operation *branch, const BlockInfo &pending);
+
   MembarScratchSync scratchSync;
   // Materialize only the final decisions, after CFG analysis has converged.
   llvm::SmallPtrSet<Operation *, 16> scratchSyncOps;
@@ -550,13 +605,22 @@ private:
                       std::optional<triton::gpu::SharedKind> sharedKind = {});
   bool isRegionLocal(Value value);
   bool mayNotifyPeer(Operation *op);
+  bool waitsForWholeRegion(Operation *op);
   BlockInfo getThreadEffects(Operation *op);
   void addThreadDemand(BlockInfo &effects, Operation *op);
+  /// The thread effects and demands that `op` adds at its program point.
+  BlockInfo getOperationEffects(Operation *op);
 
   MembarSliceFilterFn sliceFilter;
   AccessMode accessMode;
   BufferIndexAnalysis bufferIndexAnalysis;
   DenseMap<Value, bool> regionLocalAllocations;
+  /// What an operation that a divergent branch may skip needs synchronized.
+  struct GuardedDemand {
+    BlockInfo::ThreadDemandState threadDemands;
+    bool missesBarrierLifetime;
+  };
+  DenseMap<Operation *, SmallVector<GuardedDemand>> branchDemands;
 };
 
 /// Inserts shared-memory and operation rendezvous barriers across a module,
@@ -585,6 +649,7 @@ public:
 
   template <typename AnalysisT>
   void runAnalysis(triton::BufferRegionAnalysis &regions) {
+    triton::encodeSharedMemoryBreakdown(moduleAllocation.getModuleOp());
     AnalysisT::runModule(
         moduleAllocation.getModuleOp(), [&](FunctionOpInterface function) {
           auto &allocation = *moduleAllocation.getFuncData(function);

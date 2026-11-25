@@ -1969,6 +1969,8 @@ public:
   LogicalResult
   matchAndRewrite(triton::FpToFpOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    if (op.getRounding() == triton::RoundingMode::RS)
+      return op.emitOpError("stochastic rounding is not supported on TileIR");
     auto converter = this->getTypeConverter();
     SmallVector<Type> retTypes;
     if (failed(converter->convertTypes(op->getResultTypes(), retTypes)))

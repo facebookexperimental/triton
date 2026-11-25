@@ -15,10 +15,12 @@ from triton.language.extra.tlx.inductor.gfx950_addmm_warppipe_core import (
     stride_ak = {{stride("A", 1)}}
     stride_bk = {{stride("B", 0)}}
     stride_bn = {{stride("B", 1)}}
-    tl.assume(stride_am > 0)
-    tl.assume(stride_ak > 0)
-    tl.assume(stride_bk > 0)
-    tl.assume(stride_bn > 0)
+    # >= 0, not > 0: a size-1 or broadcast dim gets a literal 0 stride, and a false assume
+    # makes the whole kernel unreachable (it compiles to a lone s_trap).
+    tl.assume(stride_am >= 0)
+    tl.assume(stride_ak >= 0)
+    tl.assume(stride_bk >= 0)
+    tl.assume(stride_bn >= 0)
 
     grid_m = (M + BLOCK_M - 1) // BLOCK_M
     grid_n = (N + BLOCK_N - 1) // BLOCK_N

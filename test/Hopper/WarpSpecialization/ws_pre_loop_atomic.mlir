@@ -53,4 +53,56 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     } attributes {tt.warp_specialize}
     tt.return
   }
+
+// The second atomic follows a load that moves into the partitions, so WS is
+// rejected. The first atomic, which was accepted, must not be left with cloned
+// operand defs.
+// CHECK-LABEL: @pre_loop_atomic_reject
+// CHECK-NOT: ttg.warp_specialize
+// CHECK: tt.get_program_id
+// CHECK-NOT: tt.get_program_id
+// CHECK: tt.addptr
+// CHECK-NEXT: tt.atomic_rmw
+// CHECK-NOT: ttg.warp_specialize
+// CHECK: tt.return
+
+  tt.func public @pre_loop_atomic_reject(
+      %a_desc: !tt.tensordesc<128x64xf16, #shared>,
+      %b_desc: !tt.tensordesc<64x256xf16, #shared>,
+      %out: !tt.ptr<f32>, %flag: !tt.ptr<i32>, %k_tiles: i32, %num_tiles: i32) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %cm1 = arith.constant -1 : i32
+    %c148 = arith.constant 148 : i32
+    %true = arith.constant true
+    %acc_init = arith.constant dense<0.000000e+00> : tensor<128x256xf32, #mma>
+    %pid = tt.get_program_id x : i32
+    %slot = tt.addptr %flag, %pid : !tt.ptr<i32>, i32
+    %tok = tt.atomic_rmw add, acq_rel, gpu, %slot, %c1, %true : (!tt.ptr<i32>, i32, i1) -> i32
+    %off = tt.load %flag : !tt.ptr<i32>
+    %slot2 = tt.addptr %flag, %off : !tt.ptr<i32>, i32
+    %tok2 = tt.atomic_rmw add, acq_rel, gpu, %slot2, %c1, %true : (!tt.ptr<i32>, i32, i1) -> i32
+    %sum = arith.addi %tok, %tok2 : i32
+    %start = arith.addi %pid, %sum : i32
+    %result = scf.while (%tile = %start) : (i32) -> i32 {
+      %valid = arith.cmpi slt, %tile, %num_tiles : i32
+      scf.condition(%valid) %tile : i32
+    } do {
+    ^bb0(%tile: i32):
+      %inner = scf.for %ki = %c0 to %k_tiles step %c1 iter_args(%acc = %acc_init) -> (tensor<128x256xf32, #mma>) : i32 {
+        %a = tt.descriptor_load %a_desc[%tile, %ki] {loop.cluster = 0 : i32, loop.stage = 0 : i32} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
+        %a_alloc = ttg.local_alloc %a {loop.cluster = 0 : i32, loop.stage = 0 : i32} : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem>
+        %b = tt.descriptor_load %b_desc[%ki, %tile] {loop.cluster = 0 : i32, loop.stage = 0 : i32} : !tt.tensordesc<64x256xf16, #shared> -> tensor<64x256xf16, #blocked1>
+        %b_alloc = ttg.local_alloc %b {loop.cluster = 0 : i32, loop.stage = 0 : i32} : (tensor<64x256xf16, #blocked1>) -> !ttg.memdesc<64x256xf16, #shared, #smem>
+        %dot = ttng.warp_group_dot %a_alloc, %b_alloc, %acc {inputPrecision = 0 : i32, loop.cluster = 1 : i32, loop.stage = 2 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem> * !ttg.memdesc<64x256xf16, #shared, #smem> -> tensor<128x256xf32, #mma>
+        scf.yield %dot : tensor<128x256xf32, #mma>
+      } {tt.scheduled_max_stage = 2 : i32}
+      %ptrs = tt.splat %out : !tt.ptr<f32> -> tensor<128x256x!tt.ptr<f32>, #blocked1>
+      %cvt = ttg.convert_layout %inner : tensor<128x256xf32, #mma> -> tensor<128x256xf32, #blocked1>
+      tt.store %ptrs, %cvt : tensor<128x256x!tt.ptr<f32>, #blocked1>
+      %next = arith.addi %tile, %c148 : i32
+      scf.yield %next : i32
+    } attributes {tt.warp_specialize}
+    tt.return
+  }
 }
