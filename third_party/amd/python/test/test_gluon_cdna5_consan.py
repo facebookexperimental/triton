@@ -4,9 +4,9 @@ import subprocess
 import sys
 import os
 
-from triton._internal_testing import is_hip_gfx1250
+from triton._internal_testing import is_hip_cdna5
 
-pytestmark = pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires CDNA5")
+pytestmark = pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 
 
 def _run_consan_subprocess(test_name, *args, timeout=120):
@@ -247,7 +247,7 @@ def test_ws_two_loads_one_bar(FAILURE):
             f"Unexpected ConSan violation in stderr:\n{stderr_str}"
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires CDNA5")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("MISSING_BAR", ["none", "0", "1", "2", "3"])
 def test_ws_two_loads_two_bars_loop(MISSING_BAR):
     """
@@ -375,6 +375,23 @@ def test_consan_async_copy(FAILURE):
     else:
         assert "device assertion failed" not in stderr_str, \
             f"Unexpected ConSan violation in stderr:\n{stderr_str}"
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
+@pytest.mark.parametrize(
+    ("mode", "message"),
+    [
+        ("empty_groups", None),
+        ("large_count", "Accessing buffer with pending access. Pending access type: async_copy_global_to_shared"),
+        ("negative_count", "Buffer being accessed has outstanding writes"),
+    ],
+)
+def test_async_wait_count_bounds(mode, message):
+    stderr = _run_consan_subprocess("async_wait_count_bounds", mode)
+    if message is None:
+        assert not stderr, stderr
+    else:
+        assert message in stderr, stderr
 
 
 @pytest.mark.parametrize("FAILURE", [True, False])

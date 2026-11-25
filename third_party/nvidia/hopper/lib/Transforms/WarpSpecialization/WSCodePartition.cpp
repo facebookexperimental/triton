@@ -592,6 +592,26 @@ void reorderEpilogOps(const SmallVector<Channel *> &channels,
       return false;
     };
 
+    // A TMA staging write has no memdesc operand, so hoistsAcrossMemoryOp
+    // misses it. The staging allocs later share a ring of K copies, so a write
+    // hoisted above an earlier TMA op can overwrite a slot that op still reads.
+    auto isTMAStoreLike = [](Operation *op) {
+      return isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(op);
+    };
+    auto hoistsStagingWriteAcrossTMAOp = [&](Operation *op,
+                                             Operation *insertAfter) {
+      auto alloc = dyn_cast<ttg::LocalAllocOp>(op);
+      if (!alloc || !alloc.getSrc() || !insertAfter->isBeforeInBlock(op))
+        return false;
+      if (llvm::none_of(op->getUsers(), isTMAStoreLike))
+        return false;
+      for (Operation *cur = insertAfter->getNextNode(); cur && cur != op;
+           cur = cur->getNextNode())
+        if (isTMAStoreLike(cur))
+          return true;
+      return false;
+    };
+
     // Streamline ops on a channel chain.
     // Starting with producers with smaller task ids, moving forward
     // dependencies of the consumer ops close to the them.
@@ -604,7 +624,8 @@ void reorderEpilogOps(const SmallVector<Channel *> &channels,
             continue;
           // push depOp to be right after its operands
           auto lastOpndOp = lastInBlockOperand(depOp);
-          if (lastOpndOp && !hoistsAcrossMemoryOp(depOp, lastOpndOp))
+          if (lastOpndOp && !hoistsAcrossMemoryOp(depOp, lastOpndOp) &&
+              !hoistsStagingWriteAcrossTMAOp(depOp, lastOpndOp))
             depOp->moveAfter(lastOpndOp);
         }
       }
@@ -5289,12 +5310,19 @@ static void separateLocalAllocWithSrc(triton::FuncOp &funcOp) {
 //   %a = local_alloc %val -> memdesc<#shared_nontransposed>
 //   %b = memdesc_trans %a  -> memdesc<#shared_transposed>
 //   mmav5 %b, ...          (operand A)
+//
+// FP32 operands are left alone: a transposed TF32 operand would need 128B
+// swizzle with 32B atomicity, which is not supported (see
+// AccelerateMatmul.cpp), so AccelerateMatmul picks the transposed alloc
+// precisely so that the MMA reads a non-transposed operand.
 static void swapTransposedLocalAllocs(triton::FuncOp &funcOp) {
   SmallVector<ttg::LocalAllocOp> toSwap;
   funcOp.walk([&](ttg::LocalAllocOp allocOp) {
     if (!allocOp.getSrc())
       return;
     auto memDescType = cast<ttg::MemDescType>(allocOp.getType());
+    if (memDescType.getElementType().isF32())
+      return;
     auto encoding =
         dyn_cast<ttg::NVMMASharedEncodingAttr>(memDescType.getEncoding());
     if (!encoding || !encoding.getTransposed())

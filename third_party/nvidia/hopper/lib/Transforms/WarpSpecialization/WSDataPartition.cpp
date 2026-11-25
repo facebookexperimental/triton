@@ -1792,32 +1792,51 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
   } else if (isa<DescriptorLoadOp, DescriptorStoreOp>(op)) {
     SmallVector<int64_t> shape;
     Value coordVal;
+    unsigned coordOperandIdx;
     if (auto loadOp = dyn_cast<DescriptorLoadOp>(op)) {
       sliceOp(loadOp.getDesc(), offset, mappings, reverseMappings,
               partitionScheme);
-      coordVal = loadOp.getIndices()[dim];
+      // dim indexes the load result; a rank-reducing descriptor drops unit
+      // block dims, so map it back to the descriptor's coordinate dim.
+      auto descShape = getShape(loadOp.getDesc());
       shape = getShape(loadOp.getResult());
+      unsigned coordDim =
+          remappedSqueezedDim(descShape, shape, dim, /*unsqueeze=*/true);
+      coordVal = loadOp.getIndices()[coordDim];
+      coordOperandIdx = loadOp.getIndicesMutable()[coordDim].getOperandNumber();
     } else if (auto storeOp = dyn_cast<DescriptorStoreOp>(op)) {
       sliceOp(storeOp.getDesc(), offset, mappings, reverseMappings,
               partitionScheme);
+      // Unlike loads, stores need no rank remapping: nothing produces a
+      // rank-reducing descriptor_store. The frontend requires the stored value
+      // to have the descriptor block shape, and only loads get the unit dims
+      // folded away (RankedReduceDescriptorLoads in Combine.cpp), so dim is
+      // also the descriptor coordinate dim here.
+      assert(getShape(storeOp.getDesc()).size() ==
+                 getShape(storeOp.getSrc()).size() &&
+             "rank-reducing descriptor_store is not supported");
       coordVal = storeOp.getIndices()[dim];
+      coordOperandIdx = storeOp.getIndicesMutable()[dim].getOperandNumber();
       shape = getShape(storeOp.getSrc());
-    }
-    auto newCoordVal = coordVal;
-    if (offset) {
-      if (auto *defOp = coordVal.getDefiningOp())
-        builder.setInsertionPointAfter(defOp);
-      else
-        builder.setInsertionPoint(op);
-      Value offsetVal = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-          op->getLoc(), offset * shape[dim] / numOfPartitions, 32);
-      newCoordVal = builder.createWithAsyncTaskIds<arith::AddIOp>(
-          op->getLoc(), coordVal, offsetVal);
-      mappings.map(coordVal, newCoordVal);
-      reverseMappings.map(newCoordVal, coordVal);
     }
 
     newOp = cloneAndSetResultType(op);
+    if (offset) {
+      // Shift only this op's operand: mapping coordVal would leak the offset
+      // into later clones that use the same scalar and into a shared index.
+      // Start from the clone's operand, i.e. this partition's copy of the
+      // coordinate when the scalar itself was sliced, not the original op.
+      Value baseCoordVal = newOp->getOperand(coordOperandIdx);
+      if (auto *defOp = baseCoordVal.getDefiningOp())
+        builder.setInsertionPointAfter(defOp);
+      else
+        builder.setInsertionPoint(newOp);
+      Value offsetVal = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+          op->getLoc(), offset * shape[dim] / numOfPartitions, 32);
+      Value newCoordVal = builder.createWithAsyncTaskIds<arith::AddIOp>(
+          op->getLoc(), baseCoordVal, offsetVal);
+      newOp->setOperand(coordOperandIdx, newCoordVal);
+    }
     if (isa<DescriptorLoadOp>(op)) {
       // map load result
       auto v = op->getResult(0);

@@ -79,6 +79,7 @@ jobs:
         id: select
         env:
           GH_TOKEN: ${{ github.token }}
+          GPU_CI_SKIP_PLATFORMS: ${{ vars.GPU_CI_SKIP_PLATFORMS }}
         run: python3 .github/scripts/gpu_test_selection.py
 
   build:

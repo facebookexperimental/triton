@@ -1,7 +1,8 @@
 import pytest
 
 import sanitizer_log
-from sample_logs import MEMCHECK_API_ONLY, MEMCHECK_MIXED, RACECHECK_CLEAN, RACECHECK_HAZARD, SYNCCHECK_CLEAN, SYNCCHECK_ERROR
+from sample_logs import (MEMCHECK_API_ONLY, MEMCHECK_MIXED, RACECHECK_CLEAN, RACECHECK_HAZARD,
+                         RACECHECK_HAZARD_NO_LINE_INFO, SYNCCHECK_CLEAN, SYNCCHECK_ERROR)
 from sanitizer_log import classify, device_reports, report_lines
 
 
@@ -97,3 +98,11 @@ def test_racecheck_findings_attribute_kernel():
     findings = sanitizer_log.racecheck_findings(RACECHECK_HAZARD, "kernel_a")
     assert [finding["in_kernel"] for finding in findings] == [True, False]
     assert findings[0]["accesses"][0]["location"] == "kernels.py:42"
+
+
+def test_racecheck_findings_without_line_info_report_the_sass_site():
+    parser = pytest.importorskip("cutracer.compute_sanitizer.parser")
+    if not hasattr(parser.RacecheckAccess, "site"):
+        pytest.skip("this cutracer does not parse race sites without file:line")
+    findings = sanitizer_log.racecheck_findings(RACECHECK_HAZARD_NO_LINE_INFO, "kernel_a")
+    assert [access["location"] for access in findings[0]["accesses"]] == ["kernel_a+0x5960", "kernel_a+0x2340"]

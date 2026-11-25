@@ -215,7 +215,8 @@ def _validate_geo(c, q, inputs):
 
 @pytest.mark.parametrize("norm", ["layer", "rms"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("m,n", [(0, 384), (1, 1), (33, 127), (128, 384), (4096, 384), (3, 32768), (2, 65536)])
+@pytest.mark.parametrize("m,n", [(0, 384), (1, 1), (33, 127), (128, 384), (4096, 384), (16384, 384), (32768, 256),
+                                 (3, 32768), (2, 65536)])
 def test_plain(norm, dtype, m, n):
     torch.manual_seed(7)
     x = torch.randn((m, n + 8), device="cuda", dtype=dtype)[:, :n]

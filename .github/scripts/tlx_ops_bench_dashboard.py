@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Publish and render the tlx.ops nightly perf dashboard.
 
-  summarize DIR --platform P --version V --sha S --out FILE
+  summarize DIR --platform P --version V --sha S --out FILE [--ci C --ci-run URL]
       Condense one platform's python/test/tlx_benchmark artifacts into the
       public summary uploaded to the 'tlx-ops-bench' release. Raw artifacts
       carry the runner's hostname, GPU UUID and process list, so only
       benchmark fields are copied.
   prune KEEP
       Keep the last KEEP nights of summaries on that release.
+  report SUMMARY [--regressions FILE]
+      Markdown for the run summary: the commit's TLX test status, cases below
+      the perf floor or in error, and the night's regressions.
   render OUTDIR [--from DIR]
       Write OUTDIR/index.html from every summary on the release (or in DIR,
       for a local preview), for pages.yml to mount at /bench/. The page is
@@ -27,6 +30,7 @@ import subprocess
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
+from urllib.parse import urlencode
 
 REPO = os.environ.get("GITHUB_REPOSITORY", "facebookexperimental/triton")
 TAG = "tlx-ops-bench"
@@ -46,7 +50,9 @@ BENCH_SCRIPT = {
     "bench_kda_decode.py"
 }
 #: Per-platform fields the page shows in its version panel, taken from the latest night.
-PLATFORM_FIELDS = ("gpu", "driver", "torch", "runtime", "triton", "governed", "timing", "version", "sha")
+PLATFORM_FIELDS = ("gpu", "driver", "torch", "runtime", "triton", "governed", "timing", "version", "sha", "ci")
+#: The LLVM builds the wheel pins, as cmake/<name>-info.json.
+LLVM_PINS = ("llvm", "amd-llvm", "meta-llvm", "meta-amd-llvm")
 #: A case's night-over-night TLX TFLOP/s change that makes a perf event, if the night after still holds it.
 EVENT_THRESHOLD = 0.10
 #: Changed cases listed per op and direction in one event; the rest are counted.
@@ -109,6 +115,8 @@ def summarize(args):
             "tlx_tflops": (r.get("tlx") or {}).get("mean"),
             "tlx_p50": (r.get("tlx") or {}).get("p50"),
             "ref_tflops": (r.get("ref") or {}).get("mean"),
+            "best_config": r.get("best_config"),
+            "autotune": r.get("autotune", []),
             "notes": r.get("notes", []),
         } for r in artifact["results"]]
         op = artifact["results"][0]["case"]["op"]
@@ -142,6 +150,7 @@ def summarize(args):
         "governed": (env.get("governed") or {}).get("applied", []),
         "timing": {k: env.get(k)
                    for k in ("latency_mode", "replicates")},
+        "ci": {"tlx_test": args.ci, "run": args.ci_run} if args.ci else None,
         "ops": ops,
     }
     with open(args.out, "w") as fh:
@@ -283,6 +292,22 @@ def env_changes(a, b):
     return changes
 
 
+def llvm_pin(sha, name):
+    try:
+        out = subprocess.run(["git", "show", f"{sha}:cmake/{name}-info.json"], capture_output=True, text=True,
+                             check=True, cwd=REPO_ROOT).stdout
+        info = json.loads(out)
+    except (subprocess.CalledProcessError, OSError, json.JSONDecodeError):
+        return None
+    return f"{info['llvm_hash'][:8]}-{info['build_number']}"
+
+
+def llvm_changes(a, b):
+    """LLVM pins (cmake/*llvm-info.json) that differ between two nights' commits, as {field, from, to}."""
+    pins = ((name, llvm_pin(a["sha"], name), llvm_pin(b["sha"], name)) for name in LLVM_PINS)
+    return [{"field": f"{name} pin", "from": x or "none", "to": y or "none"} for name, x, y in pins if x != y]
+
+
 def latency_us(case):
     """One call's time from its throughput, where the op's FLOPs are known from its inputs.
 
@@ -330,7 +355,8 @@ def events(nights):
         before = nights[i - 1]
         found = commits(before["sha"], night["sha"])
         entry.update(prev=before["date"], range=f"{before['sha'][:9]}..{night['sha'][:9]}",
-                     commits=None if found is None else len(found), env=env_changes(before, night),
+                     commits=None if found is None else len(found),
+                     env=env_changes(before, night) + llvm_changes(before, night),
                      compare=f"https://github.com/{REPO}/compare/{before['sha'][:12]}...{night['sha'][:12]}")
         for op in sorted(cases[i - 1].keys() | cases[i].keys()):
             a, b = cases[i - 1].get(op, {}), cases[i].get(op, {})
@@ -381,6 +407,136 @@ def events(nights):
     return out
 
 
+EPISODE_RECOVERY = 0.05
+
+
+def case_episodes(series, contexts):
+    records, healthy = [], []
+    active = pending = lifted = recovery = context = None
+
+    def clean_value(case):
+        value = case.get("tlx_tflops") if case else None
+        return value if case and case["status"] in ("ok", "pip") and isinstance(
+            value, (int, float)) and math.isfinite(value) and value > 0 else None
+
+    def update(row, i, value):
+        row.update(last=i, value=value, worst=min(row["worst"], value / row["baseline"]),
+                   peak=max(row["peak"], value / row["baseline"]))
+
+    def begin(kind, i, baseline, base, value, confirmed=None):
+        ratio = value / baseline
+        return {
+            "kind": kind, "start": i, "base": base, "baseline": baseline, "confirmed": confirmed, "recovered": None,
+            "last": i, "value": value, "worst": ratio, "peak": ratio, "end": None, "context_changed": False
+        }
+
+    def close_lift(i):
+        if lifted is not None:
+            samples = [(j, clean_value(c))
+                       for j, c in enumerate(series[lifted["start"]:i + 1], lifted["start"])
+                       if clean_value(c) is not None]
+            lifted.update(end=i, last=samples[-1][0], value=samples[-1][1],
+                          worst=min(v for _, v in samples) / lifted["baseline"],
+                          peak=max(v for _, v in samples) / lifted["baseline"])
+
+    for i, case in enumerate(series):
+        if context is not None and contexts[i] != context:
+            if active is not None:
+                active["context_changed"] = True
+            if lifted is not None:
+                close_lift(i - 1)
+                lifted["context_changed"] = True
+            active = pending = lifted = recovery = None
+            healthy = []
+        context = contexts[i]
+        value = clean_value(case)
+        if value is None:
+            pending = recovery = None
+            continue
+        if active is not None:
+            update(active, i, value)
+            ratio = value / active["baseline"]
+            if ratio >= 1 - EPISODE_RECOVERY:
+                if recovery is not None and recovery[0] == i - 1:
+                    first, first_value = recovery
+                    active.update(recovered=first, end=first)
+                    if min(value, first_value) / active["baseline"] >= 1 + EVENT_THRESHOLD:
+                        lifted = begin("lift", first, active["baseline"], active["base"], first_value, i)
+                        update(lifted, i, value)
+                        records.append(lifted)
+                        healthy = [(first, first_value), (i, value)]
+                    else:
+                        healthy = [(active["base"], active["baseline"])] * 3
+                        if value / active["baseline"] >= 1 + EVENT_THRESHOLD:
+                            pending = ("lift", i, active["baseline"], active["base"], value)
+                    active = recovery = None
+                else:
+                    recovery = (i, value)
+            else:
+                recovery = None
+            continue
+        if not healthy:
+            healthy.append((i, value))
+            continue
+        if lifted is not None:
+            update(lifted, i, value)
+        baseline = statistics.median(v for _, v in healthy)
+        if pending is not None:
+            kind, start, old_base, base_index, first_value = pending
+            ratio = value / old_base
+            held = ratio <= 1 - EVENT_THRESHOLD if kind == "regression" else ratio >= 1 + EVENT_THRESHOLD
+            if held:
+                close_lift(start - 1)
+                row = begin(kind, start, old_base, base_index, first_value, i)
+                update(row, i, value)
+                records.append(row)
+                lifted = None
+                if kind == "regression":
+                    active = row
+                else:
+                    lifted = row
+                    healthy = [(start, first_value), (i, value)]
+                pending = None
+                continue
+            pending = None
+        ratio = value / baseline
+        kind = "regression" if ratio <= 1 - EVENT_THRESHOLD else "lift" if ratio >= 1 + EVENT_THRESHOLD else None
+        if kind:
+            pending = (kind, i, baseline, healthy[-1][0], value)
+        else:
+            if len(healthy) < 3:
+                healthy.append((i, value))
+    if pending is not None:
+        kind, start, baseline, base, value = pending
+        records.append(begin(kind, start, baseline, base, value))
+    return records
+
+
+def episodes(nights, catalog):
+    contexts = [
+        json.dumps({k: n.get(k)
+                    for k in ("gpu", "driver", "torch", "runtime", "governed", "timing")}, sort_keys=True)
+        for n in nights
+    ]
+    streams = {}
+    for i, night in enumerate(nights):
+        for op, data in night["ops"].items():
+            for case in data["cases"]:
+                key = (op, case["key"])
+                if key not in streams:
+                    streams[key] = [None] * len(nights)
+                streams[key][i] = case
+    groups = {}
+    for (op, key), series in streams.items():
+        direction = next(c.get("direction", "") for c in series if c is not None)
+        for row in case_episodes(series, contexts):
+            kind, start = row.pop("kind"), row.pop("start")
+            group = groups.setdefault((op, direction, kind, start),
+                                      {"op": op, "direction": direction, "kind": kind, "start": start, "rows": []})
+            group["rows"].append({"case": catalog[op][key], **row})
+    return sorted(groups.values(), key=lambda g: (g["start"], g["op"], g["direction"], g["kind"]))
+
+
 def overview_data(runs):
     platforms = []
     positive = lambda x: isinstance(x, (int, float)) and math.isfinite(x) and x > 0
@@ -410,9 +566,9 @@ def overview_data(runs):
                     op.get("reason")
                 })
         platforms.append({
-            "platform": platform, "date": latest["date"], "version": latest.get("version"), "sha": latest["sha"],
-            "source": f"https://github.com/{REPO}/releases/download/{TAG}/{latest['date']}.{platform}.json", "rows":
-            rows
+            "platform": platform, "date": latest["date"], "version": latest.get("version"), "sha": latest["sha"], "ci":
+            latest.get("ci"), "source":
+            f"https://github.com/{REPO}/releases/download/{TAG}/{latest['date']}.{platform}.json", "rows": rows
         })
     return platforms
 
@@ -447,7 +603,8 @@ def overview_svg(platforms):
     for p in platforms:
         date = p["date"]
         text(20, y + 23, f"{p['platform'].upper()} · {date[:4]}-{date[4:6]}-{date[6:]}", "heading")
-        text(340, y + 23, f"{p['version'] or ''} · {p['sha'][:12]}")
+        tests = f" · TLX tests {p['ci']['tlx_test']}" if p.get("ci") else ""
+        text(340, y + 23, f"{p['version'] or ''} · {p['sha'][:12]}{tests}")
         for x, heading in [(20, "Operation / direction"), (300, "Reference"), (650, "Compared / cases"),
                            (788, "Geomean speedup")]:
             text(x, y + 51, heading)
@@ -484,6 +641,7 @@ def page_data(runs):
     """
     platforms = {}
     for platform, nights in runs.items():
+        nights = sorted(nights, key=lambda n: n["date"])
         latest = nights[-1]
         catalog = {}  # op -> {case key: index}
         ops = {}
@@ -497,6 +655,11 @@ def page_data(runs):
                     if c["key"] not in index:
                         index[c["key"]] = len(entry["cases"])
                         entry["cases"].append([c["params"], c["direction"], c["dtype"]])
+        episode_cases = {op: [None] * len(index) for op, index in catalog.items()}
+        for night in nights:
+            for op, data in night["ops"].items():
+                for c in data["cases"]:
+                    episode_cases[op][catalog[op][c["key"]]] = [c["params"], c["direction"], c["dtype"], c["key"]]
         encoded = []
         for night in nights:
             runs_by_op = {}
@@ -511,10 +674,83 @@ def page_data(runs):
             encoded.append({"date": night["date"], "ops": runs_by_op})
         meta = {k: latest.get(k) for k in PLATFORM_FIELDS}
         latest_ops = {name: ops[name] for name in latest["ops"]}
-        platforms[platform] = {**meta, "ops": latest_ops, "nights": encoded, "events": events(nights)}
+        platforms[platform] = {
+            **meta, "ops": latest_ops, "nights": encoded, "events": events(nights), "episode_cases": episode_cases,
+            "episodes": episodes(nights, catalog)
+        }
     return {
-        "repo": REPO, "tag": TAG, "threshold": EVENT_THRESHOLD, "platforms": platforms, "overview": overview_data(runs)
+        "repo": REPO, "tag": TAG, "threshold": EVENT_THRESHOLD, "platforms": platforms, "overview": overview_data(runs),
+        "episode_policy": {"threshold": EVENT_THRESHOLD, "recovery": EPISODE_RECOVERY, "confirmation": 2}
     }
+
+
+#: Cases listed under each op table's fold in the run summary; the rest are counted.
+REPORT_ROWS = 20
+
+
+def _cell(text, limit=160):
+    """One line of free text, safe inside a Markdown table cell: a multi-line note keeps its first line and the
+    source line a Triton CompilationError points its caret at."""
+    lines = [l.strip() for l in (text or "").strip().splitlines() if l.strip()]
+    if len(lines) > 2 and set(lines[-1]) == {"^"}:
+        lines = [lines[0], lines[-2]]
+    line = " ".join(lines[:2])
+    line = line.replace("|", "\\|")
+    return line if len(line) <= limit else line[:limit - 1] + "…"
+
+
+def report(args):
+    with open(args.summary) as fh:
+        night = json.load(fh)
+    lines = [f"### {night['platform'].upper()} · {night['version']} · `{night['sha'][:12]}`", ""]
+    ci = night.get("ci")
+    if ci:
+        status = f"[{ci['tlx_test']}]({ci['run']})" if ci.get("run") else ci["tlx_test"]
+        lines += [f"TLX tests on this commit: {status}", ""]
+    bad = {}
+    for op, o in sorted(night["ops"].items()):
+        cases = [c for c in o["cases"] if c["status"] in ("pip", "error")]
+        if cases:
+            bad[op] = (len(o["cases"]), cases)
+    if bad:
+        lines += [
+            "| Op | Cases | Below the perf floor | Worst speedup | In error |", "| --- | ---: | ---: | ---: | ---: |"
+        ]
+        for op, (total, cases) in bad.items():
+            pip = [c for c in cases if c["status"] == "pip"]
+            worst = min((c["speedup"] for c in pip if c.get("speedup")), default=None)
+            lines.append(f"| {op} | {total} | {len(pip)} | {f'{worst:.3f}x' if worst else '-'} | "
+                         f"{sum(c['status'] == 'error' for c in cases)} |")
+        rows = sorted(((op, c) for op, (_, cases) in bad.items() for c in cases), key=lambda r:
+                      (r[1]["status"] != "error", r[1].get("speedup") or 0))
+        lines += [
+            "", "<details><summary>Cases</summary>", "", "| Op | Case | Status | Speedup | Note |",
+            "| --- | --- | --- | ---: | --- |"
+        ]
+        for op, c in rows[:REPORT_ROWS]:
+            speedup = f"{c['speedup']:.3f}x" if c.get("speedup") else "-"
+            lines.append(f"| {op} | `{c['key'].split('/', 2)[-1]}` | {c['status']} | {speedup} | "
+                         f"{_cell((c.get('notes') or [''])[0])} |")
+        if len(rows) > REPORT_ROWS:
+            lines.append(f"| | {len(rows) - REPORT_ROWS} more in the summary JSON | | | |")
+        lines += ["", "</details>", ""]
+    alerts = []
+    if args.regressions and os.path.exists(args.regressions):
+        with open(args.regressions) as fh:
+            alerts = json.load(fh)
+    if alerts:
+        lines += ["| Regression | Cases | Worst loss | Issue |", "| --- | ---: | ---: | --- |"]
+        for a in alerts:
+            numbers = [a["bisect_issue"]] if a.get("bisect_issue") else a.get("tracked_by", [])
+            title = f"[perf-regression] {a['platform']} / {a['op']} / {a['direction']}"
+            search = f"https://github.com/{REPO}/issues?{urlencode({'q': f'is:issue in:title \"{title}\"'})}"
+            issue = ", ".join(f"#{n}" for n in numbers) if numbers else f"[search]({search})"
+            worst = min(c["ratio"] for c in a["cases"])
+            lines.append(f"| {a['op']} / {a['direction']} | {len(a['cases'])} | {1 - worst:.1%} | {issue} |")
+        lines.append("")
+    if not bad and not alerts:
+        lines += ["No case below the perf floor or in error, and no regressions.", ""]
+    print("\n".join(lines))
 
 
 def render(args):
@@ -541,13 +777,18 @@ def main():
     s.add_argument("dir")
     for flag in ("--platform", "--version", "--sha", "--out"):
         s.add_argument(flag, required=True)
+    s.add_argument("--ci", default="", help="conclusion of the platform's TLX tests on --sha")
+    s.add_argument("--ci-run", default="", help="the gpu-tests.yml run --ci comes from")
     p = sub.add_parser("prune")
     p.add_argument("keep", type=int)
+    rep = sub.add_parser("report")
+    rep.add_argument("summary")
+    rep.add_argument("--regressions", help="the regression detector's output for this night")
     r = sub.add_parser("render")
     r.add_argument("outdir")
     r.add_argument("--from", dest="source", help="read summaries from this directory instead of the release")
     args = parser.parse_args()
-    {"summarize": summarize, "prune": prune, "render": render}[args.cmd](args)
+    {"summarize": summarize, "prune": prune, "report": report, "render": render}[args.cmd](args)
 
 
 if __name__ == "__main__":

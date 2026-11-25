@@ -110,8 +110,21 @@ accumulate, the rsqrt/normalize chain). The whole path is gated to
 are unaffected. Mechanics:
 
 - **Trigger** (`OpCategorizer::hasComputeAnchorNoMMA`): `mmas.empty()` and the
-  loop nest contains any `triton::ReduceOp`. Drives `hasComputeAnchor` in
-  `createPartitionLayout`.
+  loop nest contains any `triton::ReduceOp`, except when the loop nest also
+  contains a register `tt.dot` (an MMA that `mmas` does not track, e.g.
+  mma.sync at BLOCK_M=32) **and** a separate "epilogue" partition will be
+  created (`createsEpiloguePartition`: an EpilogueStore op, no
+  `mergeEpilogue`, no `mergeEpilogueToComputation`). In that case the
+  reduction layout would put the dot in "reduction" but the K loop carrying its
+  accumulator in "epilogue", so the anchor is off and the kernel gets the plain
+  register-GEMM layout (dot, K loop and epilogue in "epilogue"). Without an
+  epilogue partition (merge flags set, or a pointer `tt.store` epilogue) the
+  "reduction" partition holds all of it and the anchor stays on. Drives
+  `hasComputeAnchor` in `createPartitionLayout`.
+- **Register dot + TMA reduce**: a TMA reduce creates the reduction partition
+  through `hasReduction` regardless of the anchor, so with a register `tt.dot`
+  and an epilogue partition `getInitialSchedule` returns no schedule and the
+  loop is not specialized (partition-scheduler bug #48).
 - **Reduction first → index 0**: the reduction branch fires for
   `hasReduction || hasComputeAnchor`, and because it runs before the
   load/epilogue_store branches it gets index 0 (the default 4-warp group), so
@@ -124,7 +137,8 @@ are unaffected. Mechanics:
   gated step anchors in-loop epilogue store ops — the TMA store **and** its
   `async_tma_store_token_wait` — to `epilogue_store` *before* Phase 4. The
   staging `local_alloc` stays in reduction, forming the reduction→store SMEM
-  channel.
+  channel. A TMA reduce's token wait (`isReduceTokenWait`) is not anchored: it
+  stays in the partition of its reduce.
 - **Scalar-offset fixup**: before serialization, a no-MMA gated fixpoint assigns
   each still-unannotated value-producing op (e.g. `offs = i * 64`) the union of
   its partitioned users' ids (`muli` feeding both load and store gets both).
@@ -268,7 +282,8 @@ created gets index 0, which becomes the "default" warp group in
    Serves as default for bwd (TMA-atomic reduce) and for no-MMA in-register
    reduction kernels. `hasComputeAnchor` is true only when `mmas.empty()` and the
    loop contains a `tt.reduce` (`OpCategorizer::hasComputeAnchorNoMMA`), so it
-   never fires for MMA kernels. Created first → index 0.
+   never fires for MMA kernels; it is also off for a register `tt.dot` when an
+   epilogue partition will be created (see the trigger above). Created first → index 0.
 3. **Gemm** — only when MMAv5 ops exist (Blackwell). Hopper `warp_group_dot`
    is not MMAv5, so no gemm partition is created for Hopper.
 4. **Load** — always.
@@ -367,6 +382,10 @@ before `propagatePartitions`):
 
 - **Epilogue store ops** → `epilogue_store` partition (when it exists), else
   follow the same routing as regular epilogue ops.
+- **TMA reduce token waits** (`isReduceTokenWait`) → the partition of the
+  reduce whose token they consume, not `epilogue_store`. A wait placed apart
+  from its reduce makes `doCodePartition` clone the reduce into the wait's
+  partition, so the value is reduced into global memory twice.
 - **Epilogue ops** (non-store) → routing depends on tuning knobs:
   - `mergeEpilogueToComputation`: → computation[dpId] directly
   - `mergeEpilogue`: → correction (if exists) → reduction → computation[dpId]
