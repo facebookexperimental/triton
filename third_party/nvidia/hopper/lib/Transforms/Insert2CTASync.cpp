@@ -463,8 +463,23 @@ insertSyncBeforeMMA(ttng::MMAv5OpInterface mma, Value barrierAlloc,
 
   // Order this CTA's generic writes of its split B half before the arrive that
   // lets the leader's MMA read it.
-  if (mma->hasAttr(ttng::AttrTwoCTARegisterBName))
+  if (mma->hasAttr(ttng::AttrTwoCTARegisterBName)) {
     ttng::FenceAsyncSharedOp::create(builder, loc, /*bCluster=*/true);
+  } else if (mma->hasAttr(ttng::AttrTwoCTARegisterAName)) {
+    // Only the follower's register-staged A half is read across the cluster.
+    // The leader's own half is ordered by the CTA-scoped fence before the MMA.
+    Value two = arith::ConstantIntOp::create(builder, loc, 2, 32);
+    Value zero = arith::ConstantIntOp::create(builder, loc, 0, 32);
+    Value rankMod2 = arith::RemUIOp::create(builder, loc, ctaRank, two);
+    Value isFollower = arith::CmpIOp::create(
+        builder, loc, arith::CmpIPredicate::ne, rankMod2, zero);
+    auto ifOp = scf::IfOp::create(builder, loc, TypeRange{}, isFollower,
+                                  /*withElseRegion=*/false);
+    OpBuilder thenBuilder = ifOp.getThenBodyBuilder();
+    // The follower's A half lives in its own shared memory, so the CTA
+    // state space covers it.
+    ttng::FenceAsyncSharedOp::create(thenBuilder, loc, /*bCluster=*/false);
+  }
 
   // Both CTAs arrive on leader's barrier (count=1 each, total=2).
   ttng::ArriveBarrierOp::create(builder, loc, remoteBar, /*count=*/1u);
