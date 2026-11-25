@@ -241,7 +241,7 @@ def readiness_text(kind, sha, tree, build, branch, source_url, ready_url, marker
         f'- LLVM source: [`{sha[:12]}`](https://github.com/{fork}/commit/{sha}) on `{branch}`, tree `{tree}`, '
         f'packaging revision `{build}`.', f'- [Source record]({source_url}) and [SDK validation record]({ready_url}).'
     ]
-    if pr.get('error'):
+    if pr.get('error') and pr.get('url'):
         lines.append(f'- The [candidate run]({run_url}) failed after creating the PR, so its consumer tests or the '
                      'cleanup of older candidates may not have run. Rerun the workflow.')
     if pr.get('kept'):

@@ -365,15 +365,16 @@ def ensure_candidate_pr(repo, candidate, platforms, base=''):
     branch = f'scratch/llvm-candidate/{kind}-{sha[:8]}-{build}'
     # INVARIANT: one proposal per kind, LLVM commit and packaging revision, whatever Triton base it started from.
     proposals = labeled(repo, CANDIDATE_LABEL, 'all', CANDIDATE, True)
-    higher = any(k == kind and other == sha and int(b) > build for _, (k, other, b, _) in proposals)
+    higher = [int(b) for _, (k, other, b, _) in proposals if (k, other) == (kind, sha) and int(b) > build]
     for ref in github_json(f'repos/{repo}/git/matching-refs/heads/scratch/llvm-candidate/{kind}-{sha[:8]}-'):
         other = ref['ref'].removeprefix('refs/heads/')
-        if not higher and other.rsplit('-', 1)[1].isdigit() and int(other.rsplit('-', 1)[1]) > build:
+        if other.rsplit('-', 1)[1].isdigit() and int(other.rsplit('-', 1)[1]) > build:
             pages = github_json(f'repos/{repo}/pulls?state=all&head=facebookexperimental:{quote(other, safe="")}',
                                 paginate=True)
-            higher = any(page for page in pages)
+            if any(page for page in pages):
+                higher.append(int(other.rsplit('-', 1)[1]))
     if higher:
-        return dict(result, status='superseded')
+        return dict(result, status='superseded', replacement=dict(candidate, build_number=str(max(higher))))
     numbers = {item['number'] for item, groups in proposals if groups[:3] == (kind, sha, str(build))}
     pages = github_json(f'repos/{repo}/pulls?state=all&head=facebookexperimental:{quote(branch, safe="")}&per_page=100',
                         paginate=True)
@@ -419,8 +420,16 @@ def ensure_candidate_pr(repo, candidate, platforms, base=''):
                            payload={'message': message, 'tree': tree['sha'], 'parents': [base]})['sha']
         github_json(f'repos/{repo}/git/refs', method='POST', payload={'ref': 'refs/heads/' + branch, 'sha': head})
     print(f'Candidate branch: {branch} at {head}. Main was not changed.', flush=True)
-    pull = github_json(f'repos/{repo}/pulls', method='POST',
-                       payload={'title': title, 'body': body, 'head': branch, 'base': 'main', 'draft': True})
+    try:
+        pull = github_json(f'repos/{repo}/pulls', method='POST',
+                           payload={'title': title, 'body': body, 'head': branch, 'base': 'main', 'draft': True})
+    except subprocess.CalledProcessError:
+        pages = github_json(f'repos/{repo}/pulls?state=all&head=facebookexperimental:{quote(branch, safe="")}',
+                            paginate=True)
+        found = [pull for page in pages for pull in page]
+        if not found:
+            raise
+        pull = github_json(f"repos/{repo}/pulls/{found[0]['number']}")
     if (not pull['draft'] or pull['head']['sha'] != head or pull['base']['ref'] != 'main' or pull['state'] != 'open'):
         raise ValueError('Created candidate PR does not match the prepared head, base or draft state')
     result.update(status='created', number=pull['number'], url=pull['html_url'], old=old['llvm_hash'])
@@ -443,12 +452,10 @@ def main():
     # INVARIANT: the caller holds the candidate handoff workflow lock, so supersession and issue filing never
     # interleave with another run's.
     candidates = json.loads(os.environ['CANDIDATES'])
-    create = os.environ.get('CREATE_CANDIDATE_PR', 'true') != 'false'
     failures = []
     for candidate in candidates:
         try:
-            pr = None
-            if create:
+            for _ in range(3):
                 try:
                     pr = ensure_candidate_pr(repo, candidate, platforms, os.environ.get('CANDIDATE_BASE_SHA', ''))
                 except BundleNotReady:
@@ -459,6 +466,9 @@ def main():
                 print(json.dumps(pr), flush=True)
                 if pr.get('error'):
                     failures.append(candidate['kind'])
+                if 'replacement' not in pr:
+                    break
+                candidate = pr['replacement']
             print(ensure_issue(repo, candidate, platforms, pr), flush=True)
         except BundleNotReady as error:
             print(error, flush=True)

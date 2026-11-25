@@ -24,10 +24,6 @@ on:
         description: Publish validated immutable bundle assets
         type: boolean
         default: true
-      create_candidate_pr:
-        description: Create or reuse the draft candidate PR before filing the readiness issue
-        type: boolean
-        default: true
       candidate_base_sha:
         description: Full Triton main commit for a new candidate PR (blank uses the current main)
         type: string
@@ -84,7 +80,6 @@ jobs:
           HEAD_SHA: ${{ github.sha }}
           KIND: ${{ inputs.kind || 'all' }}
           REQUEST_SOURCE: ${{ inputs.request_source || 'branches' }}
-          CREATE_CANDIDATE_PR: ${{ inputs.create_candidate_pr }}
           CANDIDATE_BASE_SHA: ${{ inputs.candidate_base_sha }}
           PUBLISH: ${{ github.event_name != 'workflow_dispatch' || inputs.publish }}
         run: python3 .github/scripts/select_meta_llvm_builds.py
@@ -132,7 +127,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CANDIDATES: ${{ needs.select.outputs.candidates }}
-          CREATE_CANDIDATE_PR: ${{ github.event_name != 'workflow_dispatch' || inputs.create_candidate_pr }}
           CANDIDATE_BASE_SHA: ${{ inputs.candidate_base_sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: python3 .github/scripts/meta_llvm_ready.py handoff
