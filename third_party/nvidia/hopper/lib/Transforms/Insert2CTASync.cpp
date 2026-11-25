@@ -456,7 +456,7 @@ static bool isCooperativeTMABarrier(Value bar) {
 // cooperative 2-CTA TMA copies. Their transaction completes on the leader's
 // barrier with both CTAs' bytes, so the leader's own wait already proves the
 // follower's half has landed. Captures into warp_specialize partitions are
-// followed to the producer partition's view of the same buffer.
+// followed into every partition's view of the same buffer.
 static bool fedOnlyByCooperativeTMA(Value operand) {
   Value base = operand;
   while (Operation *def = base.getDefiningOp()) {
@@ -469,6 +469,7 @@ static bool fedOnlyByCooperativeTMA(Value operand) {
     if (!isa<ttg::WarpSpecializePartitionsOp>(arg.getOwner()->getParentOp()))
       return false;
   SmallVector<Value> worklist = getCaptureAliases(base);
+  DenseSet<Value> visited(worklist.begin(), worklist.end());
   bool sawWriter = false;
   while (!worklist.empty()) {
     Value v = worklist.pop_back_val();
@@ -485,8 +486,16 @@ static bool fedOnlyByCooperativeTMA(Value operand) {
         sawWriter = true;
         continue;
       }
-      if (isa<ttng::MMAv5OpInterface, ttg::LocalDeallocOp,
-              ttg::WarpSpecializePartitionsOp>(user))
+      // A buffer captured into the partitions is also written through each
+      // partition's block argument; check those writers too.
+      if (auto partOp = dyn_cast<ttg::WarpSpecializePartitionsOp>(user)) {
+        unsigned n = use.getOperandNumber();
+        for (Region &region : partOp.getPartitionRegions())
+          if (visited.insert(region.getArgument(n)).second)
+            worklist.push_back(region.getArgument(n));
+        continue;
+      }
+      if (isa<ttng::MMAv5OpInterface, ttg::LocalDeallocOp>(user))
         continue;
       return false;
     }

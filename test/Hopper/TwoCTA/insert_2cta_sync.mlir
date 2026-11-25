@@ -930,3 +930,92 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// The MMA reads buffers defined outside warp_specialize. The default region
+// writes both with cooperative copies, but partition1 also writes B through
+// its captured block argument with a non-cooperative copy, so the relay and
+// the per-step rendezvous stay.
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
+#bar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+
+// CHECK-LABEL: @test_captured_operand_non_cooperative_writer
+// CHECK: scf.for
+// CHECK: scf.for
+// CHECK: ttng.fence_async_shared {{.*}}ttng.two_cta_relay
+// CHECK: ttng.arrive_barrier {{.*}}shared_cluster_memory
+// CHECK: ttng.wait_barrier
+// CHECK-NEXT: ttng.tc_gen5_mma
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32} {
+  tt.func @test_captured_operand_non_cooperative_writer(
+      %desc: !tt.tensordesc<128x64xf16, #shared>,
+      %acc: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+      %acc_tok: !ttg.async.token) {
+    %a = ttg.local_alloc : () -> !ttg.memdesc<2x128x64xf16, #shared, #smem, mutable>
+    %b = ttg.local_alloc : () -> !ttg.memdesc<2x128x64xf16, #shared, #smem, mutable>
+    %bars = ttg.local_alloc : () -> !ttg.memdesc<2x1xi64, #bar, #smem, mutable>
+    ttg.warp_specialize(%a, %b, %bars, %acc, %acc_tok, %desc)
+    default {
+      %true = arith.constant true
+      %c0_i32 = arith.constant 0 : i32
+      %c1_i32 = arith.constant 1 : i32
+      %c4_i32 = arith.constant 4 : i32
+      scf.for %t = %c0_i32 to %c4_i32 step %c1_i32 : i32 {
+        scf.for %k = %c0_i32 to %c4_i32 step %c1_i32 : i32 {
+          ttng.fence_async_shared {bCluster = false, ttng.two_cta_relay}
+          %bar0 = ttg.memdesc_index %bars[%c0_i32] : !ttg.memdesc<2x1xi64, #bar, #smem, mutable> -> !ttg.memdesc<1xi64, #bar, #smem, mutable>
+          %aw = ttg.memdesc_index %a[%c0_i32] : !ttg.memdesc<2x128x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+          ttng.async_tma_copy_global_to_local %desc[%c0_i32, %c0_i32] %aw, %bar0, %true {two_cta = true} : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<1xi64, #bar, #smem, mutable> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+          %bw = ttg.memdesc_index %b[%c0_i32] : !ttg.memdesc<2x128x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+          ttng.async_tma_copy_global_to_local %desc[%c0_i32, %c0_i32] %bw, %bar0, %true {two_cta = true} : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<1xi64, #bar, #smem, mutable> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+          %av = ttg.memdesc_index %a[%c0_i32] : !ttg.memdesc<2x128x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+          %bv = ttg.memdesc_index %b[%c0_i32] : !ttg.memdesc<2x128x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+          %bt = ttg.memdesc_trans %bv {order = array<i32: 1, 0>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<64x128xf16, #shared1, #smem, mutable>
+          %tok = ttng.tc_gen5_mma %av, %bt, %acc[%acc_tok], %true, %true {two_ctas} :
+            !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
+            !ttg.memdesc<64x128xf16, #shared1, #smem, mutable>,
+            !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+        }
+      }
+      ttg.warp_yield
+    }
+    partition0(%pa: !ttg.memdesc<2x128x64xf16, #shared, #smem, mutable>,
+               %pb: !ttg.memdesc<2x128x64xf16, #shared, #smem, mutable>,
+               %pbars: !ttg.memdesc<2x1xi64, #bar, #smem, mutable>,
+               %pacc: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+               %pacc_tok: !ttg.async.token,
+               %pdesc: !tt.tensordesc<128x64xf16, #shared>) num_warps(1) {
+      ttg.warp_return
+    }
+    partition1(%la: !ttg.memdesc<2x128x64xf16, #shared, #smem, mutable>,
+               %lb: !ttg.memdesc<2x128x64xf16, #shared, #smem, mutable>,
+               %lbars: !ttg.memdesc<2x1xi64, #bar, #smem, mutable>,
+               %lacc: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+               %lacc_tok: !ttg.async.token,
+               %ldesc: !tt.tensordesc<128x64xf16, #shared>) num_warps(1) {
+      %true = arith.constant true
+      %c0_i32 = arith.constant 0 : i32
+      %c1_i32 = arith.constant 1 : i32
+      %c16_i32 = arith.constant 16 : i32
+      scf.for %i = %c0_i32 to %c16_i32 step %c1_i32 : i32 {
+        %av = ttg.memdesc_index %la[%c0_i32] : !ttg.memdesc<2x128x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+        %bv = ttg.memdesc_index %lb[%c0_i32] : !ttg.memdesc<2x128x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+        %bar = ttg.memdesc_index %lbars[%c0_i32] : !ttg.memdesc<2x1xi64, #bar, #smem, mutable> -> !ttg.memdesc<1xi64, #bar, #smem, mutable>
+        ttng.async_tma_copy_global_to_local %ldesc[%c0_i32, %c0_i32] %av, %bar, %true {two_cta = true} : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<1xi64, #bar, #smem, mutable> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+        ttng.async_tma_copy_global_to_local %ldesc[%c0_i32, %c0_i32] %bv, %bar, %true : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<1xi64, #bar, #smem, mutable> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      }
+      ttg.warp_return
+    } : (!ttg.memdesc<2x128x64xf16, #shared, #smem, mutable>,
+         !ttg.memdesc<2x128x64xf16, #shared, #smem, mutable>,
+         !ttg.memdesc<2x1xi64, #bar, #smem, mutable>,
+         !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+         !ttg.async.token,
+         !tt.tensordesc<128x64xf16, #shared>) -> ()
+    tt.return
+  }
+}
