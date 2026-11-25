@@ -411,14 +411,18 @@ For each annotated `TMAStoreTokenWaitOp` with `can_rotate_by_buffer_count = K`:
 4. **Adjust for barriers**: scan backwards from the insertion target to
    find a preceding `WaitBarrierOp`. If one exists, insert before it
    instead — this avoids placing the TMA store wait between a barrier
-   wait and the ops it guards.
+   wait and the ops it guards. A wait marked
+   `tma_store_wait_before_wait_barrier` (the cross-tile reuse release, see
+   below) stops instead at the first `WaitBarrierOp` after its TMA store:
+   the release gates the loads that the next tile's accumulator wait
+   depends on, so moving it past that wait would deadlock.
 
 5. **Update the schedule**: split the cluster at the insertion target and
    create a new cluster for the wait op, assigned to the target's pipeline
    stage. Serialize the modified schedule back to the loop.
 
-6. **Remove the annotation**: strip `can_rotate_by_buffer_count` from the
-   wait op.
+6. **Remove the annotation**: strip `can_rotate_by_buffer_count` and
+   `tma_store_wait_before_wait_barrier` from the wait op.
 
 ### Example
 
@@ -482,8 +486,13 @@ cross-partition token for this write-after-read edge:
 
 - the **load task** does a `producer_acquire` at the **top of the persistent
   outer loop** (before the operand loads), and
-- the **staging task** does a `consumer_release` at the **bottom of the outer
-  loop** (after the staging stores, which have already drained).
+- the **staging task** releases it on the wait of its **last TMA store**.
+  Store-wait pipelining defers that wait into the next iteration, so its
+  rotation is capped at one iteration and it is marked
+  `tma_store_wait_before_wait_barrier` to stay ahead of the next tile's
+  `wait_barrier`s. Without a top-level store wait (stores waited inside
+  nested regions), it does a `consumer_release` at the **bottom of the outer
+  loop** instead.
 
 Both are loop-carried (phase derived from the outer-loop induction variable via
 `getBufferIdxAndPhase`), so the edge serializes `load(tile N+1)` after
