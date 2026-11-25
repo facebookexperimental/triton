@@ -269,6 +269,14 @@ public:
       return bailOut(funcOp);
     }
 
+    // Reserve the cp.async buffers the post-WS pipeliner adds for a same-task
+    // MMA operand's pointer loads; keep a copy to fall back to if it can't fit.
+    unsigned stagingSmemBytes =
+        estimateSameTaskOperandStagingSmem(funcOp, numStages);
+    OwningOpRef<triton::FuncOp> preWSFuncOp;
+    if (stagingSmemBytes)
+      preWSFuncOp = funcOp.clone();
+
     // Cross-partition run-once, loop-carried "claim the next tile" support for
     // dynamic-persistent kernels. Handles both the `tt.atomic_rmw` tile counter
     // and the CLC tile-scheduler fetch (`ttng.clc_read`) with the same idea:
@@ -319,11 +327,34 @@ public:
     doHoistLoopInvariantTMEMStore(funcOp);
     dumpAfter(moduleOp, "doHoistLoopInvariantTMEMStore");
 
-    if (failed(doMemoryPlanner(funcOp, numStages, smemBudget))) {
+    MemoryPlannerOptions plannerOptions;
+    bool fitsSmemBudget = true;
+    plannerOptions.reservedSmemBytes = stagingSmemBytes;
+    plannerOptions.fitsSmemBudget = &fitsSmemBudget;
+    if (failed(
+            doMemoryPlanner(funcOp, numStages, smemBudget, plannerOptions))) {
       signalPassFailure();
       return;
     }
     dumpAfter(moduleOp, "doMemoryPlanner");
+
+    if (preWSFuncOp && !fitsSmemBudget) {
+      funcOp.getBody().takeBody(preWSFuncOp->getBody());
+      // Attach the remark to the MMA if there is one, else to the function.
+      Operation *remarkOp = funcOp;
+      funcOp.walk([&](triton::nvidia_gpu::MMAv5OpInterface op) {
+        remarkOp = op;
+        return WalkResult::interrupt();
+      });
+      remarkOp->emitRemark()
+          << "meta autoWS cannot fit its buffers plus " << stagingSmemBytes
+          << " bytes of pipelined loads and conversion scratch for an MMA "
+             "operand written in the MMA's own partition in the "
+          << static_cast<unsigned>(smemBudget)
+          << "-byte shared-memory budget; compiling without warp "
+             "specialization";
+      return bailOut(funcOp);
+    }
 
     if (generateSubtiledRegion) {
       doGenerateSubtiledRegion(funcOp);
