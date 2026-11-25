@@ -88,6 +88,9 @@ constexpr static char AttrTwoCTALoadName[] = "two_cta_load";
 // Set by Transform2CTALoads on a 2-CTA MMA whose B it split across the CTA pair
 // from a register-built tile, so each CTA writes its B half from registers.
 constexpr static char AttrTwoCTARegisterBName[] = "two_cta_register_b";
+// Set by Transform2CTALoads on a 2-CTA MMA whose A shared buffer is written
+// from registers, so each CTA writes its A half with generic stores.
+constexpr static char AttrTwoCTARegisterAName[] = "two_cta_register_a";
 constexpr static char kPlannedPendingCount[] = "planned_pending_count";
 // tcgen05.mma collector usage for operand A ("fill" / "use" / "lastuse"), set
 // by the MMA collector reuse pass on single-instruction MMAs.
