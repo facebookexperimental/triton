@@ -8,6 +8,7 @@ from unittest import mock
 
 import sympy
 import torch
+from torch._dynamo.testing import CompileCounterWithBackend
 from torch._inductor import config
 from torch._inductor.codegen.simd_kernel_features import (
     DisableReduction,
@@ -3192,12 +3193,10 @@ class TestHopperMMTemplate(TestCase):
     ))
     @parametrize("op", ("mm", "addmm"))
     def test_dynamic_m(self, template, marker, k, op):
-        """A dynamic M leaves A's TMA descriptor with a symbolic shape. A launcher
-        that reads dynamic sizes at launch builds it on the host; otherwise it is
-        built on the device. B's, all static, stays on the host either way. A
-        second M reuses the compiled kernel and must not reuse A's descriptor."""
-        from torch._inductor.runtime import triton_heuristics
-
+        """A dynamic M leaves A's TMA descriptor with a symbolic shape; the launcher
+        builds it on the host from the dynamic size it reads at launch. B's, all
+        static, stays on the host too. A second M reuses the compiled kernel and
+        must not reuse A's descriptor."""
         bias = torch.randn(256, device=GPU_TYPE, dtype=torch.float16)
         fn = torch.mm if op == "mm" else functools.partial(torch.addmm, bias)
         with config.patch({**_HOPPER_ADDMM_PATCH, "test_configs.autotune_choice_name_regex": template}):
@@ -3212,11 +3211,79 @@ class TestHopperMMTemplate(TestCase):
                     generated = "\n".join(code)
         self.assertIn(marker, generated)
         self.assertNotIn("desc_b = tl.make_tensor_descriptor(", generated)
-        if getattr(triton_heuristics, "HOST_TMA_SYMBOLIC_DIMS", False):
-            self.assertNotIn("tl.make_tensor_descriptor(base=arg_A", generated)
-            self.assertRegex(generated, r"'arg_A': \{'block_shape': \[[0-9, ]+\], 'shape': \['ks0'")
+        self.assertNotIn("tl.make_tensor_descriptor(base=A", generated)
+        self.assertRegex(generated, r"'arg_A': \{'block_shape': \[[0-9, ]+\], 'shape': \['ks0'")
+
+    @parametrize("template,marker,k", (
+        ("tlx_hopper_gemm_ws", _HOPPER_WS, 1096),
+        ("tlx_hopper_gemm_small_k", _HOPPER_SMALL_K, 256),
+    ))
+    @parametrize("op", ("mm", "addmm"))
+    @parametrize("compile_time_autotune", (True, False))
+    def test_dynamic_m_cpp_wrapper(self, template, marker, k, op, compile_time_autotune):
+        """Under the C++ wrapper with compile-time autotuning (AOTInductor's
+        default), the kernel's call wrapper builds both host-side TMA descriptors,
+        A's from the dynamic size ks0 it takes as a parameter, so neither is built
+        on the device. A second M reuses the compiled kernel with a descriptor of
+        the new shape. The lazy-compile wrapper cannot take a template's host-side
+        descriptor, so there both stay on the device."""
+        bias = torch.randn(256, device=GPU_TYPE, dtype=torch.float16)
+        fn = torch.mm if op == "mm" else functools.partial(torch.addmm, bias)
+        with config.patch({
+                **_HOPPER_ADDMM_PATCH,
+                "cpp_wrapper": True,
+                "triton.autotune_at_compile_time": compile_time_autotune,
+                "test_configs.autotune_choice_name_regex": template,
+        }):
+            counter = CompileCounterWithBackend("inductor")
+            compiled = torch.compile(fn, backend=counter)
+            for m in (706, 300):
+                a, b = _operands((m, 256, k), "nt", torch.float16)
+                torch._dynamo.mark_dynamic(a, 0)
+                expected = (a.float() @ b.float() + (bias.float() if op == "addmm" else 0)).half()
+                if m == 706:
+                    # run_and_get_code resets dynamo, so only the first M goes through it.
+                    actual, code = run_and_get_code(compiled, a, b)
+                    generated = "\n".join(code)
+                else:
+                    actual = compiled(a, b)
+                torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+        self.assertEqual(counter.frame_count, 1, "a second M must reuse the compiled code")
+        self.assertIn(marker, generated)
+        if compile_time_autotune:
+            self.assertNotIn("tl.make_tensor_descriptor(base=A", generated)
+            self.assertNotIn("tl.make_tensor_descriptor(base=B", generated)
+            self.assertIn("arg_A_tma_tensor_", generated)
+            self.assertRegex(generated, r"arg_A\.global_shape\[0\] = static_cast<uint64_t>\(ks0\);")
         else:
-            self.assertIn("desc_a = tl.make_tensor_descriptor(", generated)
+            self.assertIn("tl.make_tensor_descriptor(base=A", generated)
+            self.assertNotIn("_tma_tensor_", generated)
+
+    @parametrize("cpp_wrapper", (False, True))
+    def test_host_tma_offset_operand(self, cpp_wrapper):
+        """A view with a storage offset (here a column slice taken inside the
+        graph) keeps a device-side descriptor: the template moves its pointer by
+        the offset in the kernel, which a host-side descriptor cannot carry. The
+        other operand keeps its host descriptor."""
+        m, k, n, skip = 706, 1096, 256, 16
+        x = torch.randn(m, k + skip, device=GPU_TYPE, dtype=torch.float16)
+        b = torch.randn(n, k, device=GPU_TYPE, dtype=torch.float16).t()
+
+        def fn(x, b):
+            return x[:, skip:] @ b
+
+        patch = {**_HOPPER_ADDMM_PATCH, "test_configs.autotune_choice_name_regex": "tlx_hopper_gemm_ws"}
+        if cpp_wrapper:
+            patch.update({"cpp_wrapper": True, "triton.autotune_at_compile_time": True})
+        with config.patch(patch):
+            torch._dynamo.mark_dynamic(x, 0)
+            actual, code = run_and_get_code(torch.compile(fn), x, b)
+        torch.testing.assert_close(actual, (x[:, skip:].float() @ b.float()).half(), atol=2e-2, rtol=2e-2)
+        generated = "\n".join(code)
+        self.assertIn(_HOPPER_WS, generated)
+        self.assertIn(f"A = arg_A + {skip}", generated)
+        self.assertIn("tl.make_tensor_descriptor(base=A", generated)
+        self.assertNotIn("tl.make_tensor_descriptor(base=B", generated)
 
     @parametrize("block_n", (192, 96))
     @parametrize("bias_shape", ("n", "mn"))

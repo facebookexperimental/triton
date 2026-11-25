@@ -933,26 +933,17 @@ def _host_tma_operands(kernel_inputs) -> dict[str, bool]:
 
     A device-built descriptor costs every CTA a descriptor write and fence before
     its first load. The Python launcher builds host descriptors from integer dims
-    and, where it supports it, from dynamic sizes the kernel takes as args (A's M
-    under a dynamic batch), read at launch. Any other operand is passed as a
-    plain pointer and its descriptor is built on the device. The C++ wrapper
-    passes every operand as a pointer unless it can build template descriptors
-    (HOST_TMA_TEMPLATE_DESCRIPTORS); a kernel compiled for a host descriptor and
-    launched with a pointer faults in cuLaunchKernel, so there both stay on the
-    device.
+    and from dynamic sizes the kernel takes as args (A's M under a dynamic batch),
+    read at launch. The C++ wrapper (AOTInductor) builds
+    them in the kernel's call wrapper, which takes those sizes as parameters, but
+    only when kernels are autotuned at compile time: the lazy-compile wrapper
+    cannot take a template's host-side descriptor. Any other operand is passed as
+    a plain pointer and its descriptor is built on the device.
     """
-    from torch._inductor.codegen import cpp_wrapper_gpu
-    from torch._inductor.runtime import triton_heuristics
-
-    if V.graph.cpp_wrapper and not getattr(cpp_wrapper_gpu, "HOST_TMA_TEMPLATE_DESCRIPTORS", False):
+    if V.graph.cpp_wrapper and config.triton.autotune_at_compile_time is False:
         return {"HOST_SIDE_TMA": False, "HOST_TMA_A": False, "HOST_TMA_B": False}
-    launch_dims = getattr(triton_heuristics, "HOST_TMA_SYMBOLIC_DIMS", False) and not V.graph.cpp_wrapper
-    dim_types = (int, sympy.Integer, sympy.Symbol) if launch_dims else (int, sympy.Integer)
-    # The prologue offsets an input with a storage offset (`B = arg_B + 96`), which a
-    # host descriptor cannot take, so build that one on the device.
-    a_host, b_host = (mat.get_layout().offset == 0
-                      and all(isinstance(dim, dim_types)
-                              for dim in (*mat.get_size(), *mat.get_stride()))
+    dim_types = (int, sympy.Integer, sympy.Symbol)
+    a_host, b_host = (all(isinstance(dim, dim_types) for dim in (*mat.get_size(), *mat.get_stride()))
                       for mat in kernel_inputs.mat1mat2())
     return {"HOST_SIDE_TMA": a_host or b_host, "HOST_TMA_A": a_host, "HOST_TMA_B": b_host}
 

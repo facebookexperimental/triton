@@ -657,6 +657,7 @@ def dot_scaled(
     rhs_k_pack=True,
     out_dtype=tl.float32,
     tiles_per_warp: tl.constexpr = None,
+    fp6_packed: tl.constexpr = False,
     _semantic=None,
 ):
     """Call ``tl.dot_scaled`` with an optional AMD WMMA tile schedule."""
@@ -672,6 +673,7 @@ def dot_scaled(
         lhs_k_pack,
         rhs_k_pack,
         out_dtype,
+        fp6_packed=fp6_packed,
         _semantic=_semantic,
     )
     tiles_per_warp = tl._unwrap_if_constexpr(tiles_per_warp)

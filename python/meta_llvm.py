@@ -3,7 +3,7 @@
 cmake/llvm-info.json and cmake/amd-llvm-info.json are OAI's pins and stay
 byte-identical to upstream, so upstream picks apply cleanly.
 cmake/meta-llvm-info.json and cmake/meta-amd-llvm-info.json, when present,
-name the Meta fork builds, each of which must sit on its OAI pin.
+name the Meta fork builds that replace them.
 build_helpers.py calls in here from two hooks; keep Meta's dependency logic in
 this file.
 """
@@ -29,28 +29,17 @@ def enabled(base_dir: str) -> bool:
     return os.path.exists(os.path.join(base_dir, "cmake", "meta-llvm-info.json"))
 
 
-def _load_info(base_dir: Optional[str], oai_name: str, meta_name: str) -> dict:
-    # INVARIANT: compare against the OAI pin the Triton sources are written
-    # against. The *-build-info.json files only request the next OAI build and
-    # move days before the sources do.
-    cmake_dir = os.path.join(base_dir or bh.get_base_dir(), "cmake")
-    with open(os.path.join(cmake_dir, oai_name), "r") as oai_info_file:
-        oai_info = json.load(oai_info_file)
-    with open(os.path.join(cmake_dir, meta_name), "r") as meta_info_file:
-        meta_info = json.load(meta_info_file)
-    if meta_info["based_on_oai_llvm_hash"] != oai_info["llvm_hash"]:
-        raise RuntimeError(f"cmake/{meta_name} is based on OAI LLVM {meta_info['based_on_oai_llvm_hash'][:12]} "
-                           f"but cmake/{oai_name} pins {oai_info['llvm_hash'][:12]}; "
-                           "rebuild the Meta LLVM on the new OAI pin")
-    return meta_info
+def _load_info(base_dir: Optional[str], meta_name: str) -> dict:
+    with open(os.path.join(base_dir or bh.get_base_dir(), "cmake", meta_name), "r") as meta_info_file:
+        return json.load(meta_info_file)
 
 
 def load_llvm_info(base_dir: Optional[str] = None) -> dict:
-    return _load_info(base_dir, "llvm-info.json", "meta-llvm-info.json")
+    return _load_info(base_dir, "meta-llvm-info.json")
 
 
 def load_amd_llvm_info(base_dir: Optional[str] = None) -> dict:
-    return _load_info(base_dir, "amd-llvm-info.json", "meta-amd-llvm-info.json")
+    return _load_info(base_dir, "meta-amd-llvm-info.json")
 
 
 def _fork_package(llvm_info: dict, prefix: str, system_suffix: str, **fields: str) -> "bh.Package":
