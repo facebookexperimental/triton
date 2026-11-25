@@ -494,6 +494,27 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     tt.return
   }
 
+  // A zero-initialized accumulator outside any scf.for uses use_acc = false.
+  // CHECK-LABEL: @zero_init_in_while
+  // CHECK: %[[FALSE:.+]] = arith.constant false
+  // CHECK: scf.while
+  // CHECK: ttng.tmem_alloc : ()
+  // CHECK-NEXT: ttng.tc_gen5_mma {{.*}}, %[[FALSE]], %{{.+}}
+  tt.func @zero_init_in_while(%c: i1, %a: !ttg.memdesc<128x128xf16, #mmav5_shared, #mmav5_smem>) {
+    %true = arith.constant true
+    %zero = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #mmav5_blocked>
+    %r = scf.while (%arg = %c) : (i1) -> i1 {
+      scf.condition(%arg) %arg : i1
+    } do {
+    ^bb0(%arg: i1):
+      %acc, %tok = ttng.tmem_alloc %zero : (tensor<128x128xf32, #mmav5_blocked>) -> (!ttg.memdesc<128x128xf32, #mmav5_tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+      %mma = ttng.tc_gen5_mma %a, %a, %acc[%tok], %true, %true : !ttg.memdesc<128x128xf16, #mmav5_shared, #mmav5_smem>, !ttg.memdesc<128x128xf16, #mmav5_shared, #mmav5_smem>, !ttg.memdesc<128x128xf32, #mmav5_tmem, #ttng.tensor_memory, mutable>
+      %result, %load_tok = ttng.tmem_load %acc[%mma] : !ttg.memdesc<128x128xf32, #mmav5_tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #mmav5_blocked>
+      scf.yield %arg : i1
+    }
+    tt.return
+  }
+
   // CHECK-LABEL: @tmem_store_before_mma
   // CHECK: %[[TRUE:.+]] = arith.constant true
   // CHECK: ttng.tmem_store
