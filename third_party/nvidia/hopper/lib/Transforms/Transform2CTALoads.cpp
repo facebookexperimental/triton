@@ -268,9 +268,6 @@ struct Transform2CTALoads
   // B operands (local_alloc / memdesc_trans results) already split by an
   // earlier MMA that shares them.
   DenseSet<Value> splitBOperands;
-  // Descriptor arguments are retyped in place to the half-width block, so all
-  // their 2-CTA B loads, across MMAs, must halve the same descriptor dim.
-  DenseMap<Value, unsigned> hostDescSplitDim;
   // Half-width B allocs written from registers. Each CTA writes its own half,
   // so the MMAs reading them need a cluster-scoped fence.
   DenseSet<Operation *> registerSplitBAllocs;
@@ -286,7 +283,6 @@ struct Transform2CTALoads
       return;
 
     originalDescTypes.clear();
-    hostDescSplitDim.clear();
     moduleOp.walk([&](tt::DescriptorLoadOp descLoad) {
       auto descType = cast<tt::TensorDescType>(descLoad.getDesc().getType());
       originalDescTypes.try_emplace(descLoad.getDesc(), descType);
@@ -645,28 +641,30 @@ struct Transform2CTALoads
     if (!visit(root, splitDim) || loads.empty())
       return failure();
     // A descriptor argument is retyped in place, so it can only be halved
-    // along one dimension.
+    // along one dimension, including by an earlier MMA.
     DenseMap<Value, unsigned> hostDescDim;
     for (auto load : loads) {
       if (load.getDesc().getDefiningOp())
         continue;
-      unsigned descDim =
-          *mapResultDimToDescriptor(originalDescTypes.lookup(load.getDesc()),
-                                    cast<RankedTensorType>(load.getType()),
-                                    splitDimOf.lookup(load.getResult()));
+      auto origDescType = originalDescTypes.lookup(load.getDesc());
+      unsigned descDim = *mapResultDimToDescriptor(
+          origDescType, cast<RankedTensorType>(load.getType()),
+          splitDimOf.lookup(load.getResult()));
       auto [it, inserted] = hostDescDim.try_emplace(load.getDesc(), descDim);
       if (!inserted && it->second != descDim)
         return failure();
-      if (auto prev = hostDescSplitDim.find(load.getDesc());
-          prev != hostDescSplitDim.end() && prev->second != descDim) {
+      auto curDescType = cast<tt::TensorDescType>(load.getDesc().getType());
+      SmallVector<int64_t> halfBlock(origDescType.getBlockType().getShape());
+      halfBlock[descDim] /= 2;
+      if (curDescType != origDescType &&
+          curDescType.getBlockType().getShape() !=
+              ArrayRef<int64_t>(halfBlock)) {
         mma->emitError("2-CTA B shares a host descriptor with another 2-CTA "
                        "MMA that splits it along a different dimension");
         signalPassFailure();
         return failure();
       }
     }
-    for (auto [desc, descDim] : hostDescDim)
-      hostDescSplitDim.try_emplace(desc, descDim);
 
     MLIRContext *ctx = mma->getContext();
     auto halfType = [&](Value v) {
@@ -891,9 +889,10 @@ struct Transform2CTALoads
       // and creates the CuTensorMap with the correct half-width box_dim.
       // This follows the same pattern as Data Partitioning (WSDataPartition).
       auto descVal = descLoad.getDesc();
-      if (auto prev = hostDescSplitDim.find(descVal);
-          prev != hostDescSplitDim.end() &&
-          prev->second != *descriptorSplitDim) {
+      // A register-built B split may already have halved this argument.
+      auto curDescType = cast<tt::TensorDescType>(descVal.getType());
+      if (curDescType != descType && curDescType.getBlockType().getShape() !=
+                                         ArrayRef<int64_t>(newBlockShape)) {
         mma->emitError("2-CTA B shares a host descriptor with another 2-CTA "
                        "MMA that splits it along a different dimension");
         signalPassFailure();
@@ -906,7 +905,6 @@ struct Transform2CTALoads
         signalPassFailure();
         return failure();
       }
-      hostDescSplitDim.try_emplace(descVal, *descriptorSplitDim);
       descVal.setType(newDescType);
       newDesc = descVal;
       // Update the function signature to match.
