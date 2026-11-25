@@ -220,6 +220,9 @@ def ensure_candidate_pr(repo, candidate, platforms, base):
         raise ValueError('Candidate PR requires a full Triton base SHA')
     if github_json(f'repos/{repo}/compare/{base}...main')['status'] not in ('ahead', 'identical'):
         raise ValueError('Candidate baseline is not on main history')
+    for workflow in ('gpu-tests.yml', 'tlx-ops-perf-smoke.yml'):
+        if github_json(f'repos/{repo}/contents/.github/workflows/{workflow}?ref={base}', missing_ok=True) is None:
+            raise ValueError(f'Candidate baseline has no {workflow} to test the PR')
     kind, sha, build = candidate['kind'], candidate['llvm_sha'], int(candidate['build_number'])
     path = 'cmake/meta-amd-llvm-info.json' if kind == 'amd' else 'cmake/meta-llvm-info.json'
     old = read_manifest(repo, path, base)

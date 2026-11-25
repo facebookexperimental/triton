@@ -495,6 +495,8 @@ def test_closed_candidate_is_not_recreated_on_retry(monkeypatch):
         calls.append(kwargs)
         if '/compare/' in path:
             return {'status': 'ahead'}
+        if '/contents/.github/workflows/' in path:
+            return {}
         if '/git/ref/' in path:
             return None
         assert '/pulls?' in path

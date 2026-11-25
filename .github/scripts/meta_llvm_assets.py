@@ -76,7 +76,7 @@ def github_json(path, *, missing_ok=False, paginate=False, method=None, payload=
         if missing_ok and result.stderr.rstrip().endswith('(HTTP 404)'):
             return None
         result.check_returncode()
-    if method == 'DELETE' or not result.stdout.strip():
+    if method == 'DELETE' or (method and not result.stdout.strip()):
         return None
     return json.loads(result.stdout)
 
