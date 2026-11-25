@@ -107,8 +107,12 @@ def _run(x, dy=None, out=None):
                 bm, tpr, vec, warps = (1, 256, 8, 8)
             _softmax[
                 triton.cdiv(m, bm),
-            ](x, dy, out, m, n, x.stride(), sd, out.stride(), bm, bn, warps, tpr, vec, chunks, backward,
-              num_warps=warps, enable_fp_fusion=False)
+            ](
+                x, dy, out, m, n, x.stride(), sd, out.stride(), bm, bn, warps, tpr, vec, chunks, backward,
+                num_warps=warps, enable_fp_fusion=False,
+                # On Hopper, upstream #11478's NVPTX vectorizer raises this kernel's
+                # register use (128 -> 136); SLP keeps the previous order.
+                use_slp_vectorizer=torch.cuda.get_device_capability(x.device)[0] == 9)
         else:
             block = 4096
             splits = triton.cdiv(n, block)
