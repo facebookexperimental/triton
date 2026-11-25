@@ -223,6 +223,25 @@ def verdict(latest):
     return "ready" if all(run["conclusion"] == "success" for run in latest.values()) else "failed"
 
 
+def readiness_text(kind, sha, tree, build, branch, source_url, ready_url, marker):
+    return '\n'.join([
+        marker,
+        '',
+        f'The beta {kind} LLVM bundle is published and all required SDK validations passed.',
+        '',
+        f'- LLVM source: [`{sha[:12]}`](https://github.com/facebookexperimental/llvm-project/commit/{sha}) on `{branch}`.',
+        f'- Source tree: `{tree}`. Packaging revision: `{build}`.',
+        f'- [Source record]({source_url}) and [SDK validation record]({ready_url}).',
+        '',
+        'Triton correctness and A/B performance have not been verified by this SDK build. '
+        'Use a candidate PR to validate the consumer before adoption.',
+        '',
+        'Keep this issue open until the manifest update lands and the exported consumer pin is verified. '
+        'This issue does not authorize landing.',
+        '',
+    ])
+
+
 def candidate_text(kind, old, source, ready_url, base_sha):
     """Draft-candidate text in the updater's Summary/Test Plan format."""
     sha, build = source['llvm_sha'], source['build_number']

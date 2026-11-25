@@ -10,7 +10,7 @@ from urllib.parse import quote
 
 from meta_llvm_assets import (BRANCHES, FORK, bundle_complete, github_json, published_assets, read_json_asset,
                               recover_starters, release_assets, required_platforms, source_record)
-from meta_llvm_bump import candidate_text
+from meta_llvm_bump import candidate_text, readiness_text
 
 REPOSITORY = 'facebookexperimental/triton'
 LABEL = 'llvm-bundle-ready'
@@ -157,7 +157,7 @@ def ensure_issue(repo, candidate, platforms):
     validated = validated_candidate(repo, candidate, platforms)
     if validated is None:
         return 'Candidate superseded before readiness notification'
-    assets, receipt = validated
+    assets, _ = validated
     kind, sha, build = candidate['kind'], candidate['llvm_sha'], int(candidate['build_number'])
     marker = issue_marker(kind, sha, build)
     existing = existing_issue(repo, marker)
@@ -170,19 +170,9 @@ def ensure_issue(repo, candidate, platforms):
                 'Validated LLVM bundle ready for a manifest-update review diff'
             })
     prefix = 'llvm' if kind == 'core' else 'amd-llvm'
-    record = {
-        'schema_version': 1, 'release_line': 'beta', 'kind': kind, 'llvm_repository': FORK, 'llvm_branch':
-        BRANCHES[kind], 'llvm_sha': sha, 'llvm_tree': candidate['llvm_tree'], 'build_number': build, 'source_asset':
-        assets[f'{prefix}-{sha[:8]}-{build}.source.json']['browser_download_url'], 'ready_asset':
-        assets[ready_name(kind, sha, build)]['browser_download_url'], 'build_run': receipt['build_run'],
-        'publication_attempt': receipt['publication_attempt'], 'workflow_sha': receipt['workflow_sha'],
-        'sdk_validation': receipt['sdk_validation']
-    }
-    body = (f'{marker}\n\nThe beta {kind} LLVM bundle is published and its required SDK validations passed.\n\n'
-            'Use this candidate to prepare a manifest-update review diff after verifying the current fbsource '
-            'LLVM sources and consumer test results. This issue does not authorize landing.\n\n'
-            f'```json\n{json.dumps(record, indent=2)}\n```\n\n'
-            'Keep this issue open until the manifest update lands and the exported consumer pin is verified.\n')
+    body = readiness_text(kind, sha, candidate['llvm_tree'], build, BRANCHES[kind],
+                          assets[f'{prefix}-{sha[:8]}-{build}.source.json']['browser_download_url'],
+                          assets[ready_name(kind, sha, build)]['browser_download_url'], marker)
     name, intent = claim_issue_creation(repo, kind, sha, build, marker)
     try:
         return github_json(
