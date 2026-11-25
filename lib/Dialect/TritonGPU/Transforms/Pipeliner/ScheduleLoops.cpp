@@ -1,4 +1,5 @@
 #include "mlir/IR/Dominance.h"
+#include "mlir/IR/Matchers.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/DiscardableAttributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -869,6 +870,101 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
   }
 }
 
+// The barrier array a wait_barrier in `forOp` cycles through, and the number
+// of slots in it: the array the loop indexes with a loop-varying slot. A
+// barrier the loop does not index with a loop-varying value (a single
+// barrier, or a constant index into an array of per-partition barriers) is a
+// ring of one slot. Only memdesc_index chains are followed: a barrier reached
+// through any other view is also treated as a ring of one slot, which makes
+// the check below fire more often, never less.
+static std::pair<Value, int64_t> getWaitedRing(ttng::WaitBarrierOp wait,
+                                               scf::ForOp forOp) {
+  Value alloc = wait.getAlloc();
+  while (auto index = alloc.getDefiningOp<ttg::MemDescIndexOp>()) {
+    Value slot = index.getIndex();
+    if (!matchPattern(slot, m_Constant()) &&
+        forOp.getRegion().isAncestor(slot.getParentRegion()))
+      return {
+          index.getSrc(),
+          cast<ttg::MemDescType>(index.getSrc().getType()).getShape().front()};
+    alloc = index.getSrc();
+  }
+  return {wait.getAlloc(), 1};
+}
+
+// A loop partitioned out of a warp-specialized loop keeps the stages its ops
+// had in the original loop, and pipelining it skews them: in one iteration of
+// the pipelined loop, a load at stage `sL` fetches data for the tile `sL - sW`
+// iterations older than the one a wait at stage `sW` is for. The wait for
+// tile t needs a slot last used R iterations earlier, where R is the reuse
+// distance of its ring: the number of slots divided (rounding down) by the
+// number of slots the loop takes from that ring per iteration. R is 0 when the
+// loop takes more slots per iteration than the ring has (e.g. eight epilogue
+// subtiles on a two-slot ring): the slot is reused within the iteration.
+// Another partition releases the slot, and in the worst case that release
+// needs the data of tile `t - R` from the late load (a chain through more
+// buffers, e.g. two accumulators, needs an older tile, so this is
+// conservative). If `sL - sW > R`, the load has not been issued when the wait
+// blocks, wherever it sits in the loop body, and the partitions can deadlock.
+// `sL - sW == R` can only deadlock if the load also comes after the wait in
+// the body; that case is left pipelined because FA backward relies on it.
+//
+// For example, when the K loop of a persistent GEMM folds away
+// (K <= BLOCK_K), the producer partition holds the operand loads at stage 0
+// and the epilogue (bias) loads at the last stage, and the operand rings have
+// fewer slots than that skew.
+//
+// Limitations: only late loads are checked, not late MMAs or stores. Only ops
+// directly in the loop body are checked, not ops nested in its regions. Slots
+// are told apart by the barrier Value waited on: one slot reached through two
+// memdesc_index ops counts twice (the check fires more often), while a slot
+// counter that advances several slots through one Value per iteration counts
+// once (the check can miss a hang). The check is local to one partition: it
+// does not see skews that are each within bounds in several partitions but
+// add up along a release chain between them.
+//
+// TODO: replace this with a dependency-aware check that follows each slot's
+// release through the other partitions.
+static bool
+isPartitionLoadSkewWithinRingReuse(scf::ForOp forOp,
+                                   const CoarseSchedule &schedule,
+                                   ArrayRef<Operation *> latencyOps) {
+  SmallVector<Operation *> loads;
+  SmallVector<std::pair<ttng::WaitBarrierOp, std::pair<Value, int64_t>>> waits;
+  for (Operation *op : latencyOps) {
+    if (!schedule.contains(op))
+      continue;
+    if (isa<LoadOp, DescriptorLoadLikeOpInterface, AsyncCopyGlobalToLocalOp,
+            ttng::TMALoadLikeOpInterface>(op))
+      loads.push_back(op);
+    else if (auto wait = dyn_cast<ttng::WaitBarrierOp>(op))
+      waits.push_back({wait, getWaitedRing(wait, forOp)});
+  }
+  if (loads.empty())
+    return true;
+
+  // Slots taken from each ring per iteration: the distinct slots waited on.
+  DenseMap<Value, DenseSet<Value>> slotsPerRing;
+  for (auto &[wait, ring] : waits)
+    slotsPerRing[ring.first].insert(wait.getAlloc());
+
+  for (auto &[wait, ring] : waits) {
+    int64_t reuse =
+        ring.second / static_cast<int64_t>(slotsPerRing[ring.first].size());
+    int waitStage = schedule.find(wait)->second.first;
+    for (Operation *load : loads) {
+      int skew = schedule.find(load)->second.first - waitStage;
+      if (skew > reuse) {
+        LDBG("partition load stage skew " << skew << " vs ring reuse distance "
+                                          << reuse << " at " << *wait
+                                          << "; not pipelining partition");
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 // Get an initial schedule for the loop. This is the base schedule from which
 // the rest of the pass will backward propagate dependencies.
 CoarseSchedule getInitialSchedule(scf::ForOp forOp,
@@ -904,15 +1000,19 @@ CoarseSchedule getInitialSchedule(scf::ForOp forOp,
     // don't need to pipeline the loop. Return a new schedule with everything
     // assigned to the same stage.
     DenseSet<int> latencyStages;
+    SmallVector<Operation *> latencyOps;
     auto ops = forOp.getBody()->without_terminator();
     for (Operation &op : llvm::make_filter_range(ops, isLatencyOp)) {
+      latencyOps.push_back(&op);
       // FIXME: This should assert all latency ops have an assigned stage.
       if (schedule.contains(&op))
         latencyStages.insert(schedule[&op].first);
       else if (useMetaWS)
         assert(false);
     }
-    if (latencyStages.size() <= 1) {
+    if (latencyStages.size() <= 1 ||
+        (useMetaWS &&
+         !isPartitionLoadSkewWithinRingReuse(forOp, schedule, latencyOps))) {
       CoarseSchedule normalized(/*numStages=*/1);
       auto cluster = normalized.clusters.newAtFront();
       for (Operation &op : ops)
