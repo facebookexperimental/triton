@@ -210,10 +210,8 @@ table.l1l2{table-layout:fixed}table.l1l2 th:first-child{width:90px}table.l1l2 tr
 
 <section id="llvm" role="tabpanel" hidden>
 <div class="shead"><h2>LLVM pins</h2><span class="q" id="l-q">Which LLVM does the branch build against, and is a newer one waiting?</span><span class="owner">Owner: LLVM release owners</span></div>
-<div class="card"><h3>LLVM release</h3><div class="grid2" id="l-current"></div></div>
-<div class="card"><h3>Upgrade</h3><div id="l-status" style="font-size:14px"></div></div>
-<div class="card"><h3>Pin updates, newest first</h3><div id="l-history"></div>
-<p class="note">Each row is a commit that moved <code>cmake/meta-llvm-info.json</code> to a new LLVM release, with a link to the fork commits it added over the previous pin (over the upstream pin for the first).</p></div>
+<div id="l-pins"></div>
+<p class="note">Each pin follows a branch of the LLVM fork. For main, the hourly <code>meta-llvm-branch-bundles.yml</code> run builds and validates a bundle for each new tip, opens a draft candidate PR that updates the pin, starts its GPU tests and perf smoke, and files a readiness issue for oncall.</p>
 </section>
 
 <p class="muted" style="margin-top:28px">Rebuilt every 15 minutes from GitHub Actions data by <code>.github/scripts/ci_health.py</code>; the rules are in <code>ci_health_rules.py</code>. Raw data: the <code>ci-health</code> release. Computed data: <a href="data.json">data.json</a>.</p>
@@ -554,29 +552,36 @@ function renderSanitizer(data){
 
 const LLVM_REPO="https://github.com/facebookexperimental/llvm-project";
 function renderLLVM(u,branch){
-  const tag=t=>t?`<code>${esc(t)}</code>`:`<span class="na">–</span>`;
   const forkSha=h=>h?`<a href="${LLVM_REPO}/commit/${h}"><code>${esc(h.slice(0,12))}</code></a>`:"–";
   const forkPR=c=>c.pr?`<a href="${LLVM_REPO}/pull/${c.pr}">#${c.pr}</a> `:`${forkSha(c.sha)} `;
-  const changes=cs=>cs==null?`<span class="muted">first pin</span>`:cs.length?cs.map(c=>`${forkPR(c)}${esc(c.title.slice(0,90))}`).join("<br>"):`<span class="muted">no fork changes</span>`;
-  const p=u.pinned,n=u.newest,since=(u.history||[]).find(h=>p&&h.tag===p.tag);
-  $("l-q").textContent=`Which LLVM does ${branch} build against, and is a newer one waiting?`;
   const compare=(from,to,text)=>`<a href="${LLVM_REPO}/compare/${esc(from)}...${esc(to)}"><code>${esc(text)}</code></a>`;
-  $("l-current").innerHTML=p?tile("Pinned (<code>cmake/meta-llvm-info.json</code>)",tag(p.tag),`${forkSha(p.llvm_hash)} on ${compare(u.fork_branch+"_upstream_pin",p.llvm_hash,u.fork_branch)}`+
-    (since?`<br>pinned ${esc(since.t.slice(0,10))} by ${since.pr?pr(since.pr):sha(since.sha)} · ${ago(since.t)}`:""))+
-    tile(`Newest on <code>${esc(u.fork_branch)}</code>`,n?tag(n.tag):"–",!n?"no release built yet":u.status==="current"?"same as pinned"
-      :`${forkSha(n.llvm_hash)} · ${compare(p.llvm_hash,n.llvm_hash,"changes since pinned")}<br>published ${esc((n.published_at||"").slice(0,10))} · ${ago(n.published_at)}`,u.status==="new"?"warn":""):`<p class="empty">No LLVM pin data collected yet.</p>`;
-  // Is a newer release waiting, and where is its upgrade?
-  const issues=(u.issues||[]).map(i=>`<a href="${esc(i.url)}">#${i.number}</a> ${esc(i.title)} <span class="muted">${ago(i.created_at)}</span>`).join("<br>");
-  const upgrade=u.pr?`<span style="font-weight:620">Upgrade PR:</span> ${pr(u.pr.number)} ${esc(u.pr.title)} <span class="muted">${who(u.pr.author)} · opened ${ago(u.pr.created_at)}</span>`+(issues?`<br><span class="muted">Tracking issue:</span> ${issues}`:"")
-    :issues?`<span style="font-weight:620">Upgrade PR:</span> not opened yet; open it from the command in ${issues}`
-    :`<span style="font-weight:620">Upgrade PR:</span> <span class="muted">none yet; the bump bot files an issue once the new release passes GPU tests.</span>`;
   const sub=html=>`<div style="margin-top:10px;font-size:13px">${html}</div>`;
-  if(u.status==="current"){$("l-status").innerHTML=`<b class="ok">✓ Up to date.</b> ${tag(p.tag)} is the newest release of <code>${esc(u.fork_branch)}</code>.`+(u.pr||issues?sub(upgrade):"");badge("b-llvm","✓","ok")}
-  else if(u.status==="new"){$("l-status").innerHTML=`<b class="warn">● New LLVM available:</b> ${tag(n.tag)}, published ${ago(n.published_at)}.`+
-    (u.pending&&u.pending.length?sub(`It adds ${u.pending.length} fork change${u.pending.length>1?"s":""}:<br>${changes(u.pending)}`):"")+sub(upgrade);badge("b-llvm","● new","warn")}
-  else{$("l-status").innerHTML=`<span class="na">No LLVM pin data collected yet.</span>`;badge("b-llvm","–","na")}
-  const cmp=h=>{const from=h.prev_hash||`${u.fork_branch}_upstream_pin`;return `<a href="${LLVM_REPO}/compare/${esc(from)}...${esc(h.llvm_hash)}"><code>${esc(h.prev_hash?h.prev_hash.slice(0,8):"upstream pin")}...${esc(h.llvm_hash.slice(0,8))}</code></a>`};
-  $("l-history").innerHTML=table(["Date","Triton PR","LLVM release","LLVM changes"],(u.history||[]).map(h=>[esc(h.t.slice(0,10)),h.pr?pr(h.pr):sha(h.sha),tag(h.tag),cmp(h)]));
+  $("l-q").textContent=`Which LLVM does ${branch} build against, and is a newer one waiting?`;
+  if(u.status==="unknown"){$("l-pins").innerHTML=`<div class="card"><p class="empty">No LLVM pin data collected yet.</p></div>`;badge("b-llvm","–","na");return}
+  $("l-pins").innerHTML=u.pins.map(p=>{
+    const name=p.kind==="amd"?"AMD codegen LLVM":"Core LLVM",pin=p.pinned,tip=p.tip.sha,c=p.change;
+    const since=(p.history||[]).find(h=>h.llvm_hash===pin.llvm_hash);
+    const tiles=tile(`Pinned (<code>${esc(p.path)}</code>)`,forkSha(pin.llvm_hash),`packaging revision ${esc(pin.build??"–")}`+
+        (since?`<br>pinned ${esc(since.t.slice(0,10))} by ${since.pr?pr(since.pr):sha(since.sha)} · ${ago(since.t)}`:""))+
+      tile(`Tip of <code>${esc(p.fork_branch)}</code>`,forkSha(tip),!c?"same as pinned":`${compare(pin.llvm_hash,tip,"changes since pinned")}`+(p.automated?`<br>bundle ${p.tip.ready?"validated and published":"not published yet"}`:""),c?"warn":"");
+    let status;
+    if(!c)status=`<b class="ok">✓ Up to date.</b> The pin is the tip of <code>${esc(p.fork_branch)}</code>.`;
+    else{
+      const list=c.commits.length?"<br>"+c.commits.map(x=>`${forkPR(x)}${esc(x.title.slice(0,90))}`).join("<br>"):"";
+      const what=c.status==="ahead"?`It adds ${c.commits.length} fork change${c.commits.length===1?"":"s"} on the same LLVM base:${list}`
+        :c.status==="diverged"?`It moves to a new LLVM base. Meta changes on the new branch:${list}`
+        :c.status==="behind"?"It rolls the fork branch back.":"The LLVM source is the same.";
+      const next=p.pr?`<span style="font-weight:620">Candidate PR:</span> <a href="${esc(p.pr.url)}">#${p.pr.number}</a> ${esc(p.pr.title)} <span class="muted">${p.pr.draft?"draft · ":""}opened ${ago(p.pr.created_at)}</span>`+
+          (p.issue?`<br><span class="muted">Oncall issue:</span> <a href="${esc(p.issue.url)}">#${p.issue.number}</a> ${esc(p.issue.title)}`:"")
+        :!p.automated?`<span class="muted">Candidate PRs are opened for main only; update this pin by hand.</span>`
+        :p.tip.ready?`<span class="muted">The bundle is ready; the next hourly run opens the candidate PR.</span>`
+        :`<span class="muted">The hourly run builds and validates the bundle, then opens the candidate PR.</span>`;
+      status=`<b class="warn">● New LLVM on <code>${esc(p.fork_branch)}</code>:</b> ${forkSha(tip)}.`+sub(what)+sub(next)}
+    const cmp=h=>h.prev_hash?compare(h.prev_hash,h.llvm_hash,`${h.prev_hash.slice(0,8)}...${h.llvm_hash.slice(0,8)}`):`<span class="muted">first pin</span>`;
+    const hist=table(["Date","Triton PR","LLVM","Build","LLVM changes"],(p.history||[]).map(h=>[esc(h.t.slice(0,10)),h.pr?pr(h.pr):sha(h.sha),forkSha(h.llvm_hash),esc(h.build??""),cmp(h)]));
+    return `<div class="card"><h3>${name}</h3><div class="grid2">${tiles}</div><div style="font-size:14px;margin-top:12px">${status}</div>`+
+      `<details style="margin-top:12px"><summary>Pin updates, newest first</summary>${hist}</details></div>`}).join("");
+  if(u.status==="current")badge("b-llvm","✓","ok");else badge("b-llvm","● new","warn");
 }
 
 // The page shows one tracked branch at a time, picked with the chips above the tabs.

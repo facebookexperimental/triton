@@ -32,13 +32,15 @@ Records of mi350/b200/h100.yml from before #3875 may remain in the store; the
 rules ignore them.
 
 bump.json, rewritten whole by each collection:
-  {lines: {<tracked branch>: {fork_branch, pinned: {tag, llvm_hash} | null,
-   newest: {tag, llvm_hash, published_at} | null, pending: [fork change],
-   pr: {number, title, url, author, created_at} | null, issues: [{number, title, url, created_at}],
-   history: [{sha, t, title, pr, tag, llvm_hash, prev_hash | null}]}}}
-  fork change: {sha, title, pr}, a fork commit with its fork PR number. pending is
-  what newest adds over pinned; history is the pin's last changes on the branch,
-  newest first, each with the llvm_hash it replaced (null for the first pin).
+  {lines: {<tracked branch>: {pins: [pin]}}}
+  pin: {kind, path, fork_branch, automated, pinned: {llvm_hash, build} | null,
+   tip: {sha, ready}, change: {status, commits: [fork change]} | null,
+   pr: {number, title, url, draft, created_at} | null, issue: {number, title, url, created_at} | null,
+   history: [{sha, t, title, pr, llvm_hash, build, prev_hash | null}]}
+  kind is core or amd and path its manifest. tip is the fork branch head and ready whether its bundle is published.
+  change is how tip moved from the pin (meta_llvm_bump.llvm_changes); pr and issue are the open candidate PR and
+  readiness issue for tip. automated pins get them from meta-llvm-branch-bundles.yml. history is the pin's last
+  changes on the branch, newest first, each with the llvm_hash it replaced (null for the first pin).
 """
 import argparse
 import base64
@@ -75,9 +77,13 @@ STUCK_DAYS = 7
 COLLECT = ("gpu-tests.yml", "gpu-tests-nightly.yml", rules.BENCH_WF, "nightly-fbtriton.yml", rules.LIT_WF,
            rules.FAST_WF, sanitizer.WORKFLOW)
 FORK = "facebookexperimental/llvm-project"
-#: Fork branch each tracked branch's cmake/meta-llvm-info.json follows, as in meta-llvm-update.yml.
-FORK_BRANCHES = {"main": "triton_beta", "release/3.8.x": "triton_3.8.x"}
-META_PATH = "cmake/meta-llvm-info.json"
+#: The LLVM pins of each tracked branch: (kind, manifest, fork branch). meta-llvm-branch-bundles.yml builds bundles
+#: and opens candidate PRs for main's pins only.
+PINS = {
+    "main": [("core", "cmake/meta-llvm-info.json", "triton_beta"),
+             ("amd", "cmake/meta-amd-llvm-info.json", "fbtriton-beta-amd-codegen")],
+    "release/3.8.x": [("core", "cmake/meta-llvm-info.json", "triton_3.8.x")],
+}
 #: Pin changes listed per branch.
 PIN_HISTORY = 6
 
@@ -405,13 +411,13 @@ def _q(ref):
     return urllib.parse.quote(ref, safe="")
 
 
-def _meta(get, ref):
+def _meta(get, ref, path):
     try:
-        data = get(f"repos/{REPO}/contents/{META_PATH}?ref={_q(ref)}")
-    except subprocess.CalledProcessError:  # no cmake/meta-llvm-info.json at ref
+        data = get(f"repos/{REPO}/contents/{path}?ref={_q(ref)}")
+    except subprocess.CalledProcessError:  # no manifest at ref
         return None
     meta = json.loads(base64.b64decode(data["content"]))
-    return {"tag": meta["release_base_url"].rsplit("/", 1)[-1], "llvm_hash": meta["llvm_hash"]}
+    return {"llvm_hash": meta["llvm_hash"], "build": meta.get("build_number")}
 
 
 def _pr_of(title):
@@ -419,46 +425,29 @@ def _pr_of(title):
     return (title[:m.start()], int(m.group(1))) if m else (title, None)
 
 
-def fork_changes(get, old, new):
-    """The fork commits new adds over old, oldest first, without ShipIt's empty sync commits; None if unknown."""
-    try:
-        commits = get(f"repos/{FORK}/compare/{old}...{new}")["commits"]
-    except subprocess.CalledProcessError:
-        return None
-    out = []
-    for c in commits:
-        title, pr = _pr_of(c["commit"]["message"].splitlines()[0])
-        if not title.startswith("fbshipit-source-id:"):
-            out.append({"sha": c["sha"], "title": title, "pr": pr})
-    return out
-
-
-def snapshot_line(get, target, fork_branch, releases, issues):
-    """One tracked branch's Meta LLVM pin: what it pins, the newest fork release it could take and what that adds,
-    the open bump PR and issues, and the pin's recent changes."""
-    pinned = _meta(get, target)
-    commits = get(f"repos/{FORK}/commits?sha={_q(fork_branch)}&per_page=30")
-    release = mlb.release_for(mlb.same_tree_chain([(c["sha"], c["commit"]["tree"]["sha"]) for c in commits]), releases)
-    newest = {
-        "tag": release["tag_name"], "llvm_hash": release["target_commitish"], "published_at":
-        release.get("published_at")
-    } if release else None
-    pending = []
-    if pinned and newest and pinned["tag"] != newest["tag"]:
-        pending = fork_changes(get, pinned["llvm_hash"], newest["llvm_hash"]) or []
-    branch = mlb.bot_branch_for(target)
-    prs = get(f"repos/{REPO}/pulls?head={REPO.split('/')[0]}:{_q(branch)}&state=open")
-    pr = {
-        "number": prs[0]["number"], "title": prs[0]["title"], "url": prs[0]["html_url"], "author":
-        prs[0]["user"]["login"], "created_at": prs[0].get("created_at")
-    } if prs else None
-    marker = mlb.issue_marker(target)
-    open_issues = [{"number": i["number"], "title": i["title"], "url": i["html_url"], "created_at": i["created_at"]}
-                   for i in issues
-                   if i["state"] == "open" and marker in (i.get("body") or "")]
-    # The pin's changes: commits that touched the file and moved llvm_hash, each with the hash it replaced.
-    touched = get(f"repos/{REPO}/commits?sha={_q(target)}&path={META_PATH}&per_page={PIN_HISTORY + 1}")
-    metas = [_meta(get, c["sha"]) for c in touched]
+def snapshot_pin(get, target, kind, path, fork_branch, ready, pulls, issues):
+    """One LLVM pin of a tracked branch: what it pins, where its fork branch is, how that moved and what is proposing
+    it, and the pin's recent changes."""
+    pinned = _meta(get, target, path)
+    tip = get(f"repos/{FORK}/branches/{_q(fork_branch)}")["commit"]["sha"]
+    prefix = "llvm" if kind == "core" else "amd-llvm"
+    change = None
+    if pinned and pinned["llvm_hash"] != tip:
+        status, commits = mlb.llvm_changes(get(f"repos/{FORK}/compare/{pinned['llvm_hash']}...{tip}"))
+        change = {"status": status, "commits": [dict(zip(("title", "pr"), _pr_of(t)), sha=c) for c, t in commits]}
+    pr = next(({
+        "number": p["number"], "title": p["title"], "url": p["html_url"], "draft": p["draft"], "created_at":
+        p["created_at"]
+    }
+               for p in pulls
+               if p["base"]["ref"] == target and p["head"]["ref"].startswith(f"scratch/llvm-canary/{kind}-{tip[:8]}-")),
+              None)
+    issue = next(({"number": i["number"], "title": i["title"], "url": i["html_url"], "created_at": i["created_at"]}
+                  for i in issues
+                  if f"<!-- llvm-bundle-ready beta/{kind}/{tip}/" in (i.get("body") or "")), None)
+    # The pin's changes: commits that touched the manifest and moved llvm_hash, each with the hash it replaced.
+    touched = get(f"repos/{REPO}/commits?sha={_q(target)}&path={path}&per_page={PIN_HISTORY + 1}")
+    metas = [_meta(get, c["sha"], path) for c in touched]
     history = []
     for i, c in enumerate(touched):
         before = metas[i + 1] if i + 1 < len(touched) else None
@@ -466,23 +455,31 @@ def snapshot_line(get, target, fork_branch, releases, issues):
             continue
         title, pr_number = _pr_of(c["commit"]["message"].splitlines()[0])
         history.append({
-            "sha": c["sha"], "t": c["commit"]["committer"]["date"], "title": title, "pr": pr_number, "tag":
-            metas[i]["tag"], "llvm_hash": metas[i]["llvm_hash"], "prev_hash": before["llvm_hash"] if before else None
+            "sha": c["sha"], "t": c["commit"]["committer"]["date"], "title": title, "pr": pr_number, "llvm_hash":
+            metas[i]["llvm_hash"], "build": metas[i]["build"], "prev_hash": before["llvm_hash"] if before else None
         })
     return {
-        "fork_branch": fork_branch, "pinned": pinned, "newest": newest, "pending": pending, "pr": pr, "issues":
-        open_issues, "history": history[:PIN_HISTORY]
+        "kind": kind, "path": path, "fork_branch": fork_branch, "automated": target == "main", "pinned": pinned, "tip":
+        {"sha": tip, "ready": any(n.startswith(f"{prefix}-{tip[:8]}-") for n in ready)}, "change": change, "pr": pr,
+        "issue": issue, "history": history[:PIN_HISTORY]
     }
 
 
-def snapshot_bumps(get):
-    releases = get(f"repos/{FORK}/releases?per_page=100")
-    q = urllib.parse.quote(f'repo:{REPO} is:issue is:open in:title "[Meta LLVM]"')
-    issues = get(f"search/issues?q={q}&sort=created&order=desc&per_page=50")["items"]
+def snapshot_bumps(get, api):
+    release = get(f"repos/{REPO}/releases/tags/meta-llvm")
+    ready = [
+        a["name"]
+        for page in api(f"repos/{REPO}/releases/{release['id']}/assets?per_page=100")
+        for a in page
+        if a["name"].endswith(".ready.json")
+    ]
+    pulls = [p for page in api(f"repos/{REPO}/pulls?state=open&per_page=100") for p in page]
+    issues = [i for page in api(f"repos/{REPO}/issues?labels=llvm-bundle-ready&state=open&per_page=100") for i in page]
     return {
         "lines": {
-            t: snapshot_line(get, t, fb, releases, issues)
-            for t, fb in FORK_BRANCHES.items()
+            t: {"pins": [snapshot_pin(get, t, *pin, ready, pulls, issues)
+                         for pin in pins]}
+            for t, pins in PINS.items()
             if t in rules.TRACKED_BRANCHES
         }
     }
@@ -625,7 +622,7 @@ def collect(data_dir, since, now, api=gh_api, text=gh_text, get=gh_get, download
     # A failed snapshot keeps the previous bump.json, so the rest of the page still updates.
     try:
         bump_path = os.path.join(data_dir, "bump.json")
-        if _write_if_changed(bump_path, snapshot_bumps(get)):
+        if _write_if_changed(bump_path, snapshot_bumps(get, api)):
             changed.append(bump_path)
     except (subprocess.CalledProcessError, KeyError, ValueError) as exc:
         print(f"warning: no Meta LLVM bump snapshot ({exc})")

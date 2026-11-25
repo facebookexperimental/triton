@@ -245,22 +245,29 @@ def readiness_text(kind, sha, tree, build, branch, source_url, ready_url, marker
     ])
 
 
-def llvm_change_lines(fork, old_sha, new_sha, compare):
-    """The LLVM change from the current pin: new commits on the same base, a rollback, or the Meta changes carried onto
-    a new base."""
-    if compare['status'] == 'identical':
-        return ['The LLVM source is unchanged; only the packaging revision changes.']
-    link = f'[LLVM changes since the current pin]({compare_url(fork, old_sha, new_sha)})'
-    if compare['status'] == 'behind':
-        return [f"{link} roll back {compare['behind_by']} commits."]
-    commits = [(c['sha'], c['commit']['message'].split('\n')[0].strip()) for c in compare['commits']]
-    if compare['status'] == 'ahead':
-        head = f'{link}, on the same LLVM base:'
-    else:
-        head = f'{link} move to a new LLVM base. Meta changes on the new branch:'
+def llvm_changes(compare):
+    """How the LLVM source moved from the pin, and the commits that show it: every new commit on the same base, only
+    the Meta changes on a new base, and none for a rollback or a rebuild of the same commit."""
+    status = compare['status']
+    commits = [(c['sha'], c['commit']['message'].split('\n')[0].strip())
+               for c in compare['commits']] if status in ('ahead', 'diverged') else []
+    commits = [(sha, title) for sha, title in commits if not title.startswith('fbshipit-source-id:')]
+    if status == 'diverged':
         commits = [(sha, title)
                    for sha, title in commits
                    if title.lower().startswith('[triton') and 'Vendor LLVM' not in title and 'Prune' not in title]
+    return status, commits
+
+
+def llvm_change_lines(fork, old_sha, new_sha, compare):
+    status, commits = llvm_changes(compare)
+    if status == 'identical':
+        return ['The LLVM source is unchanged; only the packaging revision changes.']
+    link = f'[LLVM changes since the current pin]({compare_url(fork, old_sha, new_sha)})'
+    if status == 'behind':
+        return [f"{link} roll back {compare['behind_by']} commits."]
+    head = (f'{link}, on the same LLVM base:'
+            if status == 'ahead' else f'{link} move to a new LLVM base. Meta changes on the new branch:')
     return [head, '', *[_fork_change(fork, sha, title) for sha, title in commits]]
 
 

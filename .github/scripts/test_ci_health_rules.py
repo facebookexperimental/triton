@@ -623,12 +623,14 @@ def test_step_grid_has_no_rows_for_a_gpu_without_results():
     assert v["steps"]["MI350"] == []
 
 
-def test_bump_status_compares_the_pin_with_the_newest_release():
-    line = {"pinned": {"tag": "llvm-aaaaaaaa-1"}, "newest": {"tag": "llvm-bbbbbbbb-1"}}
-    assert r.bump_view(line)["status"] == "new"
-    assert r.bump_view({**line, "newest": {"tag": "llvm-aaaaaaaa-1"}})["status"] == "current"
+def test_bump_status_is_new_while_any_pin_is_behind_its_tip():
+    current = {"pinned": {"llvm_hash": "a"}, "change": None}
+    behind = {"pinned": {"llvm_hash": "a"}, "change": {"status": "ahead", "commits": []}}
+    assert r.bump_view({"pins": [current, current]})["status"] == "current"
+    assert r.bump_view({"pins": [current, behind]})["status"] == "new"
     assert r.bump_view(None)["status"] == "unknown"
-    assert r.page_data([], stamp(23), {}, {"lines": {"main": line}})["branches"]["main"]["bump"]["status"] == "new"
+    assert r.page_data([], stamp(23), {},
+                       {"lines": {"main": {"pins": [behind]}}})["branches"]["main"]["bump"]["status"] == "new"
 
 
 def lit(h, *failing, build=False, conclusion=None, branch="main"):

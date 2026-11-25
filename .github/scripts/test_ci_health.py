@@ -713,8 +713,8 @@ def fake_get(responses):
     return get
 
 
-def meta_file(tag, llvm_hash):
-    body = json.dumps({"llvm_hash": llvm_hash, "release_base_url": f"https://x/download/{tag}"})
+def meta_file(llvm_hash, build=1):
+    body = json.dumps({"llvm_hash": llvm_hash, "build_number": build})
     return {"content": base64.b64encode(body.encode()).decode()}
 
 
@@ -726,27 +726,26 @@ T, F = "repos/facebookexperimental/triton", "repos/facebookexperimental/llvm-pro
 A, B, C = "a" * 40, "b" * 40, "c" * 40
 
 
-def test_snapshot_line_reads_pin_pending_changes_issues_and_history():
+def test_snapshot_pin_reads_pin_tip_change_proposal_and_history():
     get = fake_get({
         f"{T}/contents/cmake/meta-llvm-info.json?ref=main":
-        meta_file("llvm-bbbbbbbb-1", B),
+        meta_file(B),
         f"{T}/contents/cmake/meta-llvm-info.json?ref={'2' * 40}":
-        meta_file("llvm-bbbbbbbb-1", B),
+        meta_file(B),
         f"{T}/contents/cmake/meta-llvm-info.json?ref={'1' * 40}":
-        meta_file("llvm-aaaaaaaa-1", A),
-        f"{F}/commits?sha=triton_beta": [{"sha": C, "commit": {"tree": {"sha": "t"}}}],
+        meta_file(A),
+        f"{F}/branches/triton_beta": {"commit": {"sha": C}},
         f"{F}/compare/{B}...{C}": {
-            "commits": [
+            "status":
+            "ahead", "commits": [
                 fork_commit("s" * 40, "fbshipit-source-id: 48d598b00a9b"),
                 fork_commit("d" * 40, "[triton/beta] Backport VOPD fix (#18)")
             ]
         },
-        f"{T}/pulls?head=":
-        [{"number": 4282, "title": "[Meta LLVM] Bump main", "html_url": "p", "user": {"login": "me"}}],
         f"{T}/commits?sha=main&path=cmake/meta-llvm-info.json": [
             {
                 "sha": "2" * 40, "commit": {
-                    "message": "[Meta LLVM] Bump main to llvm-bbbbbbbb-1 (#4300)", "committer":
+                    "message": "[Meta LLVM] core bundle candidate: aaaaaaaa to bbbbbbbb (#4300)", "committer":
                     {"date": "2026-10-20T00:00:00Z"}
                 }
             },
@@ -756,24 +755,22 @@ def test_snapshot_line_reads_pin_pending_changes_issues_and_history():
             },
         ],
     })
-    releases = [{"tag_name": "llvm-cccccccc-1", "target_commitish": C, "published_at": "2026-10-21T00:00:00Z"}]
-    issues = [
-        {
-            "number": 7, "title": "[Meta LLVM] Bump ready: main", "state": "open", "html_url": "i7", "created_at":
-            "2026-10-21T02:00:00Z", "body": "<!-- meta-llvm-bump main -->"
-        },
-        {
-            "number": 8, "title": "[Meta LLVM] Bump ready: release/3.8.x", "state": "open", "html_url": "i8",
-            "created_at": "2026-10-21T02:00:00Z", "body": "<!-- meta-llvm-bump release/3.8.x -->"
-        },
-    ]
-    line = ch.snapshot_line(get, "main", "triton_beta", releases, issues)
-    assert line["pinned"] == {"tag": "llvm-bbbbbbbb-1", "llvm_hash": B}
-    assert line["newest"]["tag"] == "llvm-cccccccc-1"
-    assert line["pending"] == [{"sha": "d" * 40, "title": "[triton/beta] Backport VOPD fix", "pr": 18}]
-    assert line["pr"]["number"] == 4282 and [i["number"] for i in line["issues"]] == [7]
-    assert [(h["pr"], h["tag"]) for h in line["history"]] == [(4300, "llvm-bbbbbbbb-1"), (4122, "llvm-aaaaaaaa-1")]
-    assert [(h["prev_hash"], h["llvm_hash"]) for h in line["history"]] == [(A, B), (None, A)]
+    pulls = [{
+        "number": n, "title": "candidate", "html_url": f"p{n}", "draft": True, "created_at": "2026-10-21T01:00:00Z",
+        "base": {"ref": "main"}, "head": {"ref": ref}
+    } for n, ref in ((5, f"scratch/llvm-canary/amd-{C[:8]}-1"), (6, f"scratch/llvm-canary/core-{C[:8]}-1"))]
+    issues = [{
+        "number": n, "title": "ready", "html_url": f"i{n}", "created_at": "2026-10-21T02:00:00Z", "body":
+        f"<!-- llvm-bundle-ready beta/{kind}/{C}/1 -->"
+    } for n, kind in ((7, "amd"), (8, "core"))]
+    pin = ch.snapshot_pin(get, "main", "core", "cmake/meta-llvm-info.json", "triton_beta",
+                          [f"llvm-{C[:8]}-1.ready.json"], pulls, issues)
+    assert pin["pinned"] == {"llvm_hash": B, "build": 1} and pin["tip"] == {"sha": C, "ready": True}
+    assert pin["change"] == {
+        "status": "ahead", "commits": [{"sha": "d" * 40, "title": "[triton/beta] Backport VOPD fix", "pr": 18}]
+    }
+    assert pin["pr"]["number"] == 6 and pin["issue"]["number"] == 8
+    assert [(h["pr"], h["llvm_hash"], h["prev_hash"]) for h in pin["history"]] == [(4300, B, A), (4122, A, None)]
 
 
 def test_failed_snapshot_keeps_the_previous_bump_json(tmp_path):
