@@ -68,19 +68,143 @@ def _decode_fp6(codes, ebits, bias):
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
 @pytest.mark.parametrize("space", ["heuristic", "full"])
-def test_mm_mxfp6_gfx950_ones(space):
-    from triton.tlx import ops
+@pytest.mark.parametrize("a_format", ["e2m3", "e3m2"])
+@pytest.mark.parametrize("b_format", ["e2m3", "e3m2"])
+def test_mm_mxfp6_gfx950_ones(space, a_format, b_format):
+    from triton.tlx.ops.kernels.mm_mxfp6.gfx950 import mm_mxfp6
 
     device = "cuda"
     M = N = K = 128
     # E2M3 code 8 and E3M2 code 12 both decode to 1.0; E8M0 127 is 1.0.
-    a = _packed_ones(M, K, 8, device)
-    b = _packed_ones(N, K, 12, device)
+    a = _packed_ones(M, K, 8 if a_format == "e2m3" else 12, device)
+    b = _packed_ones(N, K, 8 if b_format == "e2m3" else 12, device)
     scales_a = torch.full((M, K // 32), 127, dtype=torch.uint8, device=device).view(torch.float8_e8m0fnu)
     scales_b = torch.full((N, K // 32), 127, dtype=torch.uint8, device=device).view(torch.float8_e8m0fnu)
-    out = ops.mm_mxfp6(a, scales_a, b, scales_b, space=space)
+    out = mm_mxfp6(a, scales_a, b, scales_b, space=space, a_format=a_format, b_format=b_format)
     assert out.dtype == torch.bfloat16
     torch.testing.assert_close(out.float(), torch.full((M, N), float(K), device=device))
+
+
+@pytest.mark.parametrize("split_k", [0, 3, 32])
+def test_mm_mxfp6_gfx950_rejects_invalid_split_k(split_k):
+    from triton.tlx.ops.kernels.mm_mxfp6.gfx950 import mm_mxfp6
+
+    a = torch.zeros((128, 128), dtype=torch.uint8)
+    scales = torch.zeros((128, 4), dtype=torch.float8_e8m0fnu)
+    with pytest.raises(ValueError, match="split_k must"):
+        mm_mxfp6(a, scales, a, scales, split_k=split_k)
+    with pytest.raises(ValueError, match="not exceed"):
+        mm_mxfp6(a, scales, a, scales, split_k=2)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
+@pytest.mark.parametrize("M,N,K,split_k", [
+    (256, 256, 192, 1),
+    (256, 256, 512, 1),
+    (256, 256, 640, 1),
+    (256, 256, 192, 2),
+    (256, 256, 640, 4),
+    (256, 256, 896, 2),
+    (256, 256, 6144, 4),
+    (256, 256, 16128, 8),
+    (128, 256, 640, 4),
+    (256, 128, 896, 2),
+])
+@pytest.mark.parametrize("space", ["heuristic", "full"])
+@pytest.mark.parametrize("a_format", ["e2m3", "e3m2"])
+@pytest.mark.parametrize("b_format", ["e2m3", "e3m2"])
+def test_mm_mxfp6_gfx950_split_k_random(M, N, K, split_k, space, a_format, b_format):
+    from triton.tlx.ops.kernels.mm_mxfp6.gfx950 import mm_mxfp6
+
+    if space == "full" and K % 128:
+        pytest.skip("full configs require K=128 tiles")
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    a_codes = torch.randint(0, 64, (M, K), dtype=torch.uint8, device="cuda", generator=generator)
+    b_codes = torch.randint(0, 64, (N, K), dtype=torch.uint8, device="cuda", generator=generator)
+    a, b = _pack_fp6_dense(a_codes), _pack_fp6_dense(b_codes)
+    sa = torch.randint(124, 129, (M, K // 32), dtype=torch.uint8, device="cuda", generator=generator)
+    sb = torch.randint(124, 129, (N, K // 32), dtype=torch.uint8, device="cuda", generator=generator)
+    formats = {"e2m3": (2, 1), "e3m2": (3, 3)}
+    reference_a = _decode_fp6(a_codes, *formats[a_format]) * torch.exp2(sa.double() - 127).repeat_interleave(32, dim=1)
+    reference_b = _decode_fp6(b_codes, *formats[b_format]) * torch.exp2(sb.double() - 127).repeat_interleave(32, dim=1)
+    reference = reference_a @ reference_b.T
+    out = torch.full((M, N), float("nan"), device="cuda", dtype=torch.bfloat16)
+    result = mm_mxfp6(a, sa.view(torch.float8_e8m0fnu), b, sb.view(torch.float8_e8m0fnu), out=out, space=space,
+                      split_k=split_k, a_format=a_format, b_format=b_format)
+    assert result is out
+    # Native MFMA can lose small terms while aligning products with widely
+    # differing exponents. Bound cancellation error by the sum of magnitudes.
+    tolerance = 1e-1 + 1e-2 * reference.abs() + 2**-14 * (reference_a.abs() @ reference_b.abs().T)
+    error = (result.double() - reference).abs()
+    assert torch.all(error <= tolerance), f"maximum error/tolerance: {(error / tolerance).max().item()}"
+    b.zero_()
+    mm_mxfp6(a, sa.view(torch.float8_e8m0fnu), b, sb.view(torch.float8_e8m0fnu), out=out, space=space, split_k=split_k,
+             a_format=a_format, b_format=b_format)
+    assert torch.count_nonzero(out) == 0
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
+@pytest.mark.parametrize("a_format", ["e2m3", "e3m2"])
+@pytest.mark.parametrize("b_format", ["e2m3", "e3m2"])
+@pytest.mark.parametrize("scale", [124, 127, 128])
+def test_mm_mxfp6_gfx950_all_code_products(a_format, b_format, scale):
+    from triton.tlx.ops.kernels.mm_mxfp6.gfx950 import mm_mxfp6
+
+    M = K = 128
+    codes = (torch.arange(M, device="cuda") % 64).to(torch.uint8)[:, None].expand(M, K).contiguous()
+    a, b = _pack_fp6_dense(codes), _pack_fp6_dense(codes)
+    scales = torch.full((M, K // 32), scale, dtype=torch.uint8, device="cuda").view(torch.float8_e8m0fnu)
+    formats = {"e2m3": (2, 1), "e3m2": (3, 3)}
+    reference = (_decode_fp6(codes, *formats[a_format]) @ _decode_fp6(codes, *formats[b_format]).T) * 2**(2 *
+                                                                                                          (scale - 127))
+    result = mm_mxfp6(a, scales, b, scales, space="heuristic", a_format=a_format, b_format=b_format)
+    torch.testing.assert_close(result, reference.to(torch.bfloat16), atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
+@pytest.mark.parametrize("a_format", ["e2m3", "e3m2"])
+@pytest.mark.parametrize("b_format", ["e2m3", "e3m2"])
+@pytest.mark.parametrize("mma", [16, 32])
+@pytest.mark.parametrize("split_k", [1, 4])
+def test_mm_mxfp6_gfx950_split_k_native_mfma(a_format, b_format, mma, split_k):
+    from triton.tlx.ops.kernels.mm_mxfp6.gfx950 import _gemm_mxfp6_native_kernel, _reduce_split_k
+
+    M = N = 128
+    K = 640
+    a = _packed_ones(M, K, 8 if a_format == "e2m3" else 12, "cuda")
+    b = _packed_ones(N, K, 8 if b_format == "e2m3" else 12, "cuda")
+    sa = torch.full((M, K // 32), 127, dtype=torch.uint8, device="cuda").view(torch.float8_e8m0fnu)
+    sb = torch.full((N, K // 32), 127, dtype=torch.uint8, device="cuda").view(torch.float8_e8m0fnu)
+    out = torch.empty((M, N), dtype=torch.bfloat16, device="cuda")
+    target = torch.empty((split_k, M, N), dtype=torch.float32, device="cuda") if split_k > 1 else out
+    kernel = _gemm_mxfp6_native_kernel[(1, split_k)](a, b, target, sa, sb, M, N, K, BLOCK_SIZE_M=128, BLOCK_SIZE_N=128,
+                                                     BLOCK_SIZE_K=128, GROUP_SIZE_M=8, SPLIT_K=split_k,
+                                                     A_FORMAT=a_format, B_FORMAT=b_format, num_warps=4,
+                                                     matrix_instr_nonkdim=mma)
+    instructions = [line for line in kernel.asm["amdgcn"].splitlines() if "v_mfma" in line]
+    assert instructions
+    # The transposed MFMA layout places B in cbsz and A in blgp.
+    cbsz = 2 if b_format == "e2m3" else 3
+    blgp = 2 if a_format == "e2m3" else 3
+    shape = "16x16x128" if mma == 16 else "32x32x64"
+    assert all(f"v_mfma_scale_f32_{shape}_f8f6f4" in line and f"cbsz:{cbsz}" in line and f"blgp:{blgp}" in line
+               for line in instructions)
+    if split_k > 1:
+        _reduce_split_k[(16, )](target, out, M * N, split_k, 1024)
+    torch.testing.assert_close(out, torch.full_like(out, K), atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
+def test_mm_mxfp6_gfx950_split_k_large_workspace():
+    from triton.tlx.ops.kernels.mm_mxfp6.gfx950 import mm_mxfp6
+
+    M, N, K = 32768, 8192, 2048
+    a = _packed_ones(M, K, 8, "cuda")
+    b = _packed_ones(N, K, 12, "cuda")
+    sa = torch.full((M, K // 32), 127, dtype=torch.uint8, device="cuda").view(torch.float8_e8m0fnu)
+    sb = torch.full((N, K // 32), 127, dtype=torch.uint8, device="cuda").view(torch.float8_e8m0fnu)
+    out = mm_mxfp6(a, sa, b, sb, space="heuristic", split_k=16)
+    assert torch.all(out == K).item()
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
