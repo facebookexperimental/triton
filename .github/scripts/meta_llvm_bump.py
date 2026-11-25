@@ -246,11 +246,13 @@ def candidate_text(kind, old, source, ready_url, base_sha):
     """Draft-candidate text in the updater's Summary/Test Plan format."""
     sha, build = source['llvm_sha'], source['build_number']
     title = f'[Meta LLVM] {kind} bundle candidate: {old["llvm_hash"][:8]} to {sha[:8]}'
-    problem = (
-        f'Triton at {base_sha[:12]} selects the {kind} SDK at {old["llvm_hash"][:12]}. The tracked LLVM branch has '
-        'a validated bundle that has not yet been checked with this Triton consumer.')
-    solution = 'This proposes the published SDK as a draft candidate for consumer correctness and performance validation.'
-    test = 'The source, tree and platform digests match the published SDK validation record.'
+    sdk = 'AMD codegen' if kind == 'amd' else 'core'
+    problem = (f'Triton at {base_sha[:12]} uses the {sdk} LLVM SDK at {old["llvm_hash"][:12]}. A validated bundle from '
+               f'LLVM {sha[:12]} is available but has not been tested with Triton.')
+    solution = (f'Update the {sdk} LLVM SDK pin to {sha[:12]}, packaging revision {build}, with its published archive '
+                'checksums. The other LLVM pin and the Triton sources are unchanged.')
+    test = ('All required SDKs passed relocation, compile, link and run checks. These checks do not build or test '
+            'Triton.')
     marker = f'<!-- llvm-candidate beta/{kind}/{sha}/{build}/{base_sha} -->'
     body = '\n'.join([
         '# Summary:',
@@ -269,7 +271,10 @@ def candidate_text(kind, old, source, ready_url, base_sha):
         '',
         f'SDK validation provenance: [completion record]({ready_url}).',
         '',
-        *_job_block([('Triton correctness', 'Not run'), ('A/B performance', 'Not run')]),
+        *_job_block([('Triton GPU tests', 'Started automatically; results are in the PR checks'),
+                     ('TLX.ops perf smoke', 'Started automatically; results are posted as a PR comment')]),
+        '',
+        'Keep this PR in draft until the Triton GPU tests and perf smoke results are reviewed.',
         '',
         'Source comparison: ' + compare_url('facebookexperimental/llvm-project', old['llvm_hash'], sha) + '.',
         '',
@@ -290,7 +295,7 @@ def candidate_text(kind, old, source, ready_url, base_sha):
         'Test Plan:',
         '',
         textwrap.fill(test, 72),
-        'Consumer correctness and performance checks have not run.',
+        'Triton GPU tests and TLX.ops perf smoke run on the draft PR.',
     ])
     return title, commit, body
 
