@@ -14,6 +14,7 @@ from meta_llvm_bump import candidate_text, readiness_text
 
 REPOSITORY = 'facebookexperimental/triton'
 LABEL = 'llvm-bundle-ready'
+BOT_EMAIL = '41898282+github-actions[bot]@users.noreply.github.com'
 CANDIDATE_LABEL = 'llvm-candidate'
 
 
@@ -162,7 +163,7 @@ def ensure_label(repo, name, description):
 
 def ensure_issue(repo, candidate, platforms, pr=None):
     pr = pr or {'status': 'not requested'}
-    if pr['status'] in ('superseded', 'adopted'):
+    if pr['status'] in ('superseded', 'adopted', 'handled'):
         return f"No readiness issue: the candidate is {pr['status']}"
     validated = validated_candidate(repo, candidate, platforms)
     if validated is None:
@@ -170,15 +171,19 @@ def ensure_issue(repo, candidate, platforms, pr=None):
     assets, _ = validated
     kind, sha, build = candidate['kind'], candidate['llvm_sha'], int(candidate['build_number'])
     marker = issue_marker(kind, sha, build)
-    existing = existing_issue(repo, marker)
-    if existing:
-        return existing
-    ensure_label(repo, LABEL, 'Validated LLVM bundle with a draft candidate PR to adopt')
     prefix = 'llvm' if kind == 'core' else 'amd-llvm'
     body = readiness_text(kind, sha, candidate['llvm_tree'], build, BRANCHES[kind],
                           assets[f'{prefix}-{sha[:8]}-{build}.source.json']['browser_download_url'],
                           assets[ready_name(kind, sha, build)]['browser_download_url'], marker, pr,
                           os.environ.get('RUN_URL', ''))
+    pages = github_json(f'repos/{repo}/issues?state=all&per_page=100', paginate=True)
+    issue = next((i for page in pages for i in page if 'pull_request' not in i and marker in (i.get('body') or '')),
+                 None)
+    if issue:
+        if pr.get('url') and pr['url'] not in (issue.get('body') or '') and issue['state'] == 'open':
+            github_json(f"repos/{repo}/issues/{issue['number']}", method='PATCH', payload={'body': body})
+        return issue['html_url']
+    ensure_label(repo, LABEL, 'Validated LLVM bundle with a draft candidate PR to adopt')
     name, intent = claim_issue_creation(repo, kind, sha, build, marker)
     try:
         return github_json(
@@ -258,37 +263,66 @@ def check_base(repo, base):
             raise ValueError(f'Candidate baseline has no {workflow} to test the PR')
 
 
+def newer(sha, build, other_sha, other_build):
+    """Whether candidate (sha, build) replaces (other_sha, other_build) of the same kind."""
+    return other_sha != sha or int(other_build) < build
+
+
+def untouched(repo, kind, base, number):
+    """Whether a candidate PR is still the bot's unreviewed one-commit draft."""
+    pull = github_json(f'repos/{repo}/pulls/{number}')
+    if not pull['draft'] or pull['base']['ref'] != 'main':
+        return False
+    pages = github_json(f'repos/{repo}/pulls/{number}/commits?per_page=100', paginate=True)
+    commits = [c for page in pages for c in page]
+    if len(commits) != 1 or commits[0]['sha'] != pull['head']['sha']:
+        return False
+    commit = commits[0]['commit']
+    if (commit['author']['email'] != BOT_EMAIL or commit['committer']['email'] != 'noreply@github.com'
+            or not commit['verification']['verified']):
+        return False
+    for kind_ in ('pulls/{n}/reviews', 'pulls/{n}/comments', 'issues/{n}/comments'):
+        pages = github_json(f'repos/{repo}/' + kind_.format(n=number) + '?per_page=100', paginate=True)
+        if any(item['user']['type'] != 'Bot' for page in pages for item in page):
+            return False
+    return bot_head(repo, kind, base, pull['head']['sha'])
+
+
 def close_superseded(repo, kind, sha, build, replacement):
-    """Close older untouched draft candidates of one kind and their readiness issues."""
-    kept, closed = set(), []
+    """Close older untouched draft candidates of one kind, and the readiness issues of the PRs it closes."""
+    closed, kept = [], []
     for item, (k, old_sha, old_build, base) in labeled(repo, CANDIDATE_LABEL, 'open', CANDIDATE, True):
-        if k != kind or (old_sha, old_build) == (sha, str(build)):
+        if k != kind or item['number'] == replacement or not newer(sha, build, old_sha, old_build):
             continue
-        pull = github_json(f"repos/{repo}/pulls/{item['number']}")
-        commits = [
-            c for page in github_json(f"repos/{repo}/pulls/{item['number']}/commits?per_page=100", paginate=True)
-            for c in page
-        ]
-        reviews = [
-            r for page in github_json(f"repos/{repo}/pulls/{item['number']}/reviews?per_page=100", paginate=True)
-            for r in page
-        ]
-        if (not pull['draft'] or reviews or len(commits) != 1 or not bot_head(repo, kind, base, pull['head']['sha'])):
-            kept.add((old_sha, old_build))
+        if not untouched(repo, kind, base, item['number']):
+            kept.append(item['number'])
             continue
-        github_json(f"repos/{repo}/issues/{item['number']}/comments", method='POST',
-                    payload={'body': f'Superseded by #{replacement}, which proposes a newer bundle.'})
+        note = {'body': f'Superseded by #{replacement}, which proposes a newer bundle.'}
+        github_json(f"repos/{repo}/issues/{item['number']}/comments", method='POST', payload=note)
         github_json(f"repos/{repo}/pulls/{item['number']}", method='PATCH', payload={'state': 'closed'})
         closed.append(item['number'])
-    for issue, (k, old_sha, old_build) in labeled(repo, LABEL, 'open', READY, False):
-        if k == kind and (old_sha, old_build) != (sha, str(build)) and (old_sha, old_build) not in kept:
-            github_json(f"repos/{repo}/issues/{issue['number']}/comments", method='POST',
-                        payload={'body': f'Superseded by #{replacement}, which proposes a newer bundle.'})
-            github_json(f"repos/{repo}/issues/{issue['number']}", method='PATCH',
-                        payload={'state': 'closed', 'state_reason': 'not_planned'})
-    return closed, sorted(item['number']
-                          for item, groups in labeled(repo, CANDIDATE_LABEL, 'open', CANDIDATE, True)
-                          if groups[0] == kind and groups[1:3] in kept)
+        for issue, groups in labeled(repo, LABEL, 'open', READY, False):
+            if groups == (kind, old_sha, old_build):
+                github_json(f"repos/{repo}/issues/{issue['number']}/comments", method='POST', payload=note)
+                github_json(f"repos/{repo}/issues/{issue['number']}", method='PATCH',
+                            payload={'state': 'closed', 'state_reason': 'not_planned'})
+    return closed, sorted(kept)
+
+
+def finish_proposal(repo, result, labels, branch, head):
+    """Label, test and supersede around a proposal PR; a failure keeps the PR link in the result."""
+    try:
+        if CANDIDATE_LABEL not in labels:
+            ensure_label(repo, CANDIDATE_LABEL, 'Draft PR proposing a validated Meta LLVM bundle')
+            github_json(f"repos/{repo}/issues/{result['number']}/labels", method='POST',
+                        payload={'labels': [CANDIDATE_LABEL]})
+        dispatch_consumer_tests(repo, result['kind'], branch, head, result['number'])
+        result['closed'], result['kept'] = close_superseded(repo, result['kind'], result['llvm_sha'],
+                                                            result['build_number'], result['number'])
+    except Exception as error:
+        detail = error.stderr if isinstance(error, subprocess.CalledProcessError) else str(error)
+        result['error'] = detail
+    return result
 
 
 def ensure_candidate_pr(repo, candidate, platforms, base=''):
@@ -298,14 +332,15 @@ def ensure_candidate_pr(repo, candidate, platforms, base=''):
     if validated is None:
         return dict(result, status='superseded')
     assets, receipt = validated
-    key = (kind, sha, str(build))
+    pin = read_manifest(repo, MANIFESTS[kind], 'main')
+    if pin['llvm_hash'] == sha and pin['build_number'] >= build:
+        return dict(result, status='adopted')
     branch = f'scratch/llvm-candidate/{kind}-{sha[:8]}-{build}'
     # INVARIANT: one proposal per kind, LLVM commit and packaging revision, whatever Triton base it started from.
-    numbers = {
-        item['number']
-        for item, groups in labeled(repo, CANDIDATE_LABEL, 'all', CANDIDATE, True)
-        if groups[:3] == key
-    }
+    proposals = labeled(repo, CANDIDATE_LABEL, 'all', CANDIDATE, True)
+    if any(k == kind and other == sha and int(b) > build for _, (k, other, b, _) in proposals):
+        return dict(result, status='superseded')
+    numbers = {item['number'] for item, groups in proposals if groups[:3] == (kind, sha, str(build))}
     pages = github_json(f'repos/{repo}/pulls?state=all&head=facebookexperimental:{quote(branch, safe="")}&per_page=100',
                         paginate=True)
     numbers |= {pull['number'] for page in pages for pull in page}
@@ -314,13 +349,14 @@ def ensure_candidate_pr(repo, candidate, platforms, base=''):
         match = CANDIDATE.search(pull.get('body') or '')
         result.update(number=pull['number'], url=pull['html_url'])
         if (pull['state'] != 'open' or not pull['draft'] or pull['base']['ref'] != 'main' or match is None
-                or match.groups()[:3] != key):
+                or match.groups()[:3] != (kind, sha, str(build))):
             return dict(result, status='handled')
         old, new = expected_manifest(repo, kind, match.group(4), sha, build, receipt)
         if not bot_head(repo, kind, match.group(4), pull['head']['sha'], new):
             return dict(result, status='handled')
-        dispatch_consumer_tests(repo, kind, pull['head']['ref'], pull['head']['sha'], pull['number'])
-        return dict(result, status='open', old=old['llvm_hash'])
+        result.update(status='open', old=old['llvm_hash'])
+        return finish_proposal(repo, result, [l['name'] for l in pull['labels']], pull['head']['ref'],
+                               pull['head']['sha'])
     ref = github_json(f'repos/{repo}/git/ref/heads/{branch}', missing_ok=True)
     if ref:
         head = ref['object']['sha']
@@ -330,7 +366,7 @@ def ensure_candidate_pr(repo, candidate, platforms, base=''):
         base = base or github_json(f'repos/{repo}/commits/main')['sha']
     check_base(repo, base)
     old, new = expected_manifest(repo, kind, base, sha, build, receipt)
-    if new == old or (old['llvm_hash'] == sha and old['build_number'] > build):
+    if new == old:
         return dict(result, status='adopted')
     title, message, body = candidate_text(kind, old, receipt['source'],
                                           assets[ready_name(kind, sha, build)]['browser_download_url'], base)
@@ -353,12 +389,8 @@ def ensure_candidate_pr(repo, candidate, platforms, base=''):
                        payload={'title': title, 'body': body, 'head': branch, 'base': 'main', 'draft': True})
     if (not pull['draft'] or pull['head']['sha'] != head or pull['base']['ref'] != 'main' or pull['state'] != 'open'):
         raise ValueError('Created candidate PR does not match the prepared head, base or draft state')
-    ensure_label(repo, CANDIDATE_LABEL, 'Draft PR proposing a validated Meta LLVM bundle')
-    github_json(f"repos/{repo}/issues/{pull['number']}/labels", method='POST', payload={'labels': [CANDIDATE_LABEL]})
-    dispatch_consumer_tests(repo, kind, branch, head, pull['number'])
-    closed, kept = close_superseded(repo, kind, sha, build, pull['number'])
-    return dict(result, status='created', number=pull['number'], url=pull['html_url'], old=old['llvm_hash'],
-                closed=closed, kept=kept)
+    result.update(status='created', number=pull['number'], url=pull['html_url'], old=old['llvm_hash'])
+    return finish_proposal(repo, result, [], branch, head)
 
 
 def main():

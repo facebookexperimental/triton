@@ -488,6 +488,7 @@ def test_handled_candidate_is_not_reproposed_from_a_newer_base(monkeypatch):
     assets, receipt, candidate = _ready_fixture('amd')
     marker = f'<!-- llvm-candidate beta/amd/{NEW}/1/{"a" * 40} -->'
     monkeypatch.setattr(ready, 'validated_candidate', lambda *args: ({a['name']: a for a in assets}, receipt))
+    monkeypatch.setattr(ready, 'read_manifest', lambda *args: dict(META))
     calls = []
 
     def api(path, **kwargs):
@@ -509,10 +510,16 @@ def test_handled_candidate_is_not_reproposed_from_a_newer_base(monkeypatch):
 
 def test_superseding_closes_only_untouched_drafts(monkeypatch):
     import meta_llvm_ready as ready
-    untouched, reviewed = '1' * 40, '2' * 40
-    pulls = [{'number': n, 'pull_request': {}, 'body': f'<!-- llvm-candidate beta/amd/{sha}/1/{"a" * 40} -->'}
-             for n, sha in ((1, untouched), (2, reviewed))]
-    issues = [{'number': n, 'body': ready.issue_marker('amd', sha, 1)} for n, sha in ((10, untouched), (11, reviewed))]
+    base, head = 'a' * 40, 'c' * 40
+    # 1 untouched, 2 reviewed, 3 amended by a maintainer, 4 a newer packaging build of the proposed commit.
+    shas = {1: '1' * 40, 2: '2' * 40, 3: '3' * 40, 4: NEW}
+    builds = {1: 1, 2: 1, 3: 1, 4: 2}
+    pulls = [{
+        'number': n, 'pull_request': {}, 'body': f'<!-- llvm-candidate beta/amd/{shas[n]}/{builds[n]}/{base} -->'
+    } for n in shas]
+    issues = [{'number': 10 + n, 'body': ready.issue_marker('amd', shas[n], builds[n])} for n in (1, 2, 3)]
+    issues.append({'number': 20, 'body': ready.issue_marker('amd', '5' * 40, 1)})
+    bot = {'email': ready.BOT_EMAIL}
     writes = []
 
     def api(path, method=None, payload=None, **kwargs):
@@ -523,14 +530,19 @@ def test_superseding_closes_only_untouched_drafts(monkeypatch):
             return [pulls]
         if 'labels=llvm-bundle-ready' in path:
             return [issues]
+        if path.endswith('/commits?per_page=100'):
+            committer = {'email': 'maintainer@example.com'} if '/pulls/3/' in path else {'email': 'noreply@github.com'}
+            return [[{
+                'sha': head, 'commit': {'author': bot, 'committer': committer, 'verification': {'verified': True}}
+            }]]
         if '/reviews?' in path:
-            return [[{'id': 1}]] if '/pulls/2/' in path else [[]]
-        if '/commits?' in path:
-            return [[{}]]
-        return {'draft': True, 'head': {'sha': 'c' * 40}}
+            return [[{'user': {'type': 'User'}}]] if '/pulls/2/' in path else [[]]
+        if '/comments?' in path:
+            return [[]]
+        return {'draft': True, 'base': {'ref': 'main'}, 'head': {'sha': head}}
 
     monkeypatch.setattr(ready, 'github_json', api)
     monkeypatch.setattr(ready, 'bot_head', lambda *args: True)
-    assert ready.close_superseded(ready.REPOSITORY, 'amd', NEW, 1, 9) == ([1], [2])
+    assert ready.close_superseded(ready.REPOSITORY, 'amd', NEW, 1, 9) == ([1], [2, 3])
     closed = {path.rsplit('/', 1)[1] for path, method in writes if method == 'PATCH'}
-    assert closed == {'1', '10'}
+    assert closed == {'1', '11'}

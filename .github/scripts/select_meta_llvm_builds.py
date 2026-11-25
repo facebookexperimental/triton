@@ -51,8 +51,6 @@ def main():
         base = os.environ.get('CANDIDATE_BASE_SHA', '')
         if base and re.fullmatch(r'[0-9a-f]{40}', base) is None:
             raise ValueError('A candidate base must be a full Triton commit SHA')
-        if os.environ.get('PUBLISH') == 'false':
-            raise ValueError('Candidate PR creation requires published bundles')
     manifests = event == 'push' or os.environ.get('REQUEST_SOURCE') == 'manifests'
     if manifests:
         if event == 'push':
