@@ -15,8 +15,8 @@
 //   - task 0 must wait on %b's TMA producer before its single local_load,
 //     even though %a (the other buffer in the reuse group) is not consumed by
 //     task 0 -- without the union it would silently drop this wait;
-//   - task 1 must wait twice, once for each of %a and %b, before its two
-//     local_loads;
+//   - task 1 must wait twice, once for each of %a and %b, each before the
+//     local_load of that buffer;
 //   - the producer acquires a token for both consumer tasks before each of
 //     its two TMA copies, so neither consumer can observe the reused buffer
 //     before its matching TMA load completes.
@@ -30,11 +30,11 @@
 // CHECK:        ttng.wait_barrier
 // CHECK:        ttg.local_load
 
-// partition0 == task 1: waits for both %a and %b before reading them.
+// partition0 == task 1: waits for %a and for %b before reading each.
 // CHECK:      partition0(
 // CHECK:        ttng.wait_barrier
-// CHECK:        ttng.wait_barrier
 // CHECK:        ttg.local_load
+// CHECK:        ttng.wait_barrier
 // CHECK:        ttg.local_load
 // CHECK:        arith.addf
 
