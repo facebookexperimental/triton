@@ -322,15 +322,20 @@ def tracked_branch(run):
 
 
 def _pushes(runs, branch):
+    """Push runs with their jobs collected, finished or not: a GPU's jobs count once they finish."""
     return sorted((r for r in runs if r.get("wf") == "gpu-tests.yml" and r["event"] == "push" and (
-        r.get("branch") or "main") == branch and r.get("jobs") is not None and r.get("status") == "completed"),
-                  key=lambda r: r["created_at"])
+        r.get("branch") or "main") == branch and r.get("jobs") is not None), key=lambda r: r["created_at"])
 
 
-def _running(runs, wf, branch, asof):
-    return sorted((r for r in runs if r.get("wf") == wf and r["event"] == "push" and (
-        r.get("branch") or "main") == branch and r.get("status") != "completed" and r["created_at"] <= asof),
-                  key=lambda r: r["created_at"])
+def _running(runs, wf, branch, asof, uncollected=False):
+    """Push runs still in progress; with uncollected, only those whose jobs were not collected yet."""
+
+    def keep(r):
+        return (r.get("wf") == wf and r["event"] == "push" and (r.get("branch") or "main") == branch
+                and r.get("status") != "completed" and r["created_at"] <= asof
+                and not (uncollected and r.get("jobs") is not None))
+
+    return sorted(filter(keep, runs), key=lambda r: r["created_at"])
 
 
 def _commit(run):
@@ -346,6 +351,8 @@ def _history(pushes):
     blame = collections.defaultdict(lambda: collections.defaultdict(set))
     for i, run in enumerate(pushes):
         for gpu, j in _test_jobs(run):
+            if j["conclusion"] is None:  # not finished
+                continue
             for s in j["steps"]:
                 res = step_result(j, s)
                 if res is None:
@@ -402,13 +409,14 @@ def main_view(runs, asof, branch="main"):
     # the latest push that ran the job.
     retire = iso(t(asof) - dt.timedelta(days=RETIRE_DAYS))
     latest_steps = {}
+    # A job cancelled before a runner picked it up has no steps: it neither retires nor clears its failures.
     for run in pushes:
         for gpu, j in _test_jobs(run):
-            if j["conclusion"] in RAN and run["created_at"] >= retire:
+            if j["conclusion"] in RAN and j["steps"] and run["created_at"] >= retire:
                 latest_steps[(gpu, job_key(j["name"]))] = {group_of(s["name"]) for s in j["steps"]} - {None}
     gpus = {}
     for gpu in TEST_PLATFORMS:
-        ran = [r for r in pushes if any(g == gpu and j["conclusion"] in RAN for g, j in _test_jobs(r))]
+        ran = [r for r in pushes if any(g == gpu and j["conclusion"] in RAN and j["steps"] for g, j in _test_jobs(r))]
         out = {"verdict": "none", "new": [], "known": [], **(_commit(ran[-1]) if ran else {})}
         for unit, fails in state.items():
             if unit[0] != gpu or unit[2] not in latest_steps.get(unit[:2], ()):
@@ -436,20 +444,30 @@ def main_view(runs, asof, branch="main"):
     for i in range(max(0, len(pushes) - PUSH_GRID), len(pushes)):
         run, cells = pushes[i], {}
         broken = _build_failure(run)
+        select = run.get("select") or {}
         for gpu in TEST_PLATFORMS:
             jobs = [j for g, j in _test_jobs(run) if g == gpu and j["conclusion"] in RAN]
+            # Jobs not finished yet; a GPU whose jobs were not created yet waits on the run's earlier jobs.
+            unfinished = [j for g, j in _test_jobs(run) if g == gpu and j["conclusion"] is None]
             st = seen[i].get(gpu, set())
-            if broken or not jobs:
-                # skip: path selection did not pick this GPU, so nothing it tests changed.
-                cells[gpu] = "skip" if not broken and (run.get("select") or {}).get(gpu.lower()) is False else "na"
+            if broken:
+                cells[gpu] = "na"
             elif "new" in st:
                 cells[gpu] = "new"
             elif "known" in st:
                 cells[gpu] = "known"
+            elif unfinished:
+                cells[gpu] = "running" if any(j.get("status") != "queued" for j in unfinished) else "waiting"
+            elif not jobs:
+                # skip: path selection did not pick this GPU, so nothing it tests changed.
+                cells[gpu] = ("skip" if select.get(gpu.lower()) is False else
+                              "running" if run.get("status") != "completed" else "na")
             elif any(setup_step(j) for j in jobs):
                 cells[gpu] = "setup"
             elif not any(step_result(j, s) for j in jobs for s in j["steps"]):
-                cells[gpu] = "na"  # e.g. cancelled before any test step finished: no result, not a pass
+                # No result, not a pass. A job cancelled before any step started never got a runner.
+                cells[gpu] = "norunner" if all(j["conclusion"] == "cancelled" and not j["steps"]
+                                               for j in jobs) else "na"
             else:
                 cells[gpu] = "pass"
         known_since = {
@@ -463,19 +481,20 @@ def main_view(runs, asof, branch="main"):
             **_commit(run), "title": run.get("title", ""), "url": run.get("url"), "cells": cells, "since": known_since
         })
 
-    # Push runs still in progress have no result yet; they show as running so a missing cell is never ambiguous.
+    # Push runs whose jobs were not collected yet show as running, so a missing cell is never ambiguous.
     grid += [{
         **_commit(r), "title": r.get("title", ""), "url": r.get("url"), "cells": {g: "running"
                                                                                   for g in TEST_PLATFORMS}
     }
-             for r in _running(runs, "gpu-tests.yml", branch, asof)]
+             for r in _running(runs, "gpu-tests.yml", branch, asof, uncollected=True)]
     steps = _step_grid(pushes, max(0, len(pushes) - PUSH_GRID), units, blame, since)
     setup = [{
         "sha": r.get("head_sha") or "", "t": r["created_at"], "gpu": g, "job": job_key(j["name"]), "step": setup_step(j)
     } for r in pushes[-SETUP_WINDOW:] for g, j in _test_jobs(r) if setup_step(j)]
     build = None
-    if pushes and _build_failure(pushes[-1]):
-        build = {**_commit(pushes[-1]), "step": _build_failure(pushes[-1])}
+    done = [r for r in pushes if r.get("status") == "completed"]
+    if done and _build_failure(done[-1]):
+        build = {**_commit(done[-1]), "step": _build_failure(done[-1])}
     return {"gpus": gpus, "build": build, "pushes": grid, "steps": steps, "setup": setup}
 
 
@@ -611,7 +630,7 @@ def pr_view(runs, asof, main, branch="main"):
             latest[key] = run
     out = []
     for run in sorted(latest.values(), key=lambda r: r["created_at"], reverse=True):
-        jobs = _test_jobs(run)
+        jobs = [(g, j) for g, j in _test_jobs(run) if j["conclusion"] in RAN]
         fails = {(g, job_key(j["name"]), f["id"]) for g, j in jobs for s in j["steps"] for f in s.get("failures") or []}
         outcome = run_outcome(run)
         row = {
@@ -619,23 +638,23 @@ def pr_view(runs, asof, main, branch="main"):
             "branch": run.get("pr_branch") or run.get("branch"), "t": run["created_at"], "gpus":
             sorted({g
                     for g, j in jobs
-                    if j["conclusion"] in RAN},
-                   key=TEST_PLATFORMS.index), "n_failed": len(fails), "whose": None, "note": ""
+                    if j["conclusion"] in RAN}, key=TEST_PLATFORMS.index), "n_failed": len(fails), "whose": None,
+            "note": "", "pending": outcome is None
         }
-        if outcome is None:
-            row["result"] = "running"
-        elif fails:
+        if fails:
             row["result"] = "tests"
             if fails <= on_main:
                 row["whose"], row["note"] = "main", f"all {len(fails)} also fail on {branch}"
             else:
                 row["whose"] = "author"
-        elif outcome in ("setup", "build"):
-            row["result"] = outcome if outcome == "build" else "setup"
-            row["whose"] = "author" if outcome == "build" else "ci"
-            row["note"] = _build_failure(run) or next((setup_step(j) for _, j in jobs if setup_step(j)), "")
+        elif outcome in ("setup", "build") or (outcome is None and
+                                               (_build_failure(run) or any(setup_step(j) for _, j in jobs))):
+            build = _build_failure(run)
+            row["result"] = "build" if build else "setup"
+            row["whose"] = "author" if build else "ci"
+            row["note"] = build or next((setup_step(j) for _, j in jobs if setup_step(j)), "")
         else:
-            row["result"] = outcome
+            row["result"] = outcome or "running"
         out.append(row)
     return out
 
@@ -683,8 +702,8 @@ def nightly_view(runs, asof, bench):
 
 def gpu_nightly_view(runs, asof, wf="gpu-tests-nightly.yml"):
     """The latest run of a daily GPU workflow per GPU: result and failing tests; and passes over the last 7 days."""
-    nights = sorted((r for r in runs if r.get("wf") == wf and r.get("status") == "completed"
-                     and r.get("jobs") is not None and r["created_at"] <= asof), key=lambda r: r["created_at"])
+    nights = sorted((r for r in runs if r.get("wf") == wf and r.get("jobs") is not None and r["created_at"] <= asof),
+                    key=lambda r: r["created_at"])
     week_ago = iso(t(asof) - dt.timedelta(days=7))
     out = {}
     for gpu in GPUS:
@@ -785,27 +804,39 @@ def _occupancy(spans, lo, hi):
     return peak, round(area / (hi - lo).total_seconds(), 2)
 
 
-def concurrency_view(runs, asof):
-    """GPU jobs running and waiting for a runner at once, per GPU type, per day (OPS_DAYS) and per hour
-    (OPS_HOURS): the peak and the time-weighted mean. All tracked branches and triggers count, since they share
-    the runners. Jobs of a run are stored once it completes, so the counts end where the oldest recent run without
-    jobs began: after that they would read low, and are left out."""
+def _resource_horizon(runs, asof):
     now = t(asof)
-    running, waiting = {g: [] for g in GPUS}, {g: [] for g in GPUS}
     recent = iso(now - dt.timedelta(hours=OPS_HOURS))
-    horizon = min([
+    return min([
         t(r["created_at"]) for r in runs if r.get("wf") in GPU_RUN_WORKFLOWS and recent <= r["created_at"] <= asof and
-        (r.get("jobs") is None or any(not j.get("completed_at") and j.get("conclusion") != "skipped"
-                                      for j in r["jobs"]))
+        (r.get("jobs") is None or any(j["conclusion"] is None and j.get("status") not in ("queued", "in_progress")
+                                      for _, j in _gpu_jobs(r)))
     ] + [now])
+
+
+def _resource_spans(runs, asof):
+    now = t(asof)
     for r in runs:
         if r.get("wf") not in GPU_RUN_WORKFLOWS or r["created_at"] > asof:
             continue
-        for g, j in _gpu_jobs(r):
-            if _ran(j):
-                running[g].append((t(j["started_at"]), t(j["completed_at"])))
-                if j.get("created_at"):
-                    waiting[g].append((t(j["created_at"]), t(j["started_at"])))
+        for gpu, j in _gpu_jobs(r):
+            if _ran(j) or (j.get("status") == "in_progress" and j.get("started_at")):
+                yield gpu, t(j.get("created_at") or j["started_at"]), t(
+                    j["started_at"]), t(j["completed_at"]) if j.get("completed_at") else now
+            elif j.get("status") == "queued" and j["conclusion"] is None and j.get("created_at"):
+                yield gpu, t(j["created_at"]), None, now
+
+
+def concurrency_view(runs, asof):
+    """Running and queued GPU jobs per day and hour, including unfinished workflows. Missing job snapshots remain
+    unknown rather than reporting idle runners."""
+    now = t(asof)
+    running, waiting = {g: [] for g in GPUS}, {g: [] for g in GPUS}
+    horizon = _resource_horizon(runs, asof)
+    for gpu, queued, started, ended in _resource_spans(runs, asof):
+        if started is not None:
+            running[gpu].append((started, ended))
+        waiting[gpu].append((queued, started or ended))
 
     def buckets(labels, width):
         out = []
@@ -1100,26 +1131,17 @@ def occupancy_view(runs, asof):
     Per cell: the most jobs running, exact busy runner-minutes, idle minutes (no job running), minutes with every
     runner busy, runner capacity (pool minutes), and minutes and job-minutes of waiting with every runner busy (full)
     or not (part). A job waits from WAIT_GRACE_MIN after it was queued until it started. Every branch and trigger
-    counts, since they share the runners. As in concurrency_view, cells stop where the oldest recent run without
-    stored jobs began."""
+    counts, since they share the runners. Queued and running jobs extend to the snapshot time; only missing job
+    snapshots shorten the grid."""
     now = t(asof)
     first = now.astimezone(OCC_TZ).date() - dt.timedelta(days=OPS_DAYS - 1)
     lo = dt.datetime.combine(first, dt.time(), OCC_TZ).astimezone(dt.timezone.utc)
-    recent = iso(now - dt.timedelta(hours=OPS_HOURS))
-    hi = min([
-        t(r["created_at"]) for r in runs if r.get("wf") in GPU_RUN_WORKFLOWS and recent <= r["created_at"] <= asof and
-        (r.get("jobs") is None or any(not j.get("completed_at") and j.get("conclusion") != "skipped"
-                                      for j in r["jobs"]))
-    ] + [now])
+    hi = _resource_horizon(runs, asof)
     n = max(0, int((hi - lo).total_seconds() // 60))
     n -= n % OCC_CELL_MIN
     spans = {g: [] for g in GPUS}
-    for r in runs:
-        if r.get("wf") not in GPU_RUN_WORKFLOWS or r["created_at"] > asof:
-            continue
-        for g, j in _gpu_jobs(r):
-            if _ran(j):
-                spans[g].append((t(j.get("created_at") or j["started_at"]), t(j["started_at"]), t(j["completed_at"])))
+    for gpu, queued, started, ended in _resource_spans(runs, asof):
+        spans[gpu].append((queued, started or ended, ended))
     minute = lambda x: int((x - lo).total_seconds() // 60)
 
     def most_at_once(intervals):

@@ -13,12 +13,15 @@
 #include "triton/Dialect/Triton/IR/OpInterfaces.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/Partitioning.h"
+#include "triton/Dialect/TritonGPU/Transforms/PartitionLoopPeeling.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
 #include <queue>
@@ -180,7 +183,9 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
     return op;
   if (isa<LLVM::AssumeOp, ttng::FenceAsyncSharedOp>(op))
     return op;
-  if (isa<ttg::AsyncCommitGroupOp, ttg::AsyncWaitOp>(op))
+  // Waits only retire already-issued async work, so running one in a
+  // predicated-off iteration is harmless.
+  if (isa<ttg::AsyncCommitGroupOp, ttg::AsyncWaitOp, ttng::TMAStoreWaitOp>(op))
     return op;
   if (op->hasTrait<OpTrait::LocalLoadTrait>())
     return op;
@@ -386,7 +391,7 @@ int mlir::triton::getCopyVecBytes(RankedTensorType registerTy,
            registerTy.getElementTypeBitWidth() / 8;
   auto regToSharedLayout = regLayout.invertAndCompose(sharedLayout);
   const int vecElems = regToSharedLayout.getNumConsecutiveInOut();
-  return vecElems * registerTy.getElementTypeBitWidth() / 8;
+  return vecElems * getIntOrFloatOrPtrBitWidth(registerTy.getElementType()) / 8;
 }
 
 bool mlir::triton::canBeConvertedToAsyncLoad(
@@ -400,11 +405,9 @@ bool mlir::triton::canBeConvertedToAsyncLoad(
   unsigned width = 0;
   if (tensorTy) {
     auto ty = cast<tt::PointerType>(tensorTy.getElementType()).getPointeeType();
-    width = vec * ty.getIntOrFloatBitWidth();
+    width = vec * getIntOrFloatOrPtrBitWidth(ty);
   } else {
-    width = cast<tt::PointerType>(ptr.getType())
-                .getPointeeType()
-                .getIntOrFloatBitWidth();
+    width = tt::getPointeeBitWidth(ptr.getType());
   }
 
   // We do not pipeline all loads for the following reasons:
@@ -527,7 +530,7 @@ bool mlir::triton::canPipelineTMALoad(Operation *op) {
   auto sharedEncoding = getSharedEncoding(op);
   int64_t stageSizeInBits =
       ttg::getAllocationElems(sharedEncoding, tensorTy.getShape()) *
-      tensorTy.getElementTypeBitWidth();
+      getIntOrFloatOrPtrBitWidth(tensorTy.getElementType());
   return stageSizeInBits % (ttng::TMA_ALIGN * 8) == 0;
 }
 
@@ -992,4 +995,47 @@ bool triton::isLoopTripCountKnownPositive(scf::ForOp loop,
       return true;
   }
   return false;
+}
+
+// Meta AutoWS warp-specialization predicates.
+bool mlir::triton::requestsMetaWarpSpecialization(Operation *op) {
+  return op->getAttrOfType<DenseI32ArrayAttr>(ttg::kAsyncTaskIdAttrName) ||
+         op->getAttrOfType<DenseI32ArrayAttr>(ttg::kPartitionAttrName) ||
+         (isa<scf::ForOp, scf::WhileOp>(op) &&
+          op->hasAttr(kWarpSpecializeAttrName));
+}
+
+// One walk for both the function and module predicates. With
+// `countWarpSpecializeOp`, an existing ttg.warp_specialize region (e.g. from
+// TLX) also counts as a request.
+static bool containsMetaWarpSpecializationRequest(Operation *root,
+                                                  bool countWarpSpecializeOp) {
+  return root
+      ->walk([&](Operation *op) {
+        return (countWarpSpecializeOp && isa<ttg::WarpSpecializeOp>(op)) ||
+                       triton::requestsMetaWarpSpecialization(op)
+                   ? WalkResult::interrupt()
+                   : WalkResult::advance();
+      })
+      .wasInterrupted();
+}
+
+bool mlir::triton::isMetaWarpSpecializedFunc(triton::FuncOp funcOp) {
+  return containsMetaWarpSpecializationRequest(funcOp,
+                                               /*countWarpSpecializeOp=*/false);
+}
+
+bool mlir::triton::moduleRequestsMetaWarpSpecialization(ModuleOp mod) {
+  return containsMetaWarpSpecializationRequest(mod,
+                                               /*countWarpSpecializeOp=*/true);
+}
+
+bool mlir::triton::isMetaWSEnabled(Operation *op) {
+  auto mod = dyn_cast<ModuleOp>(op);
+  if (!mod)
+    mod = op->getParentOfType<ModuleOp>();
+  if (mod)
+    if (auto attr = mod->getAttrOfType<BoolAttr>(kUseMetaWSAttrName))
+      return attr.getValue();
+  return triton::tools::getBoolEnv("TRITON_USE_META_WS");
 }

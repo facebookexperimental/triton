@@ -141,7 +141,7 @@ FailureOr<int> getTMAElementType(Location loc, tt::TensorDescInterface ty) {
     return TMA_F64;
   }
 
-  auto elemSize = elemTy.getIntOrFloatBitWidth() / 8;
+  unsigned elemSize = getIntOrFloatOrPtrBitWidth(elemTy) / 8;
   switch (elemSize) {
   case 1:
     return TMA_U8;
@@ -169,7 +169,7 @@ LogicalResult createTMADesc(Value tmaPtr, MakeTensorDescOp op,
   };
 
   auto elemType = op.getBase().getType().getPointeeType();
-  auto elemSize = elemType.getIntOrFloatBitWidth() / 8;
+  unsigned elemSize = getIntOrFloatOrPtrBitWidth(elemType) / 8;
   auto encoding = op.getType().getSharedLayout();
   auto mmaEncoding =
       llvm::dyn_cast_or_null<gpu::NVMMASharedEncodingAttr>(encoding);

@@ -7,6 +7,7 @@ import numbers
 import json
 
 from triton.runtime import driver
+from triton._utils import validate_fp6_box
 
 from .._C.libtriton import ir
 from . import core as tl
@@ -75,6 +76,10 @@ class TritonSemantic(Generic[TensorTy]):
 
     def computation_type_impl(self, a_ty: tl.dtype, a_is_scalar: bool, b_ty: tl.dtype, b_is_scalar: bool,
                               div_or_mod: bool) -> tl.dtype:
+        if a_ty in (tl.float4e2m1x2, tl.float8e8m0fnu) or b_ty in (tl.float4e2m1x2, tl.float8e8m0fnu):
+            if a_ty != b_ty:
+                raise TypeError(f"Implicit promotion between {a_ty} and {b_ty} is not supported")
+            return a_ty
         # 0) For scalars we follow semantics similar to PyTorch, namely:
         # - If the scalar is of a lower or equal kind (bool < uint < int < fp),
         #   it doesn't participate in the promotion
@@ -620,9 +625,7 @@ class TritonSemantic(Generic[TensorTy]):
     def arange(self, start: int, end: int, *, ret_ty: tl.block_type = None) -> TensorTy:
         if not isinstance(start, int) or not isinstance(end, int):
             raise ValueError("arange's arguments must be of type tl.constexpr")
-        is_start_int64 = bool(start >> 32)
-        is_end_int64 = bool(end >> 32)
-        if is_start_int64 or is_end_int64:
+        if start < -2**31 or end > 2**31 - 1:
             raise ValueError("arange must fit in int32")
         if end <= start:
             raise ValueError("arange's end argument must be greater than the start argument")
@@ -833,7 +836,7 @@ class TritonSemantic(Generic[TensorTy]):
         if rounding_mode == "rtz":
             return ir.ROUNDING_MODE.RTZ
         if rounding_mode == "rs":
-            return ir.ROUNDING_MODE.RS
+            raise ValueError("Stochastic rounding requires explicit random bits; use tlx.stoch_round or tl.sr_store.")
         raise ValueError(f"Invalid rounding mode: {rounding_mode}. Supported rounding modes are 'rtne' and 'rtz'.")
 
     def bitcast(self, input: TensorTy, dst_ty: tl.dtype) -> TensorTy:
@@ -1140,6 +1143,8 @@ class TritonSemantic(Generic[TensorTy]):
         assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
 
         offsets = self._convert_to_ir_values(offsets, require_i64=False)
+        if desc.type.fp6_format:
+            raise ValueError("packed FP6 descriptors only support stores")
         if multicast is None:
             multicast = getattr(self.builder.options, "multicast", False)
         if not isinstance(multicast, bool):
@@ -1172,6 +1177,8 @@ class TritonSemantic(Generic[TensorTy]):
 
     def descriptor_store(self, desc: tl.tensor_descriptor_base, value: tl.tensor, offsets,
                          store_reduce: str) -> tl.tensor:
+        if desc.type.fp6_format and value.dtype != tl.uint8:
+            raise ValueError("FP6 stores require one uint8 code per element")
         if store_reduce == "":
             self.validate_store_like(desc, value, offsets)
             offsets = self._convert_to_ir_values(offsets, require_i64=False)
@@ -1495,6 +1502,8 @@ class TritonSemantic(Generic[TensorTy]):
         return self.make_tensor(handle, expected.type.with_element_ty(tl.int1))
 
     def atomic_cas(self, ptr: TensorTy, cmp: TensorTy, val: TensorTy, sem: str, scope: str) -> TensorTy:
+        ptr, cmp, _ = self._atomic_typechecking_impl(ptr, cmp, None, "cas")
+        ptr, val, _ = self._atomic_typechecking_impl(ptr, val, None, "cas")
         sem = self._str_to_sem(sem)
         scope = self._str_to_scope(scope)
         element_ty = ptr.type.scalar.element_ty
@@ -1851,14 +1860,17 @@ class TritonSemantic(Generic[TensorTy]):
 
     def _bitcast_to_fp_type(self, val: TensorTy, float_format: str):
         """
-        If float_format is subbyte, make sure it's packed as uint8 and return it.
+        If float_format is subbyte, make sure it's packed as uint8 (or the native fp4 pair type for e2m1) and return it.
         Otherwise, return a tensor (perhaps bitcasting) of the specified float format.
         """
         triton_ty = {"e5m2": tl.float8e5, "e4m3": tl.float8e4nv, "bf16": tl.bfloat16, "fp16":
                      tl.float16}.get(float_format)
         if triton_ty is None:
             assert float_format in ("e2m1", "e2m3", "e3m2"), f"Internal Error: Unexpected float format: {float_format}"
-            assert val.dtype == tl.uint8, f"{float_format} format must be packed as uint8. Got {val.dtype}"
+            allowed = [tl.uint8]
+            if float_format == "e2m1":
+                allowed.append(tl.float4e2m1x2)
+            assert val.dtype in allowed, f"{float_format} format must be packed as uint8. Got {val.dtype}"
             return val
         if val.dtype == triton_ty:
             return val
@@ -1892,11 +1904,13 @@ class TritonSemantic(Generic[TensorTy]):
 
     def dot_scaled(self, lhs: TensorTy, lhs_scale: TensorTy, lhs_format: str, rhs: TensorTy,
                    rhs_scale: Optional[TensorTy], rhs_format: str, acc: TensorTy | None, fast_math: bool,
-                   lhs_k_pack: bool, rhs_k_pack: bool, out_dtype: tl.dtype, two_ctas: bool = False) -> TensorTy:
+                   lhs_k_pack: bool, rhs_k_pack: bool, out_dtype: tl.dtype, two_ctas: bool = False,
+                   fp6_packed: bool = False) -> TensorTy:
         fast_math = tl._unwrap_if_constexpr(fast_math)
         lhs_k_pack = tl._unwrap_if_constexpr(lhs_k_pack)
         rhs_k_pack = tl._unwrap_if_constexpr(rhs_k_pack)
         two_ctas = tl._unwrap_if_constexpr(two_ctas)
+        fp6_packed = tl._unwrap_if_constexpr(fp6_packed)
         assert lhs.type.is_block() and rhs.type.is_block(), "dot_scaled operands must be block tensors (not scalars)"
         # TODO: validate types.
         lhs_rank = len(lhs.shape)
@@ -1980,6 +1994,7 @@ class TritonSemantic(Generic[TensorTy]):
                 rhs_k_pack,
                 acc_handle,
                 two_ctas,
+                fp6_packed,
             ),
             ret_ty,
         )
@@ -2247,6 +2262,7 @@ class TritonSemantic(Generic[TensorTy]):
         strides: List[TensorTy],
         block_shape: List[tl.constexpr],
         padding_option: str = "zero",
+        fp6_format=None,
     ) -> tl.tensor_descriptor:
         ndim = len(shape)
         if not (1 <= ndim <= 5):
@@ -2271,6 +2287,11 @@ class TritonSemantic(Generic[TensorTy]):
             raise ValueError(f"Tensor descriptor last dim must be 1 but got {last_stride}")
 
         self._check_tensor_descriptor_alignment_static(strides, elem_size)
+        if fp6_format is not None:
+            if fp6_format not in ("e2m3", "e3m2") or base.dtype.element_ty != tl.uint8:
+                raise ValueError("FP6 descriptors require uint8 storage and format 'e2m3' or 'e3m2'")
+            validate_fp6_box(contig_dim_size, tl._unwrap_if_constexpr(shape[-1]),
+                             [tl._unwrap_if_constexpr(s) for s in strides[:-1]], padding_option)
 
         stride_sources = strides
         shape = [self.make_scalar(x, tl.int32) for x in shape]
@@ -2283,16 +2304,13 @@ class TritonSemantic(Generic[TensorTy]):
         block_shape = tl._unwrap_shape(block_shape)
 
         assert isinstance(base.type, tl.pointer_type), f"base must be a pointer type, got {base.type}"
-        type = tl.block_type(base.type.element_ty, block_shape)
-        base_handle = base.handle
-        is_signed_int = base.type.element_ty.is_int_signed()
-
         padding = self._str_to_padding_option(padding_option)
 
         if base.type.element_ty.is_int() and padding == ir.PADDING_OPTION.PAD_NAN:
             raise ValueError("Padding option `nan` is not supported for integer blocks")
 
-        handle = self.builder.create_make_tensor_descriptor(base_handle, [s.handle for s in shape],
-                                                            [s.handle for s in strides], block_shape, is_signed_int,
-                                                            padding)
-        return tl.tensor_descriptor(handle, shape, strides, type)
+        block_type = tl.block_type(base.type.element_ty, block_shape)
+        desc_ty = tl.tensor_descriptor_base_type(block_type, fp6_format)._to_ir(self.builder)
+        handle = self.builder.create_make_tensor_descriptor(desc_ty, base.handle, [s.handle for s in shape],
+                                                            [s.handle for s in strides], padding)
+        return tl.tensor_descriptor(handle, shape, strides, block_type, fp6_format)

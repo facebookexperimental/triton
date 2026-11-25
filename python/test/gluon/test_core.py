@@ -1269,6 +1269,37 @@ def test_async_copy_mbarrier(copy_vec, cache_policy):
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Requires Hopper or newer")
+@pytest.mark.parametrize("num_ctas", [2, 4])
+@pytest.mark.parametrize("batch", [2, 4])
+@pytest.mark.parametrize("two_ctas, simultaneous", [(False, False), (True, False), (False, True)])
+def test_mbarrier_dynamic_index_gsan(fresh_knobs, num_ctas, two_ctas, batch, simultaneous):
+    from triton.experimental.gsan import create_mem_pool
+
+    @gluon.jit
+    def kernel(BATCH: ttgl.constexpr, TWO_CTAS: ttgl.constexpr, SIMULTANEOUS: ttgl.constexpr):
+        barriers = mbarrier.allocate_mbarrier(batch=BATCH, two_ctas=TWO_CTAS)
+        if SIMULTANEOUS:
+            for i in range(BATCH):
+                mbarrier.init(barriers.index(i), count=1)
+            for i in range(BATCH):
+                barrier = barriers.index(i)
+                mbarrier.arrive(barrier)
+                mbarrier.wait(barrier, phase=0)
+                mbarrier.invalidate(barrier)
+        else:
+            for repeat in range(2):
+                for i in range(BATCH):
+                    barrier = barriers.index(i)
+                    mbarrier.init(barrier, count=1)
+                    mbarrier.invalidate(barrier)
+
+    triton.knobs.compilation.instrumentation_mode = "gsan"
+    with torch.cuda.use_mem_pool(create_mem_pool()):
+        kernel[(1, )](batch, two_ctas, simultaneous, num_warps=1, num_ctas=num_ctas)
+        torch.cuda.synchronize()
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Requires Hopper or newer")
 def test_warp_specialize_noinline_ids():
 
     @gluon.jit
@@ -2924,20 +2955,22 @@ def test_amd_mfma_scaled(M, N, K, a_type, b_type, cd_regclass, has_scale, device
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires CDNA4")
-def test_amd_mfma_scaled_fp6(device='cuda'):
+@pytest.mark.parametrize("a_format", ["e2m3", "e3m2"])
+@pytest.mark.parametrize("b_format", ["e2m3", "e3m2"])
+def test_amd_mfma_scaled_fp6(a_format, b_format, device='cuda'):
     # Manual K=96 (one 16x16x128 step) lowers natively; wider FP6 decomposes.
     M, N, K = 32, 32, 128
 
     @gluon.jit
-    def kernel(out_ptr, a_ptr, b_ptr, a_scale_ptr, b_scale_ptr,
-               M: ttgl.constexpr, N: ttgl.constexpr, K: ttgl.constexpr):
+    def kernel(out_ptr, a_ptr, b_ptr, a_scale_ptr, b_scale_ptr, M: ttgl.constexpr, N: ttgl.constexpr, K: ttgl.constexpr,
+               A_FORMAT: ttgl.constexpr, B_FORMAT: ttgl.constexpr):
         mfma_layout: ttgl.constexpr = ttgl.amd.AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True,
                                                              warps_per_cta=[2, 2])
         a_load_layout: ttgl.constexpr = ttgl.BlockedLayout([1, 16], [8, 8], [4, 1], [1, 0])
-        a_layout: ttgl.constexpr = ttgl.DotOperandLayout(operand_index=0, parent=mfma_layout, k_width=16)
+        a_layout: ttgl.constexpr = ttgl.DotOperandLayout(operand_index=0, parent=mfma_layout, k_width=32)
         a_scale_layout: ttgl.constexpr = ttgl.amd.cdna4.get_mfma_scale_layout(a_layout, [M, K // 32])
         b_load_layout: ttgl.constexpr = ttgl.BlockedLayout([1, 16], [32, 2], [4, 1], [1, 0])
-        b_layout: ttgl.constexpr = ttgl.DotOperandLayout(operand_index=1, parent=mfma_layout, k_width=16)
+        b_layout: ttgl.constexpr = ttgl.DotOperandLayout(operand_index=1, parent=mfma_layout, k_width=32)
         b_scale_layout: ttgl.constexpr = ttgl.amd.cdna4.get_mfma_scale_layout(b_layout, [N, K // 32])
 
         a_offs_m = ttgl.arange(0, M, layout=ttgl.SliceLayout(1, a_load_layout))[:, None]
@@ -2955,30 +2988,118 @@ def test_amd_mfma_scaled_fp6(device='cuda'):
         b_scale_offs_k = ttgl.arange(0, K // 32, layout=ttgl.SliceLayout(0, b_scale_layout))[None, :]
         b_scale = ttgl.amd.cdna4.buffer_load(b_scale_ptr, b_scale_offs_n * (K // 32) + b_scale_offs_k)
         zero = ttgl.zeros([M, N], dtype=ttgl.float32, layout=mfma_layout)
-        c = ttgl.amd.cdna4.mfma_scaled(a, a_scale, "e2m3", b, b_scale, "e3m2", zero)
+        c = ttgl.amd.cdna4.mfma_scaled(a, a_scale, A_FORMAT, b, b_scale, B_FORMAT, zero)
         c = c.to(ttgl.bfloat16)
         out_offs_m = ttgl.arange(0, M)[:, None]
         out_offs_n = ttgl.arange(0, N)[None, :]
         ttgl.amd.cdna4.buffer_store(c, out_ptr, out_offs_m * N + out_offs_n)
 
     torch.manual_seed(0)
-    a_mx = MXFP6Tensor(size=(M, K), device=device, e=2).random()
+    a_mx = MXFP6Tensor(size=(M, K), device=device, e=2 if a_format == "e2m3" else 3).random()
     # No padding: operands carry one code per byte; the ScaledMFMA
     # lowering dense-packs each lane's 32 codes into 24 bytes.
     a = a_mx.data
     # B operand for the kernel is [K, N]: transpose its codes.
-    b_codes = MXFP6Tensor(size=(N, K), device=device, e=3).random()
+    b_codes = MXFP6Tensor(size=(N, K), device=device, e=2 if b_format == "e2m3" else 3).random()
     b = b_codes.data.T.contiguous()
     b_ref_t = b_codes.to(torch.float32)
     a_scale_mx = MXScaleTensor(size=(M, K // 32)).random(1 / 32, 32)
     b_scale_mx = MXScaleTensor(size=(N, K // 32)).random(1 / 32, 32)
     out = torch.empty((M, N), dtype=torch.bfloat16, device=device)
-    compiled = kernel[(1, )](out, a, b, a_scale_mx.data.to(device), b_scale_mx.data.to(device), M, N, K, num_warps=4)
+    compiled = kernel[(1, )](out, a, b, a_scale_mx.data.to(device), b_scale_mx.data.to(device), M, N, K, a_format,
+                             b_format, num_warps=4)
     a_ref = a_mx.to(torch.float32) * a_scale_mx.to(torch.float32).repeat_interleave(32, dim=1).to(device)
     b_ref = b_ref_t * b_scale_mx.to(torch.float32).repeat_interleave(32, dim=1).to(device)
     torch.testing.assert_close(out.float(), a_ref @ b_ref.T, rtol=2e-2, atol=5.0)
-    assert 'v_mfma_scale_f32_16x16x128_f8f6f4' in compiled.asm['amdgcn']
+    instructions = [line for line in compiled.asm['amdgcn'].splitlines() if 'v_mfma' in line]
+    cbsz = 2 if b_format == "e2m3" else 3
+    blgp = 2 if a_format == "e2m3" else 3
+    assert instructions
+    assert all('v_mfma_scale_f32_16x16x128_f8f6f4' in line and f'cbsz:{cbsz}' in line and f'blgp:{blgp}' in line
+               for line in instructions)
     assert 'v_mfma_f32_16x16x32_bf16' not in compiled.asm['amdgcn']
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires CDNA4")
+@pytest.mark.parametrize("a_format", ["e2m3", "e3m2"])
+@pytest.mark.parametrize("b_format", ["e2m3", "e3m2"])
+def test_amd_mfma_scaled_fp6_packed(a_format, b_format, device='cuda'):
+    # Packed producer: global storage is dense-packed (96 bytes per
+    # 128 codes); loads address per-fragment packed bytes directly
+    # and the lowering consumes them (amdg.fp6_packed), with no
+    # unpack/repack round trip.
+    M, N, K = 32, 32, 128
+
+    @gluon.jit
+    def kernel(out_ptr, a_ptr, b_ptr, a_scale_ptr, b_scale_ptr, M: ttgl.constexpr, N: ttgl.constexpr, K: ttgl.constexpr,
+               A_FORMAT: ttgl.constexpr, B_FORMAT: ttgl.constexpr):
+        mfma_layout: ttgl.constexpr = ttgl.amd.AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True,
+                                                             warps_per_cta=[2, 2])
+        a_load_layout: ttgl.constexpr = ttgl.BlockedLayout([1, 16], [8, 8], [4, 1], [1, 0])
+        a_layout: ttgl.constexpr = ttgl.DotOperandLayout(operand_index=0, parent=mfma_layout, k_width=32)
+        a_scale_layout: ttgl.constexpr = ttgl.amd.cdna4.get_mfma_scale_layout(a_layout, [M, K // 32])
+        b_load_layout: ttgl.constexpr = ttgl.BlockedLayout([1, 16], [32, 2], [4, 1], [1, 0])
+        b_layout: ttgl.constexpr = ttgl.DotOperandLayout(operand_index=1, parent=mfma_layout, k_width=32)
+        b_scale_layout: ttgl.constexpr = ttgl.amd.cdna4.get_mfma_scale_layout(b_layout, [N, K // 32])
+
+        # With k_width=32 each lane's fragment is one consecutive
+        # 32-code segment; its packed bytes are the segment's dense
+        # 24-byte block.
+        a_offs_m = ttgl.arange(0, M, layout=ttgl.SliceLayout(1, a_load_layout))[:, None]
+        a_offs_k = ttgl.arange(0, K, layout=ttgl.SliceLayout(0, a_load_layout))[None, :]
+        # The 8 padding bytes after each 24-byte block are masked: for the
+        # last block they would read past the end of the packed row.
+        a_byte = (a_offs_k // 32) * 24 + (a_offs_k % 32)
+        a = ttgl.amd.cdna4.buffer_load(a_ptr, a_offs_m * (K * 3 // 4) + a_byte, mask=(a_offs_k % 32) < 24, other=0)
+        a = ttgl.convert_layout(a, a_layout)
+        b_offs_k = ttgl.arange(0, K, layout=ttgl.SliceLayout(1, b_load_layout))[:, None]
+        b_offs_n = ttgl.arange(0, N, layout=ttgl.SliceLayout(0, b_load_layout))[None, :]
+        b_byte = (b_offs_k // 32) * 24 + (b_offs_k % 32)
+        b = ttgl.amd.cdna4.buffer_load(b_ptr, b_byte * N + b_offs_n, mask=(b_offs_k % 32) < 24, other=0)
+        b = ttgl.convert_layout(b, b_layout)
+        a_scale_offs_m = ttgl.arange(0, M, layout=ttgl.SliceLayout(1, a_scale_layout))[:, None]
+        a_scale_offs_k = ttgl.arange(0, K // 32, layout=ttgl.SliceLayout(0, a_scale_layout))[None, :]
+        a_scale = ttgl.amd.cdna4.buffer_load(a_scale_ptr, a_scale_offs_m * (K // 32) + a_scale_offs_k)
+        b_scale_offs_n = ttgl.arange(0, N, layout=ttgl.SliceLayout(1, b_scale_layout))[:, None]
+        b_scale_offs_k = ttgl.arange(0, K // 32, layout=ttgl.SliceLayout(0, b_scale_layout))[None, :]
+        b_scale = ttgl.amd.cdna4.buffer_load(b_scale_ptr, b_scale_offs_n * (K // 32) + b_scale_offs_k)
+        zero = ttgl.zeros([M, N], dtype=ttgl.float32, layout=mfma_layout)
+        c = ttgl.amd.cdna4.mfma_scaled(a, a_scale, A_FORMAT, b, b_scale, B_FORMAT, zero, packed=True)
+        c = c.to(ttgl.bfloat16)
+        out_offs_m = ttgl.arange(0, M)[:, None]
+        out_offs_n = ttgl.arange(0, N)[None, :]
+        ttgl.amd.cdna4.buffer_store(c, out_ptr, out_offs_m * N + out_offs_n)
+
+    def _pack_dense(codes):
+        rows, k = codes.shape
+        groups = codes.reshape(rows, k // 4, 4).int()
+        packed = torch.stack([
+            groups[..., 0] | (groups[..., 1] << 6),
+            (groups[..., 1] >> 2) | (groups[..., 2] << 4),
+            (groups[..., 2] >> 4) | (groups[..., 3] << 2),
+        ], dim=-1)
+        return packed.reshape(rows, k * 3 // 4).to(torch.uint8)
+
+    torch.manual_seed(0)
+    a_mx = MXFP6Tensor(size=(M, K), device=device, e=2 if a_format == "e2m3" else 3).random()
+    a = _pack_dense(a_mx.data)
+    b_codes = MXFP6Tensor(size=(N, K), device=device, e=2 if b_format == "e2m3" else 3).random()
+    b = _pack_dense(b_codes.data).T.contiguous()
+    b_ref_t = b_codes.to(torch.float32)
+    a_scale_mx = MXScaleTensor(size=(M, K // 32)).random(1 / 32, 32)
+    b_scale_mx = MXScaleTensor(size=(N, K // 32)).random(1 / 32, 32)
+    out = torch.empty((M, N), dtype=torch.bfloat16, device=device)
+    compiled = kernel[(1, )](out, a, b, a_scale_mx.data.to(device), b_scale_mx.data.to(device), M, N, K, a_format,
+                             b_format, num_warps=4)
+    a_ref = a_mx.to(torch.float32) * a_scale_mx.to(torch.float32).repeat_interleave(32, dim=1).to(device)
+    b_ref = b_ref_t * b_scale_mx.to(torch.float32).repeat_interleave(32, dim=1).to(device)
+    torch.testing.assert_close(out.float(), a_ref @ b_ref.T, rtol=2e-2, atol=5.0)
+    instructions = [line for line in compiled.asm['amdgcn'].splitlines() if 'v_mfma' in line]
+    cbsz = 2 if b_format == "e2m3" else 3
+    blgp = 2 if a_format == "e2m3" else 3
+    assert instructions
+    assert all('v_mfma_scale_f32_16x16x128_f8f6f4' in line and f'cbsz:{cbsz}' in line and f'blgp:{blgp}' in line
+               for line in instructions)
 
 
 def test_math_fast_expf():
@@ -4105,7 +4226,8 @@ def test_packed_arith_reduction(dtype):
     torch.testing.assert_close(out_b, b.sum(dim=1), atol=0, rtol=0)
     suffix = {torch.float32: "f32x2", torch.float16: "f16x2", torch.bfloat16: "bf16x2"}[dtype]
     assert "ttng.packed_arith add" in compiled.asm["ttgir"]
-    assert f"add.{suffix}" in compiled.asm["ptx"]
+    modifier = "" if dtype == torch.float32 else ".rn"
+    assert f"add{modifier}.{suffix}" in compiled.asm["ptx"]
     if dtype == torch.float32:
         assert "prmt.b32" not in compiled.asm["ptx"]
 
@@ -4178,7 +4300,7 @@ def test_packed_arith(op, dtype):
     torch.testing.assert_close(ref, out, atol=tolerance, rtol=tolerance)
 
     suffix = {torch.float32: "f32x2", torch.float16: "f16x2", torch.bfloat16: "bf16x2"}[dtype]
-    modifier = ".rn" if op_name == "fma" else ""
+    modifier = ".rn" if op_name == "fma" or (dtype != torch.float32 and op_name in ("add", "sub")) else ""
     assert f"{op_name}{modifier}.{suffix}" in compiled.asm["ptx"]
     assert f"ttng.packed_arith {op_name}" in compiled.asm["ttgir"]
 
@@ -4398,31 +4520,52 @@ def test_split_auto_layout_execution():
     torch.testing.assert_close(output, ref)
 
 
+@pytest.mark.skipif(not is_blackwell_ultra(), reason="Requires SM103")
+def test_fp6_tma_store_noinline():
+    dst = torch.full((2, 48), 0xa5, device="cuda", dtype=torch.uint8)
+    desc = TensorDescriptor.from_tensor(dst, [2, 64], ttgl.NVMMASharedLayout(0, 8, padding="b6p2x16"))
+    compiled = noinline_tma_kernel[(1, )](desc)
+    assert "tt.call" in compiled.asm["ttgir"]
+    torch.testing.assert_close(dst, torch.zeros_like(dst))
+
+
 @gluon.jit
-def _fp6_store_tile(src, dst, desc):
+def _fp6_store_tile(src, dst, desc, ROWS: ttgl.constexpr, WIDTH: ttgl.constexpr):
+    fmt: ttgl.constexpr = ttgl.NVMMASharedLayout(0, 8, padding="b6p2x16")
     if desc is None:
-        fmt: ttgl.constexpr = ttgl.NVMMASharedLayout(0, 8, padding="b6p2x16")
-        desc = tma.make_tensor_descriptor(dst, [5, 128], [96, 1], [1, 128], fmt)
+        desc = tma.make_tensor_descriptor(dst, [2 * ROWS + 3, WIDTH], [WIDTH * 3 // 4, 1], [ROWS, WIDTH], fmt)
     layout: ttgl.constexpr = ttgl.BlockedLayout([1, 1], [1, 32], [4, 1], [1, 0])
-    i = ttgl.arange(0, 128, layout=ttgl.SliceLayout(0, layout))
-    lanes = ttgl.load(src + i).expand_dims(0)
-    stage = ttgl.allocate_shared_memory(ttgl.uint8, [1, 128], ttgl.NVMMASharedLayout(0, 8, padding="b6p2x16"), lanes)
+    pid = ttgl.program_id(0)
+    row = ttgl.arange(0, ROWS, layout=ttgl.SliceLayout(1, layout))
+    col = ttgl.arange(0, WIDTH, layout=ttgl.SliceLayout(0, layout))
+    lanes = ttgl.load(src + (pid * ROWS + row[:, None]) * WIDTH + col[None, :])
+    stage = ttgl.allocate_shared_memory(ttgl.uint8, [ROWS, WIDTH], fmt, lanes)
     fence_async_shared()
-    tma.async_store(desc, [2 * ttgl.program_id(0) + 1, 0], stage)
+    tma.async_store(desc, [pid * (ROWS + 1) + 1, 0], stage)
     tma.store_wait(0)
+
+
+def test_fp6_tma_store_reshaped_source_sm100():
+    layout = ttgl.NVMMASharedLayout(0, 8, padding="b6p2x16")
+    desc_type = f"tensordesc<u8[1,128],{layout!r}>"
+    signature = {"src": "*u8", "dst": "*u8", "desc": desc_type, "ROWS": "constexpr", "WIDTH": "constexpr"}
+    source = gluon.GluonASTSource(_fp6_store_tile, signature, {"ROWS": 2, "WIDTH": 64})
+    triton.compile(source, target=GPUTarget("cuda", 100, 32))
 
 
 @pytest.mark.skipif(not is_cuda() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
                     reason="Requires SM100 or SM103")
-@pytest.mark.parametrize("host", [False, True], ids=["device", "host"])
-def test_fp6_tma_store_contiguous(host, with_allocator):
-    src = torch.randint(0, 256, (128, ), device="cuda", dtype=torch.uint8)
-    dst = torch.full((5, 96), 0xa5, device="cuda", dtype=torch.uint8)
+@pytest.mark.parametrize("host,rows,width", [(False, 1, 128), (True, 1, 128), (True, 1, 64), (True, 2, 64)])
+def test_fp6_tma_store_contiguous(host, rows, width, with_allocator):
+    if width == 64 and not is_blackwell_ultra():
+        pytest.skip("64-value FP6 stores require SM103")
+    src = torch.randint(0, 256, (2, rows, width), device="cuda", dtype=torch.uint8)
+    dst = torch.full((2 * rows + 3, width * 3 // 4), 0xa5, device="cuda", dtype=torch.uint8)
     expected = dst.clone()
-    expected[1::2] = pack_fp6(src.int() & 63)
-    desc = TensorDescriptor.from_tensor(dst, [1, 128], ttgl.NVMMASharedLayout(0, 8,
-                                                                              padding="b6p2x16")) if host else None
-    kernel = _fp6_store_tile[(2, )](src, dst, desc)
+    expected[1:rows + 1], expected[rows + 2:-1] = pack_fp6(src.int() & 63)
+    layout = ttgl.NVMMASharedLayout(0, 8, padding="b6p2x16")
+    desc = TensorDescriptor.from_tensor(dst, [rows, width], layout) if host else None
+    kernel = _fp6_store_tile[(2, )](src, dst, desc, rows, width)
     torch.testing.assert_close(dst, expected)
     assert "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group" in kernel.asm["ptx"]
     if host:
@@ -4895,6 +5038,62 @@ def test_convert_auto_layout_to_coalesced_layout():
     torch.testing.assert_close(output, ref)
 
 
+@pytest.mark.skipif(not is_ampere_or_newer(), reason="Requires Ampere or newer")
+@pytest.mark.parametrize("operation", ["ld", "st"])
+@pytest.mark.parametrize("dtype, transpose, reg_bases, lane_bases", [
+    pytest.param(torch.int8, True, [128, 32, 64, 8, 512, 1024], [16, 256, 1, 2, 4], id="b8-transpose-nonadditive"),
+    pytest.param(torch.int8, True, [32, 64, 8, 128, 512], [16, 256, 1, 2, 4], id="b8-transpose-load-packed"),
+    pytest.param(torch.int8, True, [32, 8, 64, 128, 512], [16, 256, 1, 2, 4], id="b8-transpose-store-packed"),
+    pytest.param(torch.float16, True, [8], [16, 32, 1, 2, 4], id="b16-transpose-x1"),
+    pytest.param(torch.float16, True, [64, 32, 128, 256], [8, 16, 1, 2, 4], id="b16-transpose-bank-conflict"),
+    pytest.param(torch.int8, False, [128, 1, 2, 256, 512], [4, 8, 16, 32, 64], id="b8-packed"),
+    pytest.param(torch.float16, False, [64, 1, 128, 256], [2, 4, 8, 16, 32], id="b16"),
+    pytest.param(torch.float32, False, [32, 64, 128], [1, 2, 4, 8, 16], id="b32"),
+])
+def test_ldstmatrix_register_order(operation, dtype, transpose, reg_bases, lane_bases):
+    is_b8 = dtype == torch.int8 and transpose
+    if operation == "st" and torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("stmatrix requires SM90 or newer")
+    if is_b8 and torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("ldmatrix/stmatrix.b8 requires SM100 or newer")
+
+    @gluon.jit
+    def kernel(inp, out, N: ttgl.constexpr, store_layout: ttgl.constexpr, load_layout: ttgl.constexpr,
+               shared_layout: ttgl.constexpr):
+        offsets = ttgl.arange(0, N, layout=store_layout)
+        values = ttgl.load(inp + offsets)
+        smem = ttgl.allocate_shared_memory(inp.dtype.element_ty, [N], shared_layout)
+        smem.store(values)
+        values = smem.load(load_layout)
+        offsets = ttgl.arange(0, N, layout=load_layout)
+        ttgl.store(out + offsets, values)
+
+    size = 32 << len(reg_bases)
+    shared_bases = [[1 << i] for i in range(size.bit_length() - 1)]
+    if size > 512:
+        # Exercise composition with the additive-stride register permutation.
+        shared_bases[9][0] ^= 16
+    shared_layout = ttgl.SharedLinearLayout(shared_bases)
+    layout = ttgl.DistributedLinearLayout(reg_bases=[[b] for b in reg_bases], lane_bases=[[b] for b in lane_bases],
+                                          warp_bases=[], block_bases=[], shape=[size])
+    blocked = ttgl.BlockedLayout([1], [32], [1], [0])
+    store_layout, load_layout = (layout, blocked) if operation == "st" else (blocked, layout)
+    inp = torch.randint(0, 127, (size, ), dtype=torch.int32, device="cuda").to(dtype)
+    out = torch.empty_like(inp)
+    compiled = kernel[(1, )](inp, out, size, store_layout, load_layout, shared_layout, num_warps=1)
+    torch.testing.assert_close(out, inp, atol=0, rtol=0)
+
+    shape, bitwidth = "m8n8", 16
+    if is_b8:
+        shape, bitwidth = ("m16n16", 8) if operation == "ld" else ("m16n8", 8)
+    bytes_per_matrix = 256 if is_b8 and operation == "ld" else 128
+    total_bytes = size * inp.element_size()
+    count = min(total_bytes, 512) // bytes_per_matrix
+    trans = r"\.trans" if transpose else ""
+    opcode = rf"{operation}matrix\.sync\.aligned\.(?:{shape}\.x{count}|x{count}\.{shape}){trans}\.shared\.b{bitwidth}"
+    assert len(re.findall(opcode, compiled.asm["ptx"])) == total_bytes // (bytes_per_matrix * count)
+
+
 @gluon.jit
 def in_thread_transpose_roundtrip_kernel(input, output, M: ttgl.constexpr, N: ttgl.constexpr,
                                          first_layout: ttgl.constexpr, second_layout: ttgl.constexpr,
@@ -4951,6 +5150,19 @@ def test_in_thread_convert_layout_8bit(src_reg_bases, dst_reg_bases):
 def descriptor_shape_kernel(desc, expect_shape):
     for i in ttgl.static_range(len(expect_shape)):
         ttgl.device_assert(desc.shape[i] == expect_shape[i])
+
+
+@pytest.mark.skipif(not is_blackwell_ultra(), reason="Requires SM103")
+def test_fp6_host_descriptor_shape_only():
+    dst = torch.empty((2, 48), device="cuda", dtype=torch.uint8)
+
+    def warmup(packing):
+        desc = TensorDescriptor.from_tensor(dst, [2, 64], ttgl.NVMMASharedLayout(0, 8, padding=packing))
+        descriptor_shape_kernel.warmup(desc, (2, 64), grid=(1, ), debug=True)
+
+    warmup("b6p2x16")
+    with pytest.raises(TypeError, match="64-value FP6 host maps require store packing"):
+        warmup("b6x16_p32")
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")

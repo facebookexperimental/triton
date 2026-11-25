@@ -563,9 +563,21 @@ def test_reduce_marker_rejects_rank_divergent_loop():
     assert "multi_cta loop bounds and step must not depend on cluster rank" in str(exc_info.value)
 
 
+def test_reduce_marker_ignores_meta_ws_without_warp_specialization_request():
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = True
+        compiled = _compile(
+            _marked_sum_kernel,
+            {"BLOCK_SIZE": 1024, "NUM_CTAS": 4},
+            cluster_dims=(1, 4, 1),
+        )
+    assert "async_remote_shmem_store" in compiled.asm["ttgir"]
+
+
 def test_reduce_marker_rejects_automatic_warp_specialization():
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
+        triton.knobs.nvidia.use_joint_schedule = True
         with pytest.raises(Exception) as exc_info:
             _compile(
                 _marked_sum_kernel,

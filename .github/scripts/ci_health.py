@@ -32,13 +32,12 @@ Records of mi350/b200/h100.yml from before #3875 may remain in the store; the
 rules ignore them.
 
 bump.json, rewritten whole by each collection:
-  {lines: {<tracked branch>: {fork_branch, pinned: {tag, llvm_hash, base} | null,
+  {lines: {<tracked branch>: {fork_branch, pinned: {tag, llvm_hash} | null,
    newest: {tag, llvm_hash, published_at} | null, pending: [fork change],
    pr: {number, title, url, author, created_at} | null, issues: [{number, title, url, created_at}],
    history: [{sha, t, title, pr, tag, llvm_hash, prev_hash | null}]}}}
   fork change: {sha, title, pr}, a fork commit with its fork PR number. pending is
-  what newest adds over pinned; base is the upstream (OAI) LLVM commit the pin
-  is built on; history is the pin's last changes on the branch,
+  what newest adds over pinned; history is the pin's last changes on the branch,
   newest first, each with the llvm_hash it replaced (null for the first pin).
 """
 import argparse
@@ -160,7 +159,8 @@ def _jobs(pages):
         "id":
         j.get("id"), "run_attempt":
         j.get("run_attempt", 1), "name":
-        j["name"], "conclusion":
+        j["name"], "status":
+        j.get("status"), "conclusion":
         j["conclusion"], "created_at":
         j.get("created_at"), "started_at":
         j["started_at"], "completed_at":
@@ -411,10 +411,7 @@ def _meta(get, ref):
     except subprocess.CalledProcessError:  # no cmake/meta-llvm-info.json at ref
         return None
     meta = json.loads(base64.b64decode(data["content"]))
-    return {
-        "tag": meta["release_base_url"].rsplit("/", 1)[-1], "llvm_hash": meta["llvm_hash"], "base":
-        meta.get("based_on_oai_llvm_hash")
-    }
+    return {"tag": meta["release_base_url"].rsplit("/", 1)[-1], "llvm_hash": meta["llvm_hash"]}
 
 
 def _pr_of(title):
@@ -562,9 +559,7 @@ def collect(data_dir, since, now, api=gh_api, text=gh_text, get=gh_get, download
     todo = sorted(
         (r for r in runs.values()
          if (r["status"] == "completed" and (r["jobs"] is None or r["id"] in enrich or r["id"] in sanitizer_retry)) or (
-             r["wf"] == rules.FAST_WF and r["event"] == "pull_request" and r["status"] != "completed") or (
-                 r["wf"] == "gpu-tests.yml" and r["event"] == "workflow_run" and r["status"] != "completed")),
-        key=lambda r: r["created_at"])
+             r["wf"] in rules.GPU_RUN_WORKFLOWS and r["status"] != "completed")), key=lambda r: r["created_at"])
     unfetched = []
     for i, r in enumerate(todo):
         if i % 50 == 0 and _remaining(api) < RATE_FLOOR:
@@ -604,7 +599,7 @@ def collect(data_dir, since, now, api=gh_api, text=gh_text, get=gh_get, download
         else:
             if r["wf"] in rules.GPU_RUN_WORKFLOWS:
                 _attach_failures(jobs, log, r["wf"])
-            if rules.slow_test_run(r):
+            if rules.slow_test_run(r) and r["status"] == "completed":
                 _attach_durations(jobs, log)
             if r["wf"] == rules.LIT_WF:
                 _attach_lit_failures(jobs, log)
