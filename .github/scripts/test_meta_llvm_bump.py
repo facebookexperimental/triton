@@ -495,8 +495,8 @@ def test_handled_candidate_is_not_reproposed_from_a_newer_base(monkeypatch):
         calls.append(kwargs)
         if 'labels=llvm-candidate' in path:
             return [[{'number': 7, 'pull_request': {}, 'body': marker}]]
-        if '/pulls?' in path:
-            return [[]]
+        if '/pulls?' in path or '/matching-refs/' in path:
+            return [[]] if '/pulls?' in path else []
         assert path.endswith('/pulls/7')
         return {
             'number': 7, 'state': 'closed', 'draft': True, 'base': {'ref': 'main'}, 'body': marker, 'html_url': 'pr-7'
@@ -511,18 +511,29 @@ def test_handled_candidate_is_not_reproposed_from_a_newer_base(monkeypatch):
 def test_superseding_closes_only_untouched_drafts(monkeypatch):
     import meta_llvm_ready as ready
     base, head = 'a' * 40, 'c' * 40
-    # 1 untouched, 2 reviewed, 3 amended by a maintainer, 4 a newer packaging build of the proposed commit.
-    shas = {1: '1' * 40, 2: '2' * 40, 3: '3' * 40, 4: NEW}
-    builds = {1: 1, 2: 1, 3: 1, 4: 2}
+    # 1 untouched, 2 renamed by a maintainer, 3 amended by a maintainer, 4 a newer build of the proposed commit,
+    # 5 description edited by a maintainer.
+    shas = {1: '1' * 40, 2: '2' * 40, 3: '3' * 40, 4: NEW, 5: '5' * 40}
+    builds = {1: 1, 2: 1, 3: 1, 4: 2, 5: 1}
     pulls = [{
-        'number': n, 'pull_request': {}, 'body': f'<!-- llvm-candidate beta/amd/{shas[n]}/{builds[n]}/{base} -->'
+        'number': n, 'state': 'open', 'pull_request': {}, 'body':
+        f'<!-- llvm-candidate beta/amd/{shas[n]}/{builds[n]}/{base} -->'
     } for n in shas]
-    issues = [{'number': 10 + n, 'body': ready.issue_marker('amd', shas[n], builds[n])} for n in (1, 2, 3)]
-    issues.append({'number': 20, 'body': ready.issue_marker('amd', '5' * 40, 1)})
+    # Issue 20 has no PR, and issue 21 belongs to an earlier proposal that was already closed.
+    issues = [{'number': 10 + n, 'body': ready.issue_marker('amd', shas[n], builds[n])} for n in shas]
+    issues += [{'number': 20, 'body': ready.issue_marker('amd', '6' * 40, 1)},
+               {'number': 21, 'body': ready.issue_marker('amd', '7' * 40, 1)}]
+    pulls.append({
+        'number': 7, 'state': 'closed', 'pull_request': {}, 'body':
+        f'<!-- llvm-candidate beta/amd/{"7" * 40}/1/{base} -->'
+    })
     bot = {'email': ready.BOT_EMAIL}
     writes = []
 
     def api(path, method=None, payload=None, **kwargs):
+        if path == 'graphql':
+            edited = '2026-11-25T00:00:00Z' if payload['variables']['p'] == 5 else None
+            return {'data': {'repository': {'pullRequest': {'lastEditedAt': edited}}}}
         if method:
             writes.append((path, method))
             return {}
@@ -535,14 +546,13 @@ def test_superseding_closes_only_untouched_drafts(monkeypatch):
             return [[{
                 'sha': head, 'commit': {'author': bot, 'committer': committer, 'verification': {'verified': True}}
             }]]
-        if '/reviews?' in path:
-            return [[{'user': {'type': 'User'}}]] if '/pulls/2/' in path else [[]]
-        if '/comments?' in path:
-            return [[]]
+        if '/timeline?' in path:
+            renamed = [{'event': 'renamed', 'actor': {'type': 'User'}}] if '/issues/2/' in path else []
+            return [[{'event': 'cross-referenced', 'actor': {'type': 'User'}}, *renamed]]
         return {'draft': True, 'base': {'ref': 'main'}, 'head': {'sha': head}}
 
     monkeypatch.setattr(ready, 'github_json', api)
     monkeypatch.setattr(ready, 'bot_head', lambda *args: True)
-    assert ready.close_superseded(ready.REPOSITORY, 'amd', NEW, 1, 9) == ([1], [2, 3])
+    assert ready.close_superseded(ready.REPOSITORY, 'amd', NEW, 1, 9) == ([1], [2, 3, 5])
     closed = {path.rsplit('/', 1)[1] for path, method in writes if method == 'PATCH'}
-    assert closed == {'1', '11'}
+    assert closed == {'1', '11', '20', '21'}

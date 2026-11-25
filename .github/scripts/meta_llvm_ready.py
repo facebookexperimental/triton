@@ -165,6 +165,8 @@ def ensure_issue(repo, candidate, platforms, pr=None):
     pr = pr or {'status': 'not requested'}
     if pr['status'] in ('superseded', 'adopted', 'handled'):
         return f"No readiness issue: the candidate is {pr['status']}"
+    if pr.get('number') and github_json(f"repos/{repo}/pulls/{pr['number']}")['state'] != 'open':
+        return f"No readiness issue: draft PR #{pr['number']} was closed"
     validated = validated_candidate(repo, candidate, platforms)
     if validated is None:
         return 'Candidate superseded before readiness notification'
@@ -268,8 +270,12 @@ def newer(sha, build, other_sha, other_build):
     return other_sha != sha or int(other_build) < build
 
 
+PASSIVE_EVENTS = {'committed', 'cross-referenced', 'mentioned', 'referenced', 'subscribed', 'unsubscribed'}
+EDITED = 'query($o: String!, $n: String!, $p: Int!) {repository(owner: $o, name: $n) {pullRequest(number: $p) {lastEditedAt}}}'
+
+
 def untouched(repo, kind, base, number):
-    """Whether a candidate PR is still the bot's unreviewed one-commit draft."""
+    """Whether a candidate PR is still the bot's draft: no human edit, event, review or commit since creation."""
     pull = github_json(f'repos/{repo}/pulls/{number}')
     if not pull['draft'] or pull['base']['ref'] != 'main':
         return False
@@ -281,31 +287,40 @@ def untouched(repo, kind, base, number):
     if (commit['author']['email'] != BOT_EMAIL or commit['committer']['email'] != 'noreply@github.com'
             or not commit['verification']['verified']):
         return False
-    for kind_ in ('pulls/{n}/reviews', 'pulls/{n}/comments', 'issues/{n}/comments'):
-        pages = github_json(f'repos/{repo}/' + kind_.format(n=number) + '?per_page=100', paginate=True)
-        if any(item['user']['type'] != 'Bot' for page in pages for item in page):
+    pages = github_json(f'repos/{repo}/issues/{number}/timeline?per_page=100', paginate=True)
+    for event in (event for page in pages for event in page):
+        actor = event.get('actor') or event.get('user') or {}
+        if event.get('event') not in PASSIVE_EVENTS and actor.get('type') != 'Bot':
             return False
+    owner, name = repo.split('/')
+    edited = github_json('graphql', method='POST',
+                         payload={'query': EDITED, 'variables': {'o': owner, 'n': name, 'p': number}})
+    if edited['data']['repository']['pullRequest']['lastEditedAt']:
+        return False
     return bot_head(repo, kind, base, pull['head']['sha'])
 
 
 def close_superseded(repo, kind, sha, build, replacement):
-    """Close older untouched draft candidates of one kind, and the readiness issues of the PRs it closes."""
+    """Close older untouched draft candidates of one kind, and readiness issues no open candidate PR still tracks."""
+    note = {'body': f'Superseded by #{replacement}, which proposes a newer bundle.'}
+    proposals = labeled(repo, CANDIDATE_LABEL, 'all', CANDIDATE, True)
     closed, kept = [], []
-    for item, (k, old_sha, old_build, base) in labeled(repo, CANDIDATE_LABEL, 'open', CANDIDATE, True):
-        if k != kind or item['number'] == replacement or not newer(sha, build, old_sha, old_build):
+    for item, (k, old_sha, old_build, base) in proposals:
+        if (k != kind or item['number'] == replacement or item['state'] != 'open'
+                or not newer(sha, build, old_sha, old_build)):
             continue
         if not untouched(repo, kind, base, item['number']):
             kept.append(item['number'])
             continue
-        note = {'body': f'Superseded by #{replacement}, which proposes a newer bundle.'}
         github_json(f"repos/{repo}/issues/{item['number']}/comments", method='POST', payload=note)
         github_json(f"repos/{repo}/pulls/{item['number']}", method='PATCH', payload={'state': 'closed'})
         closed.append(item['number'])
-        for issue, groups in labeled(repo, LABEL, 'open', READY, False):
-            if groups == (kind, old_sha, old_build):
-                github_json(f"repos/{repo}/issues/{issue['number']}/comments", method='POST', payload=note)
-                github_json(f"repos/{repo}/issues/{issue['number']}", method='PATCH',
-                            payload={'state': 'closed', 'state_reason': 'not_planned'})
+    tracked = {groups[:3] for item, groups in proposals if item['state'] == 'open' and item['number'] not in closed}
+    for issue, groups in labeled(repo, LABEL, 'open', READY, False):
+        if groups[0] == kind and newer(sha, build, groups[1], groups[2]) and groups not in tracked:
+            github_json(f"repos/{repo}/issues/{issue['number']}/comments", method='POST', payload=note)
+            github_json(f"repos/{repo}/issues/{issue['number']}", method='PATCH',
+                        payload={'state': 'closed', 'state_reason': 'not_planned'})
     return closed, sorted(kept)
 
 
@@ -338,7 +353,10 @@ def ensure_candidate_pr(repo, candidate, platforms, base=''):
     branch = f'scratch/llvm-candidate/{kind}-{sha[:8]}-{build}'
     # INVARIANT: one proposal per kind, LLVM commit and packaging revision, whatever Triton base it started from.
     proposals = labeled(repo, CANDIDATE_LABEL, 'all', CANDIDATE, True)
-    if any(k == kind and other == sha and int(b) > build for _, (k, other, b, _) in proposals):
+    refs = github_json(f'repos/{repo}/git/matching-refs/heads/scratch/llvm-candidate/{kind}-{sha[:8]}-')
+    builds = [int(b) for _, (k, other, b, _) in proposals if (k, other) == (kind, sha)]
+    builds += [int(ref['ref'].rsplit('-', 1)[1]) for ref in refs if ref['ref'].rsplit('-', 1)[1].isdigit()]
+    if any(b > build for b in builds):
         return dict(result, status='superseded')
     numbers = {item['number'] for item, groups in proposals if groups[:3] == (kind, sha, str(build))}
     pages = github_json(f'repos/{repo}/pulls?state=all&head=facebookexperimental:{quote(branch, safe="")}&per_page=100',
@@ -417,6 +435,8 @@ def main():
                 results.append(ensure_candidate_pr(repo, candidate, platforms, os.environ.get('CANDIDATE_BASE_SHA',
                                                                                               '')))
                 print(json.dumps(results[-1]), flush=True)
+                if results[-1].get('error'):
+                    failures.append(candidate['kind'])
         except BundleNotReady as error:
             print(error, flush=True)
         except Exception as error:
