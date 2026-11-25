@@ -759,6 +759,30 @@ def test_flash_attn_gfx950_short_ragged_inference(context):
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
+@pytest.mark.parametrize(("context", "causal"), ((640, False), (1088, False), (1088, True)))
+def test_flash_attn_gfx950_forward_partial_query_tile(context, causal):
+    """A length that leaves the last 256-row query tile partial must still match the reference."""
+    from triton.tlx.ops import flash_attn
+
+    torch.manual_seed(5416)
+    q, k, v = _qkv(128, requires_grad=False, context=context)
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        scores = (q.float() @ k.float().transpose(-2, -1)) * q.shape[-1]**-0.5
+        if causal:
+            causal_mask = torch.ones((context, context), device=q.device, dtype=torch.bool).triu(1)
+            scores.masked_fill_(causal_mask, float("-inf"))
+        reference = torch.softmax(scores, dim=-1) @ v.float()
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+    for _ in range(3):
+        actual = flash_attn(q, k, v, causal=causal)
+        tolerance = 8e-3 * reference.abs().max().item()
+        torch.testing.assert_close(actual.float(), reference, atol=tolerance, rtol=8e-3)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
 def test_flash_attn_gfx950_keeps_inference_only_shapes():
     from triton.tlx.ops import flash_attn
 
