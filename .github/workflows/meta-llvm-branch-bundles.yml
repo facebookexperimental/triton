@@ -138,6 +138,7 @@ jobs:
     if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && inputs.create_candidate_pr && inputs.publish && needs.select.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
+      actions: write
       contents: write
       pull-requests: write
     concurrency:

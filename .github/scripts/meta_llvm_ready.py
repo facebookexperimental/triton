@@ -196,6 +196,21 @@ def read_manifest(repo, path, ref):
     return manifest
 
 
+def dispatch_consumer_tests(repo, kind, branch, head, pr):
+    # The AMD SDK only builds the AMD codegen library, so NVIDIA GPU tests cannot observe it.
+    workflows = {
+        'gpu-tests.yml': {'platforms': 'mi350'} if kind == 'amd' else {}, 'tlx-ops-perf-smoke.yml': {'pr': str(pr)}
+    }
+    for workflow, inputs in workflows.items():
+        runs = github_json(f'repos/{repo}/actions/workflows/{workflow}/runs?head_sha={head}&per_page=100')
+        if any(run['conclusion'] != 'action_required' for run in runs['workflow_runs']):
+            print(f'{workflow} already has a run for {head}', flush=True)
+            continue
+        github_json(f'repos/{repo}/actions/workflows/{workflow}/dispatches', method='POST',
+                    payload={'ref': branch, 'inputs': inputs})
+        print(f'Dispatched {workflow} on {branch} at {head}', flush=True)
+
+
 def ensure_candidate_pr(repo, candidate, platforms, base):
     validated = validated_candidate(repo, candidate, platforms)
     if validated is None:
@@ -205,6 +220,9 @@ def ensure_candidate_pr(repo, candidate, platforms, base):
         raise ValueError('Candidate PR requires a full Triton base SHA')
     if github_json(f'repos/{repo}/compare/{base}...main')['status'] not in ('ahead', 'identical'):
         raise ValueError('Candidate baseline is not on main history')
+    for workflow in ('gpu-tests.yml', 'tlx-ops-perf-smoke.yml'):
+        if github_json(f'repos/{repo}/contents/.github/workflows/{workflow}?ref={base}', missing_ok=True) is None:
+            raise ValueError(f'Candidate baseline has no {workflow} to test the PR')
     kind, sha, build = candidate['kind'], candidate['llvm_sha'], int(candidate['build_number'])
     path = 'cmake/meta-amd-llvm-info.json' if kind == 'amd' else 'cmake/meta-llvm-info.json'
     old = read_manifest(repo, path, base)
@@ -254,12 +272,14 @@ def ensure_candidate_pr(repo, candidate, platforms, base):
     if pulls:
         if any(pull['head']['sha'] != head for pull in pulls):
             raise ValueError('Existing candidate PR head changed; it will not be overwritten')
+        dispatch_consumer_tests(repo, kind, branch, head, pulls[0]['number'])
         return pulls[0]['html_url']
     pull = github_json(f'repos/{repo}/pulls', method='POST',
                        payload={'title': title, 'body': body, 'head': branch, 'base': 'main', 'draft': True})
     if (not pull['draft'] or pull['head']['sha'] != head or pull['base']['ref'] != 'main' or pull['state'] != 'open'):
         raise ValueError('Created candidate PR does not match the prepared head, base or draft state')
     print('PR author: ' + pull['user']['login'], flush=True)
+    dispatch_consumer_tests(repo, kind, branch, head, pull['number'])
     return pull['html_url']
 
 
