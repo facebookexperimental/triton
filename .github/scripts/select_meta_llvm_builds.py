@@ -48,8 +48,9 @@ def main():
     kind = os.environ.get('KIND') or 'all'
     kinds = BRANCHES if kind == 'all' else {kind: BRANCHES[kind]}
     if os.environ.get('CREATE_CANDIDATE_PR') == 'true':
-        if re.fullmatch(r'[0-9a-f]{40}', os.environ.get('CANDIDATE_BASE_SHA', '')) is None:
-            raise ValueError('Candidate PR creation requires a full Triton base SHA')
+        base = os.environ.get('CANDIDATE_BASE_SHA', '')
+        if base and re.fullmatch(r'[0-9a-f]{40}', base) is None:
+            raise ValueError('A candidate base must be a full Triton commit SHA')
         if os.environ.get('PUBLISH') == 'false':
             raise ValueError('Candidate PR creation requires published bundles')
     manifests = event == 'push' or os.environ.get('REQUEST_SOURCE') == 'manifests'

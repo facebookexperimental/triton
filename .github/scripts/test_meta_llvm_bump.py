@@ -483,26 +483,54 @@ def test_explicit_validation_is_not_skipped_for_a_complete_bundle(monkeypatch):
                           validate_existing=True) == [{'kind': 'amd', 'llvm_sha': NEW, 'build_number': '1'}]
 
 
-def test_closed_candidate_is_not_recreated_on_retry(monkeypatch):
+def test_handled_candidate_is_not_reproposed_from_a_newer_base(monkeypatch):
     import meta_llvm_ready as ready
     assets, receipt, candidate = _ready_fixture('amd')
-    base = 'b' * 40
+    marker = f'<!-- llvm-candidate beta/amd/{NEW}/1/{"a" * 40} -->'
     monkeypatch.setattr(ready, 'validated_candidate', lambda *args: ({a['name']: a for a in assets}, receipt))
-    monkeypatch.setattr(ready, 'read_manifest', lambda *args: dict(META))
     calls = []
 
     def api(path, **kwargs):
         calls.append(kwargs)
-        if '/compare/' in path:
-            return {'status': 'ahead'}
-        if '/contents/.github/workflows/' in path:
-            return {}
-        if '/git/ref/' in path:
-            return None
-        assert '/pulls?' in path
-        return [[{'state': 'closed', 'draft': True}]]
+        if 'labels=llvm-candidate' in path:
+            return [[{'number': 7, 'pull_request': {}, 'body': marker}]]
+        if '/pulls?' in path:
+            return [[]]
+        assert path.endswith('/pulls/7')
+        return {
+            'number': 7, 'state': 'closed', 'draft': True, 'base': {'ref': 'main'}, 'body': marker, 'html_url': 'pr-7'
+        }
 
     monkeypatch.setattr(ready, 'github_json', api)
-    with pytest.raises(ValueError, match='closed or changed'):
-        ready.ensure_candidate_pr(ready.REPOSITORY, candidate, BRANCH_PLATFORMS, base)
+    result = ready.ensure_candidate_pr(ready.REPOSITORY, candidate, BRANCH_PLATFORMS)
+    assert result['status'] == 'handled' and result['number'] == 7
     assert all('method' not in call for call in calls)
+
+
+def test_superseding_closes_only_untouched_drafts(monkeypatch):
+    import meta_llvm_ready as ready
+    untouched, reviewed = '1' * 40, '2' * 40
+    pulls = [{'number': n, 'pull_request': {}, 'body': f'<!-- llvm-candidate beta/amd/{sha}/1/{"a" * 40} -->'}
+             for n, sha in ((1, untouched), (2, reviewed))]
+    issues = [{'number': n, 'body': ready.issue_marker('amd', sha, 1)} for n, sha in ((10, untouched), (11, reviewed))]
+    writes = []
+
+    def api(path, method=None, payload=None, **kwargs):
+        if method:
+            writes.append((path, method))
+            return {}
+        if 'labels=llvm-candidate' in path:
+            return [pulls]
+        if 'labels=llvm-bundle-ready' in path:
+            return [issues]
+        if '/reviews?' in path:
+            return [[{'id': 1}]] if '/pulls/2/' in path else [[]]
+        if '/commits?' in path:
+            return [[{}]]
+        return {'draft': True, 'head': {'sha': 'c' * 40}}
+
+    monkeypatch.setattr(ready, 'github_json', api)
+    monkeypatch.setattr(ready, 'bot_head', lambda *args: True)
+    assert ready.close_superseded(ready.REPOSITORY, 'amd', NEW, 1, 9) == ([1], [2])
+    closed = {path.rsplit('/', 1)[1] for path, method in writes if method == 'PATCH'}
+    assert closed == {'1', '10'}
