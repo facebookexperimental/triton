@@ -3066,6 +3066,16 @@ LogicalResult TMEMSubSliceOp::verify() {
   if (offset < 0 || int64_t(offset) + dstShape[sliceDim] > srcShape[sliceDim]) {
     return emitError("The split offset may not exceed the source shape");
   }
+  // A BLOCK_M=64 2-CTA accumulator keeps the right half of each blockN block
+  // in TMEM rows 64-127, so only whole blockN blocks are column ranges of the
+  // buffer.
+  if (auto encoding = dyn_cast<TensorMemoryEncodingAttr>(srcEncoding);
+      encoding && encoding.getCtaMode() == TensorMemoryCTAMode::TwoCTA_RHS &&
+      sliceDim == srcTy.getRank() - 1 &&
+      (dstShape[sliceDim] % encoding.getBlockN() != 0 ||
+       offset % encoding.getBlockN() != 0))
+    return emitOpError("cannot take an N subslice of a two-CTA (twocta_rhs) "
+                       "accumulator");
 
   if (isa<triton::tlx::DummyTMEMLayoutAttr>(srcEncoding))
     return success();

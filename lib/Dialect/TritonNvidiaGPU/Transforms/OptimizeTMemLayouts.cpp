@@ -30,6 +30,29 @@ static Value stripConvertLayout(Value v,
   return v;
 }
 
+// The TMEM encoding a split chain loads from: its tmem_load's, or for a nested
+// split, the encoding of the tmem_load the outer chains start from (their
+// subslices keep the source's TwoCTA_RHS mode and do not grow blockN).
+static TensorMemoryEncodingAttr getSplitChainTMemEncoding(Value reshapeSrc) {
+  SmallVector<ttg::ConvertLayoutOp> cvts;
+  for (int depth = 0; depth < 4; ++depth) {
+    if (auto load = reshapeSrc.getDefiningOp<TMEMLoadOp>())
+      return dyn_cast<TensorMemoryEncodingAttr>(
+          load.getSrc().getType().getEncoding());
+    auto split = reshapeSrc.getDefiningOp<SplitOp>();
+    auto trans =
+        split
+            ? stripConvertLayout(split.getSrc(), cvts).getDefiningOp<TransOp>()
+            : TransOp();
+    auto reshape =
+        trans ? trans.getSrc().getDefiningOp<ReshapeOp>() : ReshapeOp();
+    if (!reshape)
+      return {};
+    reshapeSrc = stripConvertLayout(reshape.getSrc(), cvts);
+  }
+  return {};
+}
+
 std::optional<TMemSplitLoadMatch> matchTMemSplitLoad(SplitOp splitOp) {
   TMemSplitLoadMatch match;
   // Starting from the split source, peel off convert_layouts if any.
@@ -60,6 +83,13 @@ std::optional<TMemSplitLoadMatch> matchTMemSplitLoad(SplitOp splitOp) {
     if (mDim != 64 && mDim != 128)
       return std::nullopt;
   }
+  // A TwoCTA_RHS slice narrower than blockN is not a column window (see
+  // TMEMSubSliceOp::verify); the split stays in registers. A nested split is
+  // checked too, so callers matching it before the outer rewrite agree.
+  auto tmemEnc = getSplitChainTMemEncoding(match.reshapeSrc);
+  if (tmemEnc && tmemEnc.getCtaMode() == TensorMemoryCTAMode::TwoCTA_RHS &&
+      match.splitNSize % tmemEnc.getBlockN() != 0)
+    return std::nullopt;
   return match;
 }
 
