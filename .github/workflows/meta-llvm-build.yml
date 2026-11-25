@@ -60,7 +60,6 @@ jobs:
       platforms: ${{ steps.missing.outputs.platforms }}
       validation_platforms: ${{ steps.missing.outputs.validation_platforms }}
       repairs: ${{ steps.missing.outputs.repairs }}
-      source_needed: ${{ steps.missing.outputs.source_needed }}
       source_json: ${{ steps.source.outputs.content }}
       source_name: ${{ steps.revision.outputs.source_name }}
       llvm_build_info: ${{ steps.build_call.outputs.llvm_build_info }}
@@ -70,7 +69,7 @@ jobs:
         env:
           LLVM_REF: ${{ inputs.llvm_sha }}
         shell: bash
-        run: '[[ "$LLVM_REF" =~ ^[0-9a-f]{40}$ ]]'
+        run: '[[ "$GITHUB_REPOSITORY" == "facebookexperimental/triton" && "$LLVM_REF" =~ ^[0-9a-f]{40}$ ]]'
 
       - name: Resolve commit
         id: revision
@@ -183,6 +182,8 @@ jobs:
           source = assets.get(source_name)
           if source is not None and source['digest'] != os.environ['SOURCE_DIGEST']:
               raise RuntimeError('Existing LLVM source provenance differs')
+          if source is None and any(name.endswith('.tar.gz') and name in assets for name in names):
+              raise RuntimeError('Cannot reuse published LLVM archives without their source record')
           platforms, repairs = [], []
           for config in configs:
               name = f"{stem}-{config['target-os']}-{config['arch']}-{number}.tar.gz"
@@ -191,7 +192,6 @@ jobs:
               elif name + '.sha256' not in assets:
                   repairs.append({'name': name, 'digest': assets[name]['digest']})
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              output.write('source_needed=' + str(source is None).lower() + '\n')
               output.write('platforms=' + json.dumps(platforms) + '\n')
               output.write('repairs=' + json.dumps(repairs) + '\n')
               validation = []

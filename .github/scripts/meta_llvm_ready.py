@@ -200,7 +200,10 @@ def ensure_issue(repo, candidate, platforms):
 
 def read_manifest(repo, path, ref):
     obj = github_json(f'repos/{repo}/contents/{path}?ref={quote(ref, safe="")}')
-    return json.loads(base64.b64decode(obj['content']))
+    manifest = json.loads(base64.b64decode(obj['content']))
+    if type(manifest['build_number']) is not int:
+        raise ValueError('Meta LLVM packaging revision must be an integer')
+    return manifest
 
 
 def ensure_candidate_pr(repo, candidate, platforms, base):
@@ -264,8 +267,8 @@ def ensure_candidate_pr(repo, candidate, platforms, base):
         return pulls[0]['html_url']
     pull = github_json(f'repos/{repo}/pulls', method='POST',
                        payload={'title': title, 'body': body, 'head': branch, 'base': 'main', 'draft': True})
-    if not pull['draft']:
-        raise ValueError('The returned PR is not a draft')
+    if (not pull['draft'] or pull['head']['sha'] != head or pull['base']['ref'] != 'main' or pull['state'] != 'open'):
+        raise ValueError('Created candidate PR does not match the prepared head, base or draft state')
     print('PR author: ' + pull['user']['login'], flush=True)
     return pull['html_url']
 
