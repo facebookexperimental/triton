@@ -1069,7 +1069,8 @@ def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH,
                                       CLUSTER_LAYOUT="linear", SPLIT_CLUSTER_BARRIER=False, EARLY_C_STORES=False,
                                       CLUSTER_BARRIER_INTERVAL=4, STATIC_SLOT_UNROLL=False, OUTPUT_C_SLOTS=None,
                                       OVERLAP_PEEL=False, OUT_DTYPE="fp32", MERGED_HANDOFF_BARRIER=False,
-                                      STATIC_CLUSTER_STEPS=False, SCALE_LAYOUT="block128"):
+                                      STATIC_CLUSTER_STEPS=False, SCALE_LAYOUT="block128", A_ROW_PAIRS=False,
+                                      B_ROW_PAIRS=False):
     # Ten tiles over three programs exercise uneven tile counts, changes in
     # both M and N, the zero-length steady loop, and input/output slot reuse
     # across ring wrap. Cluster cases give each program two tiles; K5/K9 also
@@ -1085,20 +1086,22 @@ def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH,
     b_scale = torch.randint(125, 130, (N, K // 32), dtype=torch.uint8)
     ref = _gfx1250_mxfp.torch_gemm_mxfp(a, b, a_scale, b_scale, 32, M, N, K)
     b_data = b.to_packed_tensor(dim=0) if DTYPE_B == "float4" else b
+    a_in = _gfx1250_mxfp.pack_row_pairs(a, BLOCK_K) if A_ROW_PAIRS else a
+    b_in = b_data.T.contiguous()
+    b_in = _gfx1250_mxfp.pack_row_pairs(b_in, BLOCK_K) if B_ROW_PAIRS else b_in
     out = _gfx1250_mxfp.matmul(
-        a.cuda(),
-        b_data.T.contiguous().cuda(),
+        a_in.cuda(), b_in.cuda(),
         _gfx1250_mxfp.pack_scale(a_scale, layout=SCALE_LAYOUT).cuda(),
-        _gfx1250_mxfp.pack_scale(b_scale, layout=SCALE_LAYOUT).cuda(),
-        config=dict(BLOCK_M=256, BLOCK_N=256, BLOCK_K=BLOCK_K, NUM_BUFFERS=NUM_BUFFERS, DTYPE_A="e4m3",
-                    DTYPE_B=_gfx1250_mxfp.DTYPE_TO_TRITON[DTYPE_B], TRANSPOSE_B=True, SCHEDULE="sliceMNK",
-                    TDM_FUSION="partial", PERSISTENT=True, NUM_PROGRAMS=programs,
-                    CROSS_TILE_PREFETCH=CROSS_TILE_PREFETCH, CLUSTER_SIZE=CLUSTER_SIZE,
-                    CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL, CLUSTER_LAYOUT=CLUSTER_LAYOUT,
-                    SPLIT_CLUSTER_BARRIER=SPLIT_CLUSTER_BARRIER, EARLY_C_STORES=EARLY_C_STORES,
-                    STATIC_SLOT_UNROLL=STATIC_SLOT_UNROLL, OUTPUT_C_SLOTS=OUTPUT_C_SLOTS, OVERLAP_PEEL=OVERLAP_PEEL,
-                    OUT_DTYPE=OUT_DTYPE, MERGED_HANDOFF_BARRIER=MERGED_HANDOFF_BARRIER,
-                    STATIC_CLUSTER_STEPS=STATIC_CLUSTER_STEPS, SCALE_LAYOUT=SCALE_LAYOUT))
+        _gfx1250_mxfp.pack_scale(b_scale, layout=SCALE_LAYOUT).cuda(), config=dict(
+            BLOCK_M=256, BLOCK_N=256, BLOCK_K=BLOCK_K, NUM_BUFFERS=NUM_BUFFERS, DTYPE_A="e4m3",
+            DTYPE_B=_gfx1250_mxfp.DTYPE_TO_TRITON[DTYPE_B], TRANSPOSE_B=True, SCHEDULE="sliceMNK", TDM_FUSION="partial",
+            PERSISTENT=True, NUM_PROGRAMS=programs, CROSS_TILE_PREFETCH=CROSS_TILE_PREFETCH, CLUSTER_SIZE=CLUSTER_SIZE,
+            CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL, CLUSTER_LAYOUT=CLUSTER_LAYOUT,
+            SPLIT_CLUSTER_BARRIER=SPLIT_CLUSTER_BARRIER, EARLY_C_STORES=EARLY_C_STORES,
+            STATIC_SLOT_UNROLL=STATIC_SLOT_UNROLL, OUTPUT_C_SLOTS=OUTPUT_C_SLOTS, OVERLAP_PEEL=OVERLAP_PEEL,
+            OUT_DTYPE=OUT_DTYPE, MERGED_HANDOFF_BARRIER=MERGED_HANDOFF_BARRIER,
+            STATIC_CLUSTER_STEPS=STATIC_CLUSTER_STEPS, SCALE_LAYOUT=SCALE_LAYOUT, A_ROW_PAIRS=A_ROW_PAIRS,
+            B_ROW_PAIRS=B_ROW_PAIRS))
     if OUT_DTYPE == "fp32":
         torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=1e-4)
     else:
@@ -1170,6 +1173,32 @@ def test_mxgemm_wave256_scales_ring_phase(k_iters, cluster_size, schedule):
                                       OUTPUT_C_SLOTS=3 if buffers == 3 else 2, OVERLAP_PEEL=schedule != "dynamic4",
                                       OUT_DTYPE="fp16" if merged else "fp32", MERGED_HANDOFF_BARRIER=merged,
                                       STATIC_CLUSTER_STEPS=merged and cluster_size > 1, SCALE_LAYOUT="wave256")
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
+@pytest.mark.parametrize("k_iters", [5, 9])
+@pytest.mark.parametrize("schedule", ["merged-4x4", "merged-2x2", "static3", "dynamic4", "unclustered"])
+@pytest.mark.parametrize("operands", ["a", "b", "ab"])
+def test_mxgemm_row_pairs_ring_phase(k_iters, schedule, operands):
+    # Row-pair operands (pack_row_pairs) load one 256-byte TDM piece per row
+    # pair into the unchanged LDS image: the partitioned static-slot slots of
+    # the merged four-stage and three-stage loops, and the plain slots of the
+    # dynamic four-stage ring, with and without multicast clusters.
+    pairs = dict(A_ROW_PAIRS="a" in operands, B_ROW_PAIRS="b" in operands)
+    if schedule.startswith("merged"):
+        layout = schedule.split("-")[1]
+        test_mxgemm_persistent_ring_phase(k_iters, 4, True, "float8_e4m3", 128, 16 if layout == "4x4" else 4,
+                                          CLUSTER_LAYOUT=layout, CLUSTER_BARRIER_INTERVAL=8, STATIC_SLOT_UNROLL=True,
+                                          OUTPUT_C_SLOTS=2, OVERLAP_PEEL=True, OUT_DTYPE="fp16",
+                                          MERGED_HANDOFF_BARRIER=True, STATIC_CLUSTER_STEPS=True, **pairs)
+    elif schedule == "static3":
+        test_mxgemm_persistent_ring_phase(k_iters, 3, True, "float8_e4m3", 128, 4, CLUSTER_LAYOUT="2x2",
+                                          STATIC_SLOT_UNROLL=True, OUTPUT_C_SLOTS=3, OVERLAP_PEEL=True, **pairs)
+    elif schedule == "dynamic4":
+        test_mxgemm_persistent_ring_phase(k_iters, 4, True, "float8_e4m3", 128, 16, CLUSTER_LAYOUT="4x4",
+                                          CLUSTER_BARRIER_INTERVAL=8, OUT_DTYPE="fp16", **pairs)
+    else:
+        test_mxgemm_persistent_ring_phase(k_iters, 3, True, "float8_e4m3", 128, 1, **pairs)
 
 
 @pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
@@ -1455,6 +1484,12 @@ def test_mxgemm_bench_defaults_and_overrides():
         for shape, want in zip((shapes[0], shapes[2]), expected):
             cmd = bench._command(bench._case_args(args, shape), shape, dtype_b)
             assert ("--overlap_peel" in cmd) == want
+
+    # Row pairs apply to MX8xMX8 only; MX8xMX4's BK256 tile keeps plain operands.
+    _, shapes, variants = bench.parse_benchmark_args(["--a-row-pairs", "--b-row-pairs", "--dry-run"])
+    for variant, dtype_b, args in variants:
+        cmd = bench._command(bench._case_args(args, shapes[0]), shapes[0], dtype_b)
+        assert ("--a_row_pairs" in cmd and "--b_row_pairs" in cmd) == (variant == "mx8xmx8")
 
 
 test_gfx1250_grouped_gemm_phase0_ragged = _gfx1250_grouped.test_grouped_gemm_phase0_ragged_gfx1250

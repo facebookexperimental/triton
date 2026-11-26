@@ -137,6 +137,23 @@ def mxgemm_desc_group_rows(desc, _semantic=None):
 
 
 @tl.core.builtin
+def _mxgemm_desc_row_pairs(desc, block_k, _semantic=None):
+    # A row-pair operand descriptor ([rows // 2, 2 * K] or
+    # [rows // R, R // 2, 2 * K]) loads 2 * BLOCK_K contiguous bytes per row pair.
+    shape = [tl.core._unwrap_if_constexpr(d) for d in desc.block_shape]
+    return tl.constexpr(shape[-1] == 2 * tl.core._unwrap_if_constexpr(block_k))
+
+
+@tl.core.builtin
+def _mxgemm_row_pair_view(view, _semantic=None):
+    # View an operand slot [.., rows, K] as [.., rows // 2, 2 * K] for row-pair TDM
+    # loads: rows 2p and 2p + 1 become one row of the row-major reshape.
+    shape = [tl.core._unwrap_if_constexpr(d) for d in view.type.shape]
+    pairs = shape[:-2] + [shape[-2] // 2, 2 * shape[-1]]
+    return tlx.local_reshape(view, pairs, _semantic=_semantic)
+
+
+@tl.core.builtin
 def mxgemm_flat_view(view, _semantic=None):
     # Read a group-major [G, R, K] operand slot as [G * R, K].
     shape = [tl.core._unwrap_if_constexpr(d) for d in view.type.shape]
@@ -335,12 +352,29 @@ def mxgemm_issue_loads(
     else:
         data_masks = None
         all_masks = None
-    if B_PRESHUFFLE:
+    if _mxgemm_desc_row_pairs(a_desc, BLOCK_K_PACKED_A):
+        tl.static_assert(TDM_FUSION != "none", "row-pair A needs fused TDM loads")
+        a_offsets = [0, load_idx * 2 * BLOCK_K_PACKED_A]
+        a_view = _mxgemm_row_pair_view(tlx.local_view(a_buf, slot))
+    else:
+        a_offsets = [0, load_idx * BLOCK_K_PACKED_A]
+        a_view = tlx.local_view(a_buf, slot)
+    # Only transposed ([N, K]) B descriptors can be row-paired; a [K, N] block
+    # whose N happens to equal 2 * K is ordinary B.
+    B_PAIRS: tl.constexpr = TRANSPOSE_B and _mxgemm_desc_row_pairs(b_desc, BLOCK_K_PACKED_B)
+    if B_PAIRS:
+        tl.static_assert(TDM_FUSION != "none", "row-pair B needs fused TDM loads")
+        b_offsets = [0, load_idx * 2 * BLOCK_K_PACKED_B]
+        b_view = _mxgemm_row_pair_view(tlx.local_view(b_buf, slot))
+    elif B_PRESHUFFLE:
         b_offsets = [0, load_idx * BLOCK_K_PACKED_B * 128]
+        b_view = tlx.local_view(b_buf, slot)
     elif TRANSPOSE_B:
         b_offsets = [0, load_idx * BLOCK_K_PACKED_B]
+        b_view = tlx.local_view(b_buf, slot)
     else:
         b_offsets = [load_idx * BLOCK_K_PACKED_B, 0]
+        b_view = tlx.local_view(b_buf, slot)
     if SCALE_PRESHUFFLE:
         a_scale_offsets = [0, load_idx * BLOCK_K_SCALE_PRESHUFFLED]
     else:
@@ -358,10 +392,8 @@ def mxgemm_issue_loads(
     if TDM_FUSION == "4way":
         tl.static_assert(WITH_A_SCALE, "4-way TDM fusion requires WITH_A_SCALE")
         tlx.async_amd_descriptor_load_fused([
-            (mxgemm_position_load_descriptor(a_desc, [0, load_idx * BLOCK_K_PACKED_A], pred,
-                                             CLAMP_BOUNDS), tlx.local_view(a_buf, slot), 1 * WAVE_MASK_REPEAT),
-            (mxgemm_position_load_descriptor(b_desc, b_offsets, pred, CLAMP_BOUNDS), tlx.local_view(
-                b_buf, slot), 2 * WAVE_MASK_REPEAT),
+            (mxgemm_position_load_descriptor(a_desc, a_offsets, pred, CLAMP_BOUNDS), a_view, 1 * WAVE_MASK_REPEAT),
+            (mxgemm_position_load_descriptor(b_desc, b_offsets, pred, CLAMP_BOUNDS), b_view, 2 * WAVE_MASK_REPEAT),
             (mxgemm_position_load_descriptor(a_scale_desc, a_scale_offsets, pred,
                                              CLAMP_BOUNDS), tlx.local_view(a_scale_buf, slot), 4 * WAVE_MASK_REPEAT),
             (mxgemm_position_load_descriptor(b_scale_desc, b_scale_offsets, pred,
@@ -369,10 +401,8 @@ def mxgemm_issue_loads(
         ], multicast_masks=all_masks)
     elif TDM_FUSION == "2way":
         tlx.async_amd_descriptor_load_fused([
-            (mxgemm_position_load_descriptor(a_desc, [0, load_idx * BLOCK_K_PACKED_A], pred,
-                                             CLAMP_BOUNDS), tlx.local_view(a_buf, slot), 3 * WAVE_MASK_REPEAT),
-            (mxgemm_position_load_descriptor(b_desc, b_offsets, pred, CLAMP_BOUNDS), tlx.local_view(
-                b_buf, slot), 12 * WAVE_MASK_REPEAT),
+            (mxgemm_position_load_descriptor(a_desc, a_offsets, pred, CLAMP_BOUNDS), a_view, 3 * WAVE_MASK_REPEAT),
+            (mxgemm_position_load_descriptor(b_desc, b_offsets, pred, CLAMP_BOUNDS), b_view, 12 * WAVE_MASK_REPEAT),
         ], multicast_masks=data_masks)
         if WITH_A_SCALE:
             tlx.async_amd_descriptor_load_fused([
@@ -396,10 +426,8 @@ def mxgemm_issue_loads(
                                                  CLAMP_BOUNDS), tlx.local_view(b_scale_buf, slot), B_WAVES),
             ], multicast_masks=data_masks)
         tlx.async_amd_descriptor_load_fused([
-            (mxgemm_position_load_descriptor(a_desc, [0, load_idx * BLOCK_K_PACKED_A], pred,
-                                             CLAMP_BOUNDS), tlx.local_view(a_buf, slot), A_WAVES),
-            (mxgemm_position_load_descriptor(b_desc, b_offsets, pred, CLAMP_BOUNDS), tlx.local_view(b_buf,
-                                                                                                    slot), B_WAVES),
+            (mxgemm_position_load_descriptor(a_desc, a_offsets, pred, CLAMP_BOUNDS), a_view, A_WAVES),
+            (mxgemm_position_load_descriptor(b_desc, b_offsets, pred, CLAMP_BOUNDS), b_view, B_WAVES),
         ], multicast_masks=data_masks)
         if not SCALES_FIRST:
             tlx.async_amd_descriptor_load_fused([
@@ -773,16 +801,21 @@ def _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_b
     # Keep the K coordinate independent of the LDS ring slot. Adding (k - slot)
     # here and slot in the loader hides the invariant per-wave global base
     # from LLVM and repeats descriptor address work inside the K loop.
+    # A row-pair descriptor row holds two operand rows.
+    A_PAIR: tl.constexpr = 2 if _mxgemm_desc_row_pairs(a_desc, BK // DA) else 1
+    B_PAIR: tl.constexpr = 2 if _mxgemm_desc_row_pairs(b_desc, BK // DB) else 1
     if mxgemm_desc_group_rows(a_desc) != 0:
         tl.static_assert(a_srow is None, "grouped tiles need unpartitioned A and B")
-        ad = tlx.update_tensor_descriptor(a_desc, add_offsets=[off_m // mxgemm_desc_group_rows(a_desc), 0, 0],
-                                          clamp_bounds=False)
-        bd = tlx.update_tensor_descriptor(b_desc, add_offsets=[off_n // mxgemm_desc_group_rows(b_desc), 0, 0],
-                                          clamp_bounds=False)
+        ad = tlx.update_tensor_descriptor(a_desc,
+                                          add_offsets=[off_m // (mxgemm_desc_group_rows(a_desc) * A_PAIR), 0,
+                                                       0], clamp_bounds=False)
+        bd = tlx.update_tensor_descriptor(b_desc,
+                                          add_offsets=[off_n // (mxgemm_desc_group_rows(b_desc) * B_PAIR), 0,
+                                                       0], clamp_bounds=False)
     else:
         # Grouped tiles: rows past A's end read zeros; the C store drops them.
-        ad = tlx.update_tensor_descriptor(a_desc, add_offsets=[off_m, 0], clamp_bounds=a_srow is not None)
-        bd = tlx.update_tensor_descriptor(b_desc, add_offsets=[off_n, 0], clamp_bounds=False)
+        ad = tlx.update_tensor_descriptor(a_desc, add_offsets=[off_m // A_PAIR, 0], clamp_bounds=a_srow is not None)
+        bd = tlx.update_tensor_descriptor(b_desc, add_offsets=[off_n // B_PAIR, 0], clamp_bounds=False)
     SROWS: tl.constexpr = 256 if mxgemm_scale_cols(bs_desc) == BK // 32 * 256 else 128
     if a_srow is None:
         asd = tlx.update_tensor_descriptor(as_desc, add_offsets=[off_m // SROWS, 0], clamp_bounds=False)
@@ -1242,6 +1275,8 @@ def mxgemm_tdm_persistent_kernel(
     MERGED_HANDOFF_BARRIER: tl.constexpr = False,
     STATIC_CLUSTER_STEPS: tl.constexpr = False,
     SCALE_WAVE256: tl.constexpr = False,
+    A_ROW_PAIRS: tl.constexpr = False,
+    B_ROW_PAIRS: tl.constexpr = False,
     NUM_GROUPS: tl.constexpr = 0,
     tile_meta0=None,
     tile_meta1=None,
@@ -1257,6 +1292,9 @@ def mxgemm_tdm_persistent_kernel(
     a_scale_rows scale rows are tile-ordered: map entry i's BLOCK_M rows in block128 order at row
     i * BLOCK_M // 128. With clusters, each group's map entries start at a multiple of the cluster rows
     and fill whole cluster rows, and the map has whole GROUP_SIZE_M groups of entries.
+
+    A_ROW_PAIRS / B_ROW_PAIRS take A / B stored by pack_row_pairs, as [rows // 2, K // BLOCK_K, 2, BLOCK_K]: each
+    row pair's K step is 2 * BLOCK_K contiguous bytes, which one TDM piece moves. The LDS image is unchanged.
     """
     tl.static_assert(BLOCK_M % 128 == 0 and BLOCK_N % 128 == 0 and (BLOCK_K == 128 or BLOCK_K == 256))
     tl.static_assert(NUM_BUFFERS >= 2 and NUM_PROGRAMS > 0 and GROUP_SIZE_M > 0)
@@ -1292,6 +1330,9 @@ def mxgemm_tdm_persistent_kernel(
         tl.static_assert((CROSS_TILE_PREFETCH or DB == 2) and (CLUSTER_SIZE == 1 or CLUSTER_LAYOUT != "linear")
                          and (DB == 2 or not (EARLY_C_STORES or SPLIT_CLUSTER_BARRIER)) and not SCALE_WAVE256,
                          "grouped GEMM supports the block128-scale schedules with grid clusters")
+    tl.static_assert(not (A_ROW_PAIRS or B_ROW_PAIRS) or (BLOCK_K == 128 and not GROUPED_TILES),
+                     "A_ROW_PAIRS and B_ROW_PAIRS require BLOCK_K=128 and no grouped tiles")
+    tl.static_assert(not B_ROW_PAIRS or DB == 1, "B_ROW_PAIRS requires FP8 B")
     B_ROWS: tl.constexpr = NUM_GROUPS * N if GROUPED_TILES else N
     OUTPUT_REUSE: tl.constexpr = BLOCK_K == 256
     # C buffers that alias input ring slots keep the input slot pitch: a
@@ -1361,20 +1402,38 @@ def mxgemm_tdm_persistent_kernel(
         tl.static_assert(DB == 1 and BLOCK_K == 128, "partitioned A/B requires A8W8 BK128")
         R: tl.constexpr = 2 * PIECE_ROWS
         tl.static_assert(M % R == 0 and N % R == 0 and BLOCK_M % R == 0 and BLOCK_N % R == 0)
-        a_desc = tl.make_tensor_descriptor(a_ptr, [M // R, R, K],
-                                           [R * stride_am, stride_am, tl.constexpr(1)], [BLOCK_M // R, R, BLOCK_K])
-        b_desc = tl.make_tensor_descriptor(b_ptr, [N // R, R, K // DB],
-                                           [R * stride_bn, stride_bn, tl.constexpr(1)],
-                                           [BLOCK_N // R, R, BLOCK_K // DB])
+        if A_ROW_PAIRS:
+            a_desc = tl.make_tensor_descriptor(
+                a_ptr, [M // R, R // 2, 2 * K],
+                [R * stride_am, 2 * stride_am, tl.constexpr(1)], [BLOCK_M // R, R // 2, 2 * BLOCK_K])
+        else:
+            a_desc = tl.make_tensor_descriptor(a_ptr, [M // R, R, K],
+                                               [R * stride_am, stride_am, tl.constexpr(1)], [BLOCK_M // R, R, BLOCK_K])
+        if B_ROW_PAIRS:
+            b_desc = tl.make_tensor_descriptor(
+                b_ptr, [N // R, R // 2, 2 * K],
+                [R * stride_bn, 2 * stride_bn, tl.constexpr(1)], [BLOCK_N // R, R // 2, 2 * BLOCK_K])
+        else:
+            b_desc = tl.make_tensor_descriptor(b_ptr, [N // R, R, K // DB],
+                                               [R * stride_bn, stride_bn, tl.constexpr(1)],
+                                               [BLOCK_N // R, R, BLOCK_K // DB])
         a_buf = tlx.local_alloc((BLOCK_M // R, R, BLOCK_K), tlx.dtype_of(a_ptr), NUM_BUFFERS,
                                 layout=_partitioned_operand_shared_layout([BLOCK_M // R, R, BLOCK_K]))
         b_buf = tlx.local_alloc((BLOCK_N // R, R, BLOCK_K // DB), tlx.dtype_of(b_ptr), NUM_BUFFERS,
                                 layout=_partitioned_operand_shared_layout([BLOCK_N // R, R, BLOCK_K // DB]))
     else:
-        a_desc = tl.make_tensor_descriptor(a_ptr, [a_rows if GROUPED_TILES else M, K],
-                                           [stride_am, tl.constexpr(1)], [BLOCK_M, BLOCK_K])
-        b_desc = tl.make_tensor_descriptor(b_ptr, [B_ROWS, K // DB], [stride_bn, tl.constexpr(1)],
-                                           [BLOCK_N, BLOCK_K // DB])
+        if A_ROW_PAIRS:
+            a_desc = tl.make_tensor_descriptor(a_ptr, [M // 2, 2 * K], [2 * stride_am, tl.constexpr(1)],
+                                               [BLOCK_M // 2, 2 * BLOCK_K])
+        else:
+            a_desc = tl.make_tensor_descriptor(a_ptr, [a_rows if GROUPED_TILES else M, K],
+                                               [stride_am, tl.constexpr(1)], [BLOCK_M, BLOCK_K])
+        if B_ROW_PAIRS:
+            b_desc = tl.make_tensor_descriptor(b_ptr, [N // 2, 2 * K], [2 * stride_bn, tl.constexpr(1)],
+                                               [BLOCK_N // 2, 2 * BLOCK_K])
+        else:
+            b_desc = tl.make_tensor_descriptor(b_ptr, [B_ROWS, K // DB], [stride_bn, tl.constexpr(1)],
+                                               [BLOCK_N, BLOCK_K // DB])
         a_buf = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_ptr), NUM_BUFFERS,
                                 layout=operand_shared_layout([BLOCK_M, BLOCK_K]))
         b_buf = tlx.local_alloc((BLOCK_N, BLOCK_K // DB), tlx.dtype_of(b_ptr), NUM_BUFFERS,
@@ -1858,6 +1917,19 @@ def is_gfx1250_available():
         return target.arch == "gfx1250"
     except Exception:
         return False
+
+
+def pack_row_pairs(x: torch.Tensor, block_k: int = 128) -> torch.Tensor:
+    """Store an FP8 operand ([rows, K]: A or transposed B) as row pairs, [rows // 2, K // block_k, 2, block_k], in a
+    [rows, K] tensor.
+
+    For ``A_ROW_PAIRS`` / ``B_ROW_PAIRS``: each row pair's K step is 2 * block_k contiguous bytes, so one TDM piece
+    moves both rows.
+    """
+    n, k = x.shape
+    if n % 2 or k % block_k:
+        raise ValueError("row pairs need an even number of rows and K a multiple of block_k")
+    return x.reshape(n // 2, 2, k // block_k, block_k).permute(0, 2, 1, 3).contiguous().view(n, k)
 
 
 def fp8e8m0_to_float32(scale: torch.Tensor) -> torch.Tensor:
@@ -3134,52 +3206,54 @@ PIPELINED_COMPILE_OPTIONS = {"va_vdst_anti_hints": False, "llvm_cl_opts": (("amd
 
 
 def mxgemm_tdm_pipelined(
-        a: torch.Tensor,
-        b: torch.Tensor,
-        a_scale: torch.Tensor,
-        b_scale: torch.Tensor,
-        BLOCK_M: int = 128,
-        BLOCK_N: int = 128,
-        BLOCK_K: int = 128,
-        TRANSPOSE_B: bool = False,
-        NUM_BUFFERS: int = 2,
-        DTYPE_A: str = "e5m2",
-        DTYPE_B: str = "e5m2",
-        SCALE_PRESHUFFLE: bool = True,
-        WITH_A_SCALE: bool = True,
-        SCHEDULE: str = "baseline",
-        L2_PREFETCH_DISTANCE: int = -1,
-        M: int | None = None,
-        N: int | None = None,
-        K: int | None = None,
-        TDM_FUSION: str = "none",
-        TDM_SPLIT: bool = False,
-        GROUP_SIZE_M: int = 8,
-        BENCHMARK: str | Callable | None = None,
-        BENCHMARK_NUM_ITERS: int = 32,
-        BENCHMARK_WARMUP_SECONDS: float = 0.0,
-        BENCHMARK_DURATION_SECONDS: float = 0.0,
-        PERSISTENT: bool = False,
-        NUM_PROGRAMS: int | None = None,
-        CROSS_TILE_PREFETCH: bool = True,
-        XCD_REMAP: str = "none",
-        NUM_XCDS: int = 8,
-        XCD_CHUNK: int = 2,
-        CLUSTER_SIZE: int = 1,
-        CLUSTER_MULTICAST: bool = True,
-        CLUSTER_BARRIER_INTERVAL: int = 1,
-        CLUSTER_LAYOUT: str = "linear",
-        SPLIT_CLUSTER_BARRIER: bool = False,
-        EARLY_C_STORES: bool = False,
-        STATIC_SLOT_UNROLL: bool = False,
-        OUTPUT_C_SLOTS: int | None = None,
-        OVERLAP_PEEL: bool = False,
-        MERGED_HANDOFF_BARRIER: bool = False,
-        STATIC_CLUSTER_STEPS: bool = False,
-        SCALE_LAYOUT: str = "block128",
-        OUT_DTYPE: str = "fp32",
-        TILES_PER_WARP: tuple[int, int] = (2, 2),
-        ENABLE_WMMA_QUEUING: bool = False,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    BLOCK_M: int = 128,
+    BLOCK_N: int = 128,
+    BLOCK_K: int = 128,
+    TRANSPOSE_B: bool = False,
+    NUM_BUFFERS: int = 2,
+    DTYPE_A: str = "e5m2",
+    DTYPE_B: str = "e5m2",
+    SCALE_PRESHUFFLE: bool = True,
+    WITH_A_SCALE: bool = True,
+    SCHEDULE: str = "baseline",
+    L2_PREFETCH_DISTANCE: int = -1,
+    M: int | None = None,
+    N: int | None = None,
+    K: int | None = None,
+    TDM_FUSION: str = "none",
+    TDM_SPLIT: bool = False,
+    GROUP_SIZE_M: int = 8,
+    BENCHMARK: str | Callable | None = None,
+    BENCHMARK_NUM_ITERS: int = 32,
+    BENCHMARK_WARMUP_SECONDS: float = 0.0,
+    BENCHMARK_DURATION_SECONDS: float = 0.0,
+    PERSISTENT: bool = False,
+    NUM_PROGRAMS: int | None = None,
+    CROSS_TILE_PREFETCH: bool = True,
+    XCD_REMAP: str = "none",
+    NUM_XCDS: int = 8,
+    XCD_CHUNK: int = 2,
+    CLUSTER_SIZE: int = 1,
+    CLUSTER_MULTICAST: bool = True,
+    CLUSTER_BARRIER_INTERVAL: int = 1,
+    CLUSTER_LAYOUT: str = "linear",
+    SPLIT_CLUSTER_BARRIER: bool = False,
+    EARLY_C_STORES: bool = False,
+    STATIC_SLOT_UNROLL: bool = False,
+    OUTPUT_C_SLOTS: int | None = None,
+    OVERLAP_PEEL: bool = False,
+    MERGED_HANDOFF_BARRIER: bool = False,
+    STATIC_CLUSTER_STEPS: bool = False,
+    SCALE_LAYOUT: str = "block128",
+    OUT_DTYPE: str = "fp32",
+    TILES_PER_WARP: tuple[int, int] = (2, 2),
+    ENABLE_WMMA_QUEUING: bool = False,
+    A_ROW_PAIRS: bool = False,
+    B_ROW_PAIRS: bool = False,
 ) -> torch.Tensor:
     """Run MXFP GEMM, optionally with the persistent sliceMNK kernel.
 
@@ -3246,6 +3320,11 @@ def mxgemm_tdm_pipelined(
     scales with one ``ds_load_b128``, and other FP8 BK128 schedules read one
     quadrant per ``ds_load_b64``. Pack scales with
     ``pack_scale(x, layout=...)`` using the same layout.
+
+    ``A_ROW_PAIRS`` / ``B_ROW_PAIRS`` take A / transposed B stored by
+    :func:`pack_row_pairs`: each pair of rows keeps its two 128-byte K steps
+    together, so one TDM piece moves 256 contiguous bytes. The persistent
+    kernel with FP8 operands and BK128 supports them.
     """
     TILES_PER_WARP = _validate_tiles_per_warp(TILES_PER_WARP)
     if M is None:
@@ -3268,10 +3347,11 @@ def mxgemm_tdm_pipelined(
         raise ValueError("SCALE_LAYOUT must be 'block128' or 'wave256'")
     if not PERSISTENT and (CLUSTER_LAYOUT != "linear" or SPLIT_CLUSTER_BARRIER or EARLY_C_STORES or STATIC_SLOT_UNROLL
                            or OUTPUT_C_SLOTS is not None or OVERLAP_PEEL or MERGED_HANDOFF_BARRIER
-                           or STATIC_CLUSTER_STEPS or SCALE_LAYOUT != "block128" or ENABLE_WMMA_QUEUING):
+                           or STATIC_CLUSTER_STEPS or SCALE_LAYOUT != "block128" or ENABLE_WMMA_QUEUING or A_ROW_PAIRS
+                           or B_ROW_PAIRS):
         raise ValueError("CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER, EARLY_C_STORES, STATIC_SLOT_UNROLL, "
                          "OUTPUT_C_SLOTS, OVERLAP_PEEL, MERGED_HANDOFF_BARRIER, STATIC_CLUSTER_STEPS, "
-                         "SCALE_LAYOUT, and ENABLE_WMMA_QUEUING require PERSISTENT")
+                         "SCALE_LAYOUT, ENABLE_WMMA_QUEUING, A_ROW_PAIRS, and B_ROW_PAIRS require PERSISTENT")
     if PERSISTENT:
         if TILES_PER_WARP != (2, 2):
             raise ValueError("persistent MXFP requires TILES_PER_WARP=(2, 2)")
@@ -3303,6 +3383,10 @@ def mxgemm_tdm_pipelined(
             raise ValueError("STATIC_CLUSTER_STEPS requires STATIC_SLOT_UNROLL")
         if SCALE_LAYOUT == "wave256" and not (BLOCK_K == 128 and DTYPE_B == "e4m3"):
             raise ValueError("SCALE_LAYOUT='wave256' requires E4M3 B with BK128")
+        if (A_ROW_PAIRS or B_ROW_PAIRS) and BLOCK_K != 128:
+            raise ValueError("A_ROW_PAIRS and B_ROW_PAIRS require BK128 (pack with pack_row_pairs(x, 128))")
+        if B_ROW_PAIRS and not (TRANSPOSE_B and DTYPE_B != "e2m1"):
+            raise ValueError("B_ROW_PAIRS requires transposed FP8 B")
         if OVERLAP_PEEL and not (CROSS_TILE_PREFETCH and BLOCK_K == 128 and K // BLOCK_K > NUM_BUFFERS
                                  and not (SPLIT_CLUSTER_BARRIER or EARLY_C_STORES)):
             raise ValueError("OVERLAP_PEEL requires BK128, cross-tile prefetch, more K tiles than buffers, and no "
@@ -3334,8 +3418,8 @@ def mxgemm_tdm_pipelined(
                 SPLIT_CLUSTER_BARRIER=SPLIT_CLUSTER_BARRIER, EARLY_C_STORES=EARLY_C_STORES,
                 STATIC_SLOT_UNROLL=STATIC_SLOT_UNROLL, OUTPUT_C_SLOTS=OUTPUT_C_SLOTS, OVERLAP_PEEL=OVERLAP_PEEL,
                 MERGED_HANDOFF_BARRIER=MERGED_HANDOFF_BARRIER, STATIC_CLUSTER_STEPS=STATIC_CLUSTER_STEPS,
-                SCALE_WAVE256=SCALE_LAYOUT == "wave256", num_warps=4, waves_per_eu=1, ctas_per_cga=(CLUSTER_SIZE, 1, 1),
-                enable_wmma_queuing=ENABLE_WMMA_QUEUING)
+                SCALE_WAVE256=SCALE_LAYOUT == "wave256", A_ROW_PAIRS=A_ROW_PAIRS, B_ROW_PAIRS=B_ROW_PAIRS, num_warps=4,
+                waves_per_eu=1, ctas_per_cga=(CLUSTER_SIZE, 1, 1), enable_wmma_queuing=ENABLE_WMMA_QUEUING)
         return mxgemm_tdm_pipelined_kernel[grid](
             a,
             b,
@@ -3419,7 +3503,7 @@ _PERSISTENT_CONFIG_KEYS = ("PERSISTENT", "NUM_PROGRAMS", "CROSS_TILE_PREFETCH", 
                            "CLUSTER_SIZE", "CLUSTER_MULTICAST", "CLUSTER_BARRIER_INTERVAL", "CLUSTER_LAYOUT",
                            "SPLIT_CLUSTER_BARRIER", "EARLY_C_STORES", "STATIC_SLOT_UNROLL", "OUTPUT_C_SLOTS",
                            "OVERLAP_PEEL", "MERGED_HANDOFF_BARRIER", "STATIC_CLUSTER_STEPS", "SCALE_LAYOUT",
-                           "ENABLE_WMMA_QUEUING")
+                           "ENABLE_WMMA_QUEUING", "A_ROW_PAIRS", "B_ROW_PAIRS")
 
 
 def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: torch.Tensor, config=None) -> torch.Tensor:
@@ -3432,7 +3516,7 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
     options (``NUM_PROGRAMS``, ``CROSS_TILE_PREFETCH``, ``XCD_REMAP``, cluster
     options, ``STATIC_SLOT_UNROLL``, ``OUTPUT_C_SLOTS``, ``OVERLAP_PEEL``,
     ``MERGED_HANDOFF_BARRIER``, ``STATIC_CLUSTER_STEPS``, ``SCALE_LAYOUT``,
-    ``ENABLE_WMMA_QUEUING``) are described in :func:`mxgemm_tdm_pipelined`. ``OUT_DTYPE`` selects FP32 or
+    ``ENABLE_WMMA_QUEUING``, ``A_ROW_PAIRS``, ``B_ROW_PAIRS``) are described in :func:`mxgemm_tdm_pipelined`. ``OUT_DTYPE`` selects FP32 or
     FP16 output.
     """
     cfg = dict(_DEFAULT_CONFIG)
@@ -3454,7 +3538,7 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
             raise ValueError("persistent MXFP requires four warps, one wave per SIMD, and SCALE_BLOCK=32")
     persistent_only = ("CLUSTER_LAYOUT", "SPLIT_CLUSTER_BARRIER", "EARLY_C_STORES", "STATIC_SLOT_UNROLL",
                        "OUTPUT_C_SLOTS", "OVERLAP_PEEL", "MERGED_HANDOFF_BARRIER", "STATIC_CLUSTER_STEPS",
-                       "SCALE_LAYOUT", "ENABLE_WMMA_QUEUING")
+                       "SCALE_LAYOUT", "ENABLE_WMMA_QUEUING", "A_ROW_PAIRS", "B_ROW_PAIRS")
     if (cfg.get("PERSISTENT", False) or cfg.get("OUT_DTYPE", "fp32") != "fp32"
             or any(key in cfg for key in persistent_only)):
         return mxgemm_tdm_pipelined(a, b, a_scale, b_scale, BLOCK_M=cfg["BLOCK_M"], BLOCK_N=cfg["BLOCK_N"],
