@@ -15,8 +15,8 @@ page_data() builds the data.json the page renders, one section per tab:
   ops      GPU hours, job durations and setup failures.
   usage    GPU hours per day by activity (L1, L2, TritonBench, other tests, setup) and trigger.
 The runner occupancy (busy, idle and waiting per 15 minutes) is shared by every branch, so it sits beside them.
-  bump     is the branch's Meta LLVM pin current, what a newer fork release
-           would add, the open bump issues, and the pin's recent changes.
+  bump     is each Meta LLVM pin at its fork branch tip, what the tip changes,
+           its candidate PR and readiness issue, and the pin's recent changes.
 No I/O.
 """
 import collections
@@ -1192,11 +1192,12 @@ def occupancy_view(runs, asof):
 
 
 def bump_view(line):
-    """The Meta LLVM tab of one tracked branch, from its bump.json entry (None before the first snapshot).
-    status: current (pins the newest fork release), new (a newer release is not pinned yet) or unknown."""
-    if not line or not line.get("newest") or not line.get("pinned"):
-        return {"status": "unknown", **(line or {})}
-    return {"status": "current" if line["pinned"]["tag"] == line["newest"]["tag"] else "new", **line}
+    """The LLVM tab of one tracked branch, from its bump.json entry. status: current (every pin is at its fork branch
+    tip), new (a pin is behind its tip) or unknown (no snapshot yet)."""
+    pins = (line or {}).get("pins")
+    if not pins or not all(p["pinned"] for p in pins):
+        return {"status": "unknown", "pins": pins or []}
+    return {"status": "new" if any(p["change"] for p in pins) else "current", "pins": pins}
 
 
 def page_data(runs, asof, bench, bump=None):
