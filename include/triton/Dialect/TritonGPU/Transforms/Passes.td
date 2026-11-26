@@ -281,7 +281,9 @@ def TritonGPUCoalesce: Pass<"tritongpu-coalesce", "mlir::ModuleOp"> {
 
   let options = [
     Option<"maxVecBits", "max-vec-bits", "unsigned", /*default*/"128",
-           "Maximum vector width in bits for load/store coalescing">
+           "Maximum vector width in bits for load/store coalescing">,
+    Option<"sectorBytes", "sector-bytes", "unsigned", /*default*/"0",
+           "Sector size in bytes for scalar coalescing (0 disables sector scoring)">
   ];
 }
 
