@@ -197,20 +197,31 @@ class ClcTileScheduler(TileScheduler):
     dimensions and logical tile geometry must be divisible by
     ``ctas_per_cga``; inactive padded CTAs are unsupported, and all members must
     reach ``advance`` uniformly.
+
+    ``num_stealing_ctas`` (constexpr, default ``None`` = every CTA steals)
+    enables partial work-stealing: only the first ``num_stealing_ctas`` CTAs in
+    linear program-id order (rounded down to whole clusters) keep cancelling
+    pending clusters; every other CTA runs its own tile and exits. At most that
+    many SMs are then held by the kernel until it drains, so SMs freed by a
+    concurrent kernel (e.g. NCCL) are released again after one tile instead of
+    being kept by a stealer. The predicate is cluster-uniform by construction.
+    No tile is dropped: a non-stealing CTA issues no CLC request at all.
     """
     _valid: tl.tensor
     _x: tl.tensor
     _y: tl.tensor
     _z: tl.tensor
+    _num_stealing_ctas: tl.constexpr = tl.constexpr(None)
 
     @builtin
-    def initialize(lowering_args, num_tiles_fn, tile_counter, _semantic=None):
+    def initialize(lowering_args, num_tiles_fn, tile_counter, num_stealing_ctas=None, _semantic=None):
         b = _semantic.builder
         return ClcTileScheduler(
             tl.tensor(b.get_int1(True), tl.int1),
             tl.tensor(b.create_get_program_id(0), tl.int32),
             tl.tensor(b.create_get_program_id(1), tl.int32),
             tl.tensor(b.create_get_program_id(2), tl.int32),
+            _check_num_stealing_ctas(num_stealing_ctas),
         )
 
     @jit
@@ -219,9 +230,40 @@ class ClcTileScheduler(TileScheduler):
 
     @builtin
     def advance(self, _semantic=None):
-        is_valid, x, y, z = _semantic.builder.create_clc_advance()
+        steal = _clc_steal_predicate(self._num_stealing_ctas, _semantic)
+        is_valid, x, y, z = _semantic.builder.create_clc_advance(steal)
         return ClcTileScheduler(tl.tensor(is_valid, tl.int1), tl.tensor(x, tl.int32), tl.tensor(y, tl.int32),
-                                tl.tensor(z, tl.int32))
+                                tl.tensor(z, tl.int32), self._num_stealing_ctas)
+
+
+def _check_num_stealing_ctas(num_stealing_ctas):
+    n = tl._unwrap_if_constexpr(num_stealing_ctas)
+    if n is not None and (isinstance(n, bool) or not isinstance(n, int) or n < 0):
+        raise ValueError(f"num_stealing_ctas must be a non-negative constexpr int or None, got {n!r}")
+    return tl.constexpr(n)
+
+
+def _clc_steal_predicate(num_stealing_ctas, _semantic):
+    """i1 handle that is true iff this CTA's cluster is among the first
+    ``num_stealing_ctas // cluster_size`` clusters in linear launch order, or
+    ``None`` when every CTA steals. Built from cluster base coordinates, so all
+    CTAs of a cluster agree."""
+    n = tl._unwrap_if_constexpr(num_stealing_ctas)
+    if n is None:
+        return None
+    cluster = tuple(getattr(_semantic.builder.options, "cluster_dims", None) or (1, 1, 1))
+    cluster = cluster + (1, ) * (3 - len(cluster))
+    num_clusters = n // (cluster[0] * cluster[1] * cluster[2])
+    # Linear cluster id, x fastest: (x / cx) + (nx / cx) * ((y / cy) + (ny / cy) * (z / cz)).
+    cluster_id = None
+    for axis in (2, 1, 0):
+        coord = _semantic.floordiv(_semantic.program_id(axis), cluster[axis])
+        if cluster_id is None:
+            cluster_id = coord
+        else:
+            extent = _semantic.floordiv(_semantic.num_programs(axis), cluster[axis])
+            cluster_id = _semantic.add(coord, _semantic.mul(extent, cluster_id, False), False)
+    return _semantic.less_than(cluster_id, _semantic.to_tensor(num_clusters)).handle
 
 
 _attach_tile_id(ClcTileScheduler)

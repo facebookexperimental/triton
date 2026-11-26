@@ -253,3 +253,212 @@ def test_matmul_clc(M, N, K):
         BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M, tl.ClcTileScheduler)
 
     torch.testing.assert_close(c, torch.matmul(a, b), atol=1e-1, rtol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# CLC partial work-stealing (num_stealing_ctas)
+# ---------------------------------------------------------------------------
+@triton.jit
+def _clc_owner_kernel(counts_ptr, owner_ptr, NUM_STEALING_CTAS: tl.constexpr):
+    """Records which CTA (linear program id, x fastest) ran each tile."""
+    sched = tl.clc_tile_scheduler(num_stealing_ctas=NUM_STEALING_CTAS)
+    nx = tl.num_programs(0)
+    while sched.is_valid():
+        tile = sched.tile_id[1] * nx + sched.tile_id[0]
+        tl.atomic_add(counts_ptr + tile, 1)
+        tl.store(owner_ptr + tile, tl.program_id(1) * nx + tl.program_id(0))
+        sched = sched.advance()
+
+
+def test_clc_partial_steal_predicates_advance():
+    sig = {"counts_ptr": "*i32", "owner_ptr": "*i32"}
+    ttir = initial_ttir(_clc_owner_kernel, sig, {"NUM_STEALING_CTAS": 132})
+    assert "ttng.clc_advance %" in ttir, "num_stealing_ctas passes a steal predicate to clc_advance"
+    ttir = initial_ttir(_clc_owner_kernel, sig, {"NUM_STEALING_CTAS": None})
+    assert "ttng.clc_advance :" in ttir, "without num_stealing_ctas clc_advance has no predicate"
+
+
+def test_clc_partial_steal_rejects_negative():
+    sig = {"counts_ptr": "*i32", "owner_ptr": "*i32"}
+    with pytest.raises(Exception) as excinfo:
+        initial_ttir(_clc_owner_kernel, sig, {"NUM_STEALING_CTAS": -1})
+    chain, err = [], excinfo.value
+    while err is not None:
+        chain.append(str(err))
+        err = err.__cause__ or err.__context__
+    assert any("num_stealing_ctas" in m for m in chain), chain
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="CLC requires Blackwell (SM100+)")
+@pytest.mark.parametrize("cluster", [(1, 1), (2, 1), (1, 2), (2, 2)])
+@pytest.mark.parametrize("num_stealing", [None, 0, 1, 7, 64, "num_sms"])
+@pytest.mark.parametrize("grid", [(2, 2), (1000, 1), (20000, 1), (64, 300)])
+def test_clc_partial_steal_ownership(cluster, num_stealing, grid):
+    """Every tile runs exactly once, exactly the first num_stealing_ctas CTAs
+    (whole clusters, linear cluster order) steal, and every other CTA runs only
+    its own tile."""
+    if grid[1] % cluster[1]:
+        pytest.skip("grid must be divisible by the cluster shape")
+    if num_stealing == "num_sms":
+        num_stealing = _num_sms()
+    gx, gy = grid
+    num_tiles = gx * gy
+    counts = torch.zeros(num_tiles, device="cuda", dtype=torch.int32)
+    owner = torch.full((num_tiles, ), -1, device="cuda", dtype=torch.int32)
+    opts = {"ctas_per_cga": (*cluster, 1)} if cluster != (1, 1) else {}
+    _clc_owner_kernel[(gx, gy)](counts, owner, num_stealing, **opts)
+    counts, owner = counts.cpu(), owner.cpu()
+    assert counts.min().item() == 1, "some tile was never run (dropped)"
+    assert counts.max().item() == 1, "some tile was run more than once"
+    tiles = torch.arange(num_tiles, dtype=torch.int32)
+
+    def cluster_id(linear):
+        x, y = linear % gx, linear // gx
+        return x // cluster[0] + (gx // cluster[0]) * (y // cluster[1])
+
+    # A cluster is claimed as a unit: all tiles of one cluster are run by the
+    # members of a single cluster.
+    tile_cluster, owner_cluster = cluster_id(tiles).long(), cluster_id(owner)
+    num_clusters = num_tiles // (cluster[0] * cluster[1])
+    lo = torch.full((num_clusters, ), 1 << 30, dtype=torch.int32).scatter_reduce(0, tile_cluster, owner_cluster, "amin")
+    hi = torch.full((num_clusters, ), -1, dtype=torch.int32).scatter_reduce(0, tile_cluster, owner_cluster, "amax")
+    assert torch.equal(lo, hi), "members of one claimed cluster disagree"
+    stolen = owner != tiles
+    if num_stealing is None:
+        return
+    stealers = min(num_stealing // (cluster[0] * cluster[1]), num_clusters)
+    stealing_clusters = cluster_id(owner[stolen]).unique()
+    assert bool((stealing_clusters < stealers).all()), "a non-stealing CTA ran a tile that was not its own"
+    if num_tiles >= 100 * _num_sms() and stealers > 0:
+        # With far more tiles than SMs every stealer gets to steal; this also
+        # guards against a lowering that silently never steals.
+        assert stealing_clusters.numel() == stealers, (stealing_clusters.numel(), stealers)
+
+
+@triton.jit
+def _ws_tma_gemm_kernel(a_desc, b_desc, c_desc, M, N, K: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                        BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr, EPILOGUE_SUBTILE: tl.constexpr,
+                        NUM_SMS: tl.constexpr, DP: tl.constexpr, SES: tl.constexpr, TWO_CTAS: tl.constexpr,
+                        CLC: tl.constexpr, NUM_STEALING_CTAS: tl.constexpr, owner_ptr=None):
+    """autoWS persistent TMA GEMM shaped like Inductor's Blackwell template;
+    CLC=False is the static persistent reference."""
+    grid_m = tl.cdiv(M, BLOCK_M)
+    if TWO_CTAS:
+        grid_m = (grid_m + 1) // 2 * 2
+    grid_n = tl.cdiv(N, BLOCK_N)
+    k_tiles = tl.cdiv(K, BLOCK_K)
+    num_pid_in_group = GROUP_M * grid_n
+    if CLC:
+        sched = tl.clc_tile_scheduler(num_stealing_ctas=NUM_STEALING_CTAS)
+        while tl.condition(sched.is_valid(), warp_specialize=True, data_partition_factor=DP,
+                           separate_epilogue_store=SES):
+            pid_m, pid_n = _compute_pid(sched.tile_id[0], num_pid_in_group, grid_m, GROUP_M)
+            if owner_ptr is not None:
+                tl.store(owner_ptr + sched.tile_id[0], tl.program_id(0))
+            _ws_tma_gemm_tile(a_desc, b_desc, c_desc, pid_m, pid_n, k_tiles, BLOCK_M, BLOCK_N, BLOCK_K,
+                              EPILOGUE_SUBTILE, TWO_CTAS)
+            sched = sched.advance()
+    else:
+        for tile_id in tl.range(tl.program_id(0), grid_m * grid_n, NUM_SMS, flatten=False, warp_specialize=True,
+                                data_partition_factor=DP, separate_epilogue_store=SES):
+            pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, grid_m, GROUP_M)
+            _ws_tma_gemm_tile(a_desc, b_desc, c_desc, pid_m, pid_n, k_tiles, BLOCK_M, BLOCK_N, BLOCK_K,
+                              EPILOGUE_SUBTILE, TWO_CTAS)
+
+
+@triton.jit
+def _ws_tma_gemm_tile(a_desc, b_desc, c_desc, pid_m, pid_n, k_tiles, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                      BLOCK_K: tl.constexpr, EPILOGUE_SUBTILE: tl.constexpr, TWO_CTAS: tl.constexpr):
+    offs_am = pid_m * BLOCK_M
+    offs_bn = pid_n * BLOCK_N
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for ki in range(k_tiles):
+        a = a_desc.load([offs_am, ki * BLOCK_K])
+        b = b_desc.load([offs_bn, ki * BLOCK_K])
+        acc = tl.dot(a, b.T, acc, two_ctas=TWO_CTAS)
+    acc = acc.to(c_desc.dtype)
+    if EPILOGUE_SUBTILE:
+        c0, c1 = tl.split(tl.permute(tl.reshape(acc, (BLOCK_M, 2, BLOCK_N // 2)), (0, 2, 1)))
+        c_desc.store([offs_am, offs_bn], c0)
+        c_desc.store([offs_am, offs_bn + BLOCK_N // 2], c1)
+    else:
+        c_desc.store([offs_am, offs_bn], acc)
+
+
+def _launch_ws_tma_gemm(a, b, c, cfg, clc, num_stealing, owner=None):
+    from triton.tools.tensor_descriptor import TensorDescriptor
+
+    BM, BN, BK, ES, DP, SES, CTAS, stages = cfg
+    M, K = a.shape
+    N = b.shape[0]
+    a_d = TensorDescriptor(a, a.shape, a.stride(), [BM, BK])
+    b_d = TensorDescriptor(b, b.shape, b.stride(), [BN, BK])
+    c_d = TensorDescriptor(c, c.shape, c.stride(), [BM, BN // (2 if ES else 1)])
+    num_sms = _num_sms()
+    tiles = triton.cdiv(triton.cdiv(M, BM), CTAS) * CTAS * triton.cdiv(N, BN)
+    grid = tiles if clc else min(num_sms // CTAS * CTAS, tiles)
+    opts = {"num_stages": stages, "num_warps": 4}
+    if CTAS == 2:
+        opts["ctas_per_cga"] = (2, 1, 1)
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = True
+        return _ws_tma_gemm_kernel[(grid, )](a_d, b_d, c_d, M, N, K, BM, BN, BK, 8, ES, num_sms // CTAS * CTAS, DP, SES,
+                                             CTAS == 2, clc, num_stealing, owner, **opts)
+
+
+_WS_GEMM_CONFIGS = [
+    # BLOCK_M, BLOCK_N, BLOCK_K, EPILOGUE_SUBTILE, DP, SES, CTAS, num_stages
+    (128, 128, 64, False, 1, True, 1, 3),
+    (128, 256, 64, True, 1, True, 1, 3),
+    (256, 128, 64, True, 2, True, 1, 3),
+    (128, 128, 64, False, 1, False, 1, 3),
+    (128, 256, 64, True, 1, True, 2, 3),
+    (128, 128, 64, False, 1, False, 2, 3),
+]
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="CLC requires Blackwell (SM100+)")
+@pytest.mark.parametrize("cfg", _WS_GEMM_CONFIGS)
+@pytest.mark.parametrize("M, N, K", [(1024, 2048, 256), (1152, 12800, 128), (6202, 2048, 512), (8192, 8192, 1024)])
+@pytest.mark.parametrize("num_stealing", [None, 0, 7, "num_sms-16"])
+def test_ws_clc_partial_steal_matches_static(cfg, M, N, K, num_stealing):
+    """Partial-steal CLC under Meta autoWS is bit-identical to the static
+    persistent kernel and leaves no tile unwritten (NaN-poisoned output)."""
+    if num_stealing == "num_sms-16":
+        num_stealing = _num_sms() - 16
+    torch.manual_seed(0)
+    a = torch.randn(M, K, device="cuda").bfloat16()
+    b = torch.randn(N, K, device="cuda").bfloat16()
+    triton.set_allocator(lambda size, align, stream: torch.empty(size, dtype=torch.int8, device="cuda"))
+    ref = torch.full((M, N), float("nan"), device="cuda", dtype=torch.float32)
+    _launch_ws_tma_gemm(a, b, ref, cfg, False, None)
+    assert not torch.isnan(ref).any()
+    torch.testing.assert_close(ref, (a.float() @ b.float().T), atol=1e-3, rtol=1e-3)
+    for _ in range(3):
+        c = torch.full((M, N), float("nan"), device="cuda", dtype=torch.float32)
+        k = _launch_ws_tma_gemm(a, b, c, cfg, True, num_stealing)
+        assert "ttg.warp_specialize" in k.asm["ttgir"], "the CLC kernel must be warp-specialized"
+        assert torch.equal(c, ref), "partial-steal CLC output differs from static persistent"
+    # Which CTA ran each tile: only the first num_stealing CTAs (whole
+    # clusters) run tiles other than their own, and they do steal.
+    BM, BN, SES, CTAS = cfg[0], cfg[1], cfg[5], cfg[6]
+    if CTAS == 2 and SES:
+        # The extra side store hits an unrelated AutoWS memory-planner failure
+        # for 2-CTA CLC with a separate epilogue store ("N-buffer reuse group:
+        # producer and consumer orderings are inconsistent"), with or without
+        # partial stealing, fixed by #3811; the SES=False 2-CTA config covers
+        # ownership until then.
+        return
+    num_tiles = triton.cdiv(triton.cdiv(M, BM), CTAS) * CTAS * triton.cdiv(N, BN)
+    owner = torch.full((num_tiles, ), -1, device="cuda", dtype=torch.int32)
+    k = _launch_ws_tma_gemm(a, b, c, cfg, True, num_stealing, owner)
+    assert "ttg.warp_specialize" in k.asm["ttgir"]
+    assert torch.equal(c, ref)
+    owner = owner.cpu()
+    tiles = torch.arange(num_tiles, dtype=torch.int32)
+    assert bool((owner >= 0).all())
+    stolen_by = owner[owner != tiles]
+    stealers = num_tiles if num_stealing is None else num_stealing // CTAS * CTAS
+    assert bool((stolen_by < stealers).all()), "a non-stealing CTA ran a tile that was not its own"
+    if num_tiles >= 4 * _num_sms() and stealers > 0:
+        assert stolen_by.numel() > 0, "no CTA stole a tile"

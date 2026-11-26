@@ -112,7 +112,8 @@ struct CLCSplitPass
         IntegerType::get(ctx, 32), IntegerType::get(ctx, 32)};
     getOperation().walk([&](CLCAdvanceOp adv) {
       OpBuilder b(adv);
-      auto issue = CLCTryCancelAsyncOp::create(b, adv.getLoc(), tokTy);
+      auto issue =
+          CLCTryCancelAsyncOp::create(b, adv.getLoc(), tokTy, adv.getSteal());
       auto read = CLCReadOp::create(b, adv.getLoc(), readTys,
                                     ValueRange{issue.getToken()});
       adv->replaceAllUsesWith(read->getResults());
@@ -129,8 +130,10 @@ struct CLCSplitPass
 // so the request resolves while the tile is computed. The move is restricted to
 // the persistent-loop body (the scf.while after-region), the only block whose
 // front is a safe issue point -- an arbitrary block's front may hold required
-// setup. TODO: cross-basic-block hoisting / unification (e.g. clc_advance in
-// both arms of an if/else) is a follow-up; see the design doc.
+// setup. An optional `steal` predicate defined in the same block bounds the
+// hoist: the issue moves to just after that definition instead. TODO:
+// cross-basic-block hoisting / unification (e.g. clc_advance in both arms of an
+// if/else) is a follow-up; see the design doc.
 //===--------------------------------------------------------------------===//
 struct CLCHoistPass
     : public impl::TritonNvidiaGPUCLCHoistPassBase<CLCHoistPass> {
@@ -140,6 +143,12 @@ struct CLCHoistPass
       auto whileOp = dyn_cast<scf::WhileOp>(blk->getParentOp());
       if (!whileOp || blk != &whileOp.getAfter().front())
         return;
+      if (Value steal = issue.getSteal())
+        if (Operation *def = steal.getDefiningOp();
+            def && def->getBlock() == blk) {
+          issue->moveAfter(def);
+          return;
+        }
       if (&blk->front() != issue.getOperation())
         issue->moveBefore(&blk->front());
     });
@@ -249,8 +258,11 @@ struct CLCMaterializePass
         cast<scf::ConditionOp>(newLoop.getBefore().front().getTerminator());
     condOp.getArgsMutable().append(phaseBefore);
 
-    // Materialize the issue: barrier_expect + clc_try_cancel.
+    // Materialize the issue: barrier_expect + clc_try_cancel. A false `steal`
+    // predicate skips the whole request (and the empty-barrier wait guarding
+    // it); the read below then reports no tile without waiting.
     OpBuilder ib(issue);
+    Value steal = issue.getSteal();
     if (emptyBar) {
       // The first wait passes immediately because an initialized mbarrier has
       // phase 0. Later waits block until every CTA has consumed the previous
@@ -263,18 +275,37 @@ struct CLCMaterializePass
       Value one = arith::ConstantIntOp::create(ib, issue.getLoc(), 1, 32);
       Value emptyPhase =
           arith::XOrIOp::create(ib, issue.getLoc(), phaseAfter, one);
-      WaitBarrierOp::create(ib, issue.getLoc(), emptyBar, emptyPhase, isLeader);
+      Value waitPred = isLeader;
+      if (steal)
+        waitPred = arith::AndIOp::create(ib, issue.getLoc(), isLeader, steal);
+      WaitBarrierOp::create(ib, issue.getLoc(), emptyBar, emptyPhase, waitPred);
     }
-    Value pred = arith::ConstantIntOp::create(ib, issue.getLoc(), /*value=*/1,
-                                              /*width=*/1);
+    Value pred = steal ? steal
+                       : arith::ConstantIntOp::create(ib, issue.getLoc(),
+                                                      /*value=*/1,
+                                                      /*width=*/1);
     BarrierExpectOp::create(ib, issue.getLoc(), bar, kClcResponseBytes, pred);
-    CLCTryCancelOp::create(ib, issue.getLoc(), resp, bar);
+    if (steal) {
+      auto ifOp = scf::IfOp::create(ib, issue.getLoc(), steal,
+                                    /*withElseRegion=*/false);
+      OpBuilder thenB = ifOp.getThenBodyBuilder();
+      CLCTryCancelOp::create(thenB, issue.getLoc(), resp, bar);
+    } else {
+      CLCTryCancelOp::create(ib, issue.getLoc(), resp, bar);
+    }
 
-    // Materialize the read: wait_barrier + clc_load_result + decode.
+    // Materialize the read: wait_barrier + clc_load_result + decode. Without a
+    // request the response buffer holds stale data, so `steal` masks isValid;
+    // the loop then exits, so the phase never runs ahead of the barrier.
     OpBuilder rb(read);
-    WaitBarrierOp::create(rb, loc, bar, phaseAfter);
+    if (steal)
+      WaitBarrierOp::create(rb, loc, bar, phaseAfter, steal);
+    else
+      WaitBarrierOp::create(rb, loc, bar, phaseAfter);
     Value clcResult = CLCLoadResultOp::create(rb, loc, resp);
     Value isValid = CLCIsCanceledOp::create(rb, loc, clcResult);
+    if (steal)
+      isValid = arith::AndIOp::create(rb, loc, isValid, steal);
     Value x = CLCGetProgramIdOp::create(rb, loc, clcResult, 0);
     Value y = CLCGetProgramIdOp::create(rb, loc, clcResult, 1);
     Value z = CLCGetProgramIdOp::create(rb, loc, clcResult, 2);
