@@ -125,11 +125,12 @@ __all__ = [
     "moe_routing", "moe_finalize", "moe_router_topk_align", "moe_mxfp4_sort_quant", "norm_residual_norm", "all_reduce",
     "all_reduce_workspace", "all_reduce_norm_residual_norm", "rmsnorm_gate", "router_gemm", "qk_norm_rope_kv_cache",
     "addmm", "addmm_mul_add", "addmm_mul_add_launch", "flash_attn", "flash_attn_mxfp8", "flash_attn_varlen",
-    "linear_rowscale", "linear_rowscale_launch", "window_attn_varlen", "rmsnorm_cat", "swiglu_ffn", "mla_window_attn",
-    "hstu_attn_dev", "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode",
-    "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward", "paged_attention_decode",
-    "paged_attention_prefill", "paged_attention_decode_workspace", "allocate_paged_kv_cache_5d", "reshape_and_cache_5d",
-    "UnsupportedOp", "UnsupportedBackward", "InvalidInput", "BitwiseInvarianceSpec", "Space"
+    "flash_attn_varlen_mxfp8", "linear_rowscale", "linear_rowscale_launch", "window_attn_varlen", "rmsnorm_cat",
+    "swiglu_ffn", "mla_window_attn", "hstu_attn_dev", "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill",
+    "kda_recurrent_decode", "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward",
+    "paged_attention_decode", "paged_attention_prefill", "paged_attention_decode_workspace",
+    "allocate_paged_kv_cache_5d", "reshape_and_cache_5d", "UnsupportedOp", "UnsupportedBackward", "InvalidInput",
+    "BitwiseInvarianceSpec", "Space"
 ]
 __all__ += [
     'paged_attention_decode_fp8', 'paged_attention_decode_fp8_workspace', 'compute_norm_nvfp4_global_scale',
@@ -1723,6 +1724,51 @@ def flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seq
         if window_size != (-1, -1):
             raise UnsupportedOp(f"tlx.ops.flash_attn_varlen does not support window_size on {spec.arch}")
         return fn(q, k, v, cu_seqlens_q, cu_seqlens_k, int(max_seqlen_q), sm_scale, bool(causal))
+
+
+def flash_attn_varlen_mxfp8(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, sm_scale=None,
+                            causal=False, *, fast_exp=None, space=None):
+    """Forward-only packed MXFP8 attention using the gfx950 4-wave kernel.
+
+    Q/K/V are contiguous BF16 ``(tokens, 4, 128)`` tensors. Sequence ``b`` owns
+    query rows ``cu_seqlens_q[b]:cu_seqlens_q[b + 1]`` and key/value rows
+    ``cu_seqlens_k[b]:cu_seqlens_k[b + 1]``; both offset tensors are contiguous
+    int32 ``(batch + 1,)``. This op is noncausal and requires MHA with exactly
+    four heads. ``max_seqlen_q`` and ``max_seqlen_k`` are accepted for API
+    parity. ``sm_scale`` defaults to ``128**-0.5`` and ``fast_exp`` selects the
+    approximate exponentiation path; by default it is used when the sequences
+    average at least 4096 keys. In-place changes to the offset tensors are
+    picked up when PyTorch records them; writes through ``.data`` are not.
+    Returns the BF16 output only (no log-sum-exp); query rows of a sequence
+    with no keys are zero.
+    """
+    import torch
+
+    if causal:
+        raise InvalidInput("tlx.ops.flash_attn_varlen_mxfp8 is noncausal")
+    if any(t.ndim != 3 for t in (q, k, v)):
+        raise InvalidInput("tlx.ops.flash_attn_varlen_mxfp8 expects rank-3 Q/K/V tensors")
+    if k.shape != v.shape or any(t.shape[1:] != (4, 128) for t in (q, k, v)):
+        raise InvalidInput("tlx.ops.flash_attn_varlen_mxfp8 expects Q/K/V shape (tokens, 4, 128)")
+    if any(t.dtype != torch.bfloat16 or not t.is_contiguous() for t in (q, k, v)):
+        raise InvalidInput("tlx.ops.flash_attn_varlen_mxfp8 expects contiguous BF16 Q/K/V")
+    if (cu_seqlens_q.ndim != 1 or cu_seqlens_k.ndim != 1 or cu_seqlens_q.shape != cu_seqlens_k.shape
+            or cu_seqlens_q.numel() < 2 or cu_seqlens_q.dtype != torch.int32 or cu_seqlens_k.dtype != torch.int32
+            or not cu_seqlens_q.is_contiguous() or not cu_seqlens_k.is_contiguous()):
+        raise InvalidInput("tlx.ops.flash_attn_varlen_mxfp8 expects contiguous int32 sequence offsets")
+    if any(t.device != q.device for t in (k, v, cu_seqlens_q, cu_seqlens_k)):
+        raise InvalidInput("tlx.ops.flash_attn_varlen_mxfp8 expects all tensors on one device")
+    if sm_scale is not None and not 0 < sm_scale < math.inf:
+        raise InvalidInput("tlx.ops.flash_attn_varlen_mxfp8 expects a positive finite sm_scale")
+    space_name, invariance = _normalize_space_arg("flash_attn_varlen_mxfp8", space)
+    _check_single_config_space("flash_attn_varlen_mxfp8", space_name)
+    fn, spec = impl_for("flash_attn_varlen_mxfp8", device=q.device)
+    check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[2], HEADS=q.shape[1])
+    check_backward(spec, q, k, v)
+    _check_enforced("flash_attn_varlen_mxfp8", spec, invariance)
+    scale = 128**-0.5 if sm_scale is None else sm_scale
+    with torch.cuda.device(q.device):
+        return fn(q, k, v, cu_seqlens_q, cu_seqlens_k, int(max_seqlen_q), int(max_seqlen_k), scale, fast_exp=fast_exp)
 
 
 def window_attn_varlen(q, k, v, cu_seqlens, window_size, sm_scale=None, *, space=None):

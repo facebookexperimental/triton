@@ -1088,6 +1088,7 @@ BENCH_MODULES = (
     "bench_flash_attn",
     "bench_flash_attn_mxfp8",
     "bench_flash_attn_varlen",
+    "bench_flash_attn_varlen_mxfp8",
     "bench_flash_attn_varlen_ragged",
     "bench_hstu_attn",
     "bench_hstu_cross_attn",

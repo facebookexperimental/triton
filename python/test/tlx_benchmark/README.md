@@ -12,7 +12,7 @@ One shot command with extreme simplicity
 python python/test/tlx_benchmark/bench_{op}.py
 
 `{op}` is one of `norm`, `mm`, `torchtlx_mm`, `torchtlx_addmm`, `torchtlx_bmm`,
-`flash_attn`, `flash_attn_mxfp8`, `flash_attn_varlen`, `window_attn_varlen`, `hstu_attn`, `hstu_cross_attn`,
+`flash_attn`, `flash_attn_mxfp8`, `flash_attn_varlen`, `flash_attn_varlen_mxfp8`, `window_attn_varlen`, `hstu_attn`, `hstu_cross_attn`,
 `kda`, `kda_prefill`, `kda_decode`, `mla_window_attn`, `swiglu_ffn`, `rmsnorm_cat`, `moe`, `moe_routing`, `moe_finalize`, `router_gemm`,
 or one of the fused operators or collectives below.
 
@@ -74,6 +74,7 @@ options:
 | `flash_attn` | `F.scaled_dot_product_attention` | speedup >= 0.9x | full |
 | `flash_attn_mxfp8` | `F.scaled_dot_product_attention` | speedup >= 0.9x | full |
 | `flash_attn_varlen` | `F.scaled_dot_product_attention` on the padded batch, masked | speedup >= 0.9x | heuristic |
+| `flash_attn_varlen_mxfp8` | none | reports absolute throughput | heuristic |
 | `window_attn_varlen` | `torch.ops.aten._flash_attention_forward` (FlashAttention-2) with the same window | speedup >= 0.9x | heuristic |
 | `hstu_attn` | `_reference.py::triton_hstu_mha` (production Triton) | speedup >= 0.9x | full |
 | `hstu_cross_attn` | `tutorials/hstu_cross_attn/triton_bw_cross_attention.py` (Triton) | speedup >= 0.9x | curated |
