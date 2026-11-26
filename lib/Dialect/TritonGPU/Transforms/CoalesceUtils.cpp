@@ -4,9 +4,11 @@
 #include "mlir/Support/LLVM.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
+#include "triton/Dialect/TritonGPU/Transforms/CoalesceSectorUtils.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/StrUtil.h"
 #include "llvm/Support/Debug.h"
+#include <limits>
 
 #define DEBUG_TYPE "tritongpu-coalesce"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -17,7 +19,8 @@ BlockedEncodingAttr
 buildCoalescedEncoding(ModuleAxisInfoAnalysis &axisInfoAnalysis, Operation *op,
                        int numWarps, int threadsPerWarp,
                        triton::gpu::CGAEncodingAttr cgaLayout,
-                       SmallVector<int64_t> shapePerCTA, unsigned maxVecBits) {
+                       SmallVector<int64_t> shapePerCTA, unsigned maxVecBits,
+                       unsigned sectorBytes) {
   Value ptr = getMemAccessPtr(op);
   auto refTensorType = cast<RankedTensorType>(ptr.getType());
 
@@ -94,8 +97,42 @@ buildCoalescedEncoding(ModuleAxisInfoAnalysis &axisInfoAnalysis, Operation *op,
   }
   SmallVector<unsigned> sizePerThread(refTensorType.getRank(), 1);
   sizePerThread[order[0]] = perThread;
-  return BlockedEncodingAttr::get(op->getContext(), refTensorType.getShape(),
-                                  sizePerThread, order, numWarps,
-                                  threadsPerWarp, cgaLayout);
+  auto buildLayout = [&](ArrayRef<unsigned> layoutOrder) {
+    return BlockedEncodingAttr::get(op->getContext(), refTensorType.getShape(),
+                                    sizePerThread, layoutOrder, numWarps,
+                                    threadsPerWarp, cgaLayout);
+  };
+  auto layout = buildLayout(order);
+  if (!sectorBytes || !load || perThread != 1 || order.size() != 2 ||
+      contiguity[order[0]] != 1)
+    return layout;
+
+  unsigned bits = getPointeeBitWidth(ptr.getType());
+  if (bits < 8 || bits > 128 || bits % 8 != 0)
+    return layout;
+
+  uint64_t strides[2];
+  for (unsigned dim = 0; dim < 2; ++dim) {
+    if (shapePerCTA[dim] <= 1)
+      return layout;
+    unsigned compileTimeBudget = 64;
+    auto step = inferLaneStep(ptr, dim, axisInfoAnalysis, compileTimeBudget);
+    if (!step || *step <= 0 || *step > std::numeric_limits<uint32_t>::max())
+      return layout;
+    strides[dim] = *step;
+  }
+
+  auto alternate = buildLayout({order[1], order[0]});
+  for (unsigned dim = 0; dim < 2; ++dim) {
+    if (layout.getThreadsPerWarp()[dim] > shapePerCTA[dim] ||
+        alternate.getThreadsPerWarp()[dim] > shapePerCTA[dim])
+      return layout;
+  }
+  unsigned sectors =
+      countScalarWaveSectors(layout, strides, bits / 8, sectorBytes);
+  unsigned alternateSectors =
+      countScalarWaveSectors(alternate, strides, bits / 8, sectorBytes);
+  LDBG("scalar load sectors: " << sectors << " vs. " << alternateSectors);
+  return alternateSectors < sectors ? alternate : layout;
 }
 } // namespace mlir::triton::gpu
