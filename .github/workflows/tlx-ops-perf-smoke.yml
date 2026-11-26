@@ -37,6 +37,11 @@ on:
         type: string
         required: false
         default: ''
+      platforms:
+        description: 'Comma-separated platforms to bench: h100,b200,mi350 (blank = all)'
+        type: string
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -59,6 +64,7 @@ jobs:
       base_date: ${{ steps.pick.outputs.base_date }}
       pr: ${{ steps.pick.outputs.pr }}
       note: ${{ steps.pick.outputs.note }}
+      platforms: ${{ steps.pick.outputs.platforms }}
     steps:
       - name: Checkout the dispatched commit
         uses: actions/checkout@v4
@@ -71,6 +77,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           INPUT_PR: ${{ inputs.pr }}
+          INPUT_PLATFORMS: ${{ inputs.platforms }}
           SKIP_PLATFORMS: ${{ vars.GPU_CI_SKIP_PLATFORMS }}
         run: |
           set -euo pipefail
@@ -112,13 +119,19 @@ jobs:
             fi
           fi
           [[ "${BASE}" =~ ^[0-9a-f]{40}$ ]] || { echo "bad base: ${BASE}"; exit 1; }
+          PLATFORMS="${INPUT_PLATFORMS// /}"
+          [[ "${PLATFORMS}" =~ ^((h100|b200|mi350)(,(h100|b200|mi350))*)?$ ]] || { echo "bad platforms: ${PLATFORMS}"; exit 1; }
           NOTE=""
           for platform in b200 h100 mi350; do
+            if [[ -n "${PLATFORMS}" && ",${PLATFORMS}," != *",${platform},"* ]]; then
+              continue
+            fi
             if [[ ",${SKIP_PLATFORMS// /}," == *",${platform},"* ]]; then
               NOTE="${NOTE:+${NOTE}, }${platform}"
             fi
           done
           [[ -z "${NOTE}" ]] || NOTE="Not run on ${NOTE}: its CI runners are paused (GPU_CI_SKIP_PLATFORMS)."
+          [[ -z "${PLATFORMS}" ]] || NOTE="Benched on ${PLATFORMS//,/, } only, as dispatched.${NOTE:+ ${NOTE}}"
           {
             echo "head=${HEAD}"
             echo "pr_head=${HEAD}"
@@ -127,6 +140,7 @@ jobs:
             echo "base_date=$(git show -s --format=%cd --date=format:%Y%m%d "${BASE}")"
             echo "pr=${PR}"
             echo "note=${NOTE}"
+            echo "platforms=${PLATFORMS:-b200,h100,mi350}"
           } >> "$GITHUB_OUTPUT"
 
   build-head:
@@ -162,7 +176,8 @@ jobs:
     if: >-
       ${{ !cancelled() && needs.resolve.outputs.head != '' &&
       needs.build-head.result == 'success' && needs.build-head.outputs.wheel != '' &&
-      !contains(vars.GPU_CI_SKIP_PLATFORMS, 'h100') }}
+      !contains(vars.GPU_CI_SKIP_PLATFORMS, 'h100') &&
+      contains(format(',{0},', needs.resolve.outputs.platforms), ',h100,') }}
     permissions:
       contents: read
       pull-requests: write
@@ -185,7 +200,8 @@ jobs:
     if: >-
       ${{ !cancelled() && needs.resolve.outputs.head != '' &&
       needs.build-head.result == 'success' && needs.build-head.outputs.wheel != '' &&
-      !contains(vars.GPU_CI_SKIP_PLATFORMS, 'b200') }}
+      !contains(vars.GPU_CI_SKIP_PLATFORMS, 'b200') &&
+      contains(format(',{0},', needs.resolve.outputs.platforms), ',b200,') }}
     permissions:
       contents: read
       pull-requests: write
@@ -208,7 +224,8 @@ jobs:
     if: >-
       ${{ !cancelled() && needs.resolve.outputs.head != '' &&
       needs.build-head.result == 'success' && needs.build-head.outputs.wheel != '' &&
-      !contains(vars.GPU_CI_SKIP_PLATFORMS, 'mi350') }}
+      !contains(vars.GPU_CI_SKIP_PLATFORMS, 'mi350') &&
+      contains(format(',{0},', needs.resolve.outputs.platforms), ',mi350,') }}
     permissions:
       contents: read
       pull-requests: write

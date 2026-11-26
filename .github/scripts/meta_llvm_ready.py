@@ -197,10 +197,9 @@ def read_manifest(repo, path, ref):
 
 
 def dispatch_consumer_tests(repo, kind, branch, pr):
-    # The AMD SDK only builds the AMD codegen library, so NVIDIA GPU tests cannot observe it.
-    workflows = {
-        'gpu-tests.yml': {'platforms': 'mi350'} if kind == 'amd' else {}, 'tlx-ops-perf-smoke.yml': {'pr': str(pr)}
-    }
+    # The AMD SDK only builds the AMD codegen library, so NVIDIA GPUs cannot observe it.
+    platforms = {'platforms': 'mi350'} if kind == 'amd' else {}
+    workflows = {'gpu-tests.yml': platforms, 'tlx-ops-perf-smoke.yml': {'pr': str(pr), **platforms}}
     for workflow, inputs in workflows.items():
         github_json(f'repos/{repo}/actions/workflows/{workflow}/dispatches', method='POST',
                     payload={'ref': branch, 'inputs': inputs})
