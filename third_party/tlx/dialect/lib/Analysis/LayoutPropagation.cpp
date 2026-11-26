@@ -136,6 +136,19 @@ void LayoutBackwardPropagation::visitWarpSpecRegionArgs(
   }
 }
 
+// A rank-changing memdesc_reinterpret whose result layout is user pinned
+// (local_reinterpret with an explicit layout) is an independent view of the
+// same bytes: its layout says nothing about the source's, and the source's
+// layout must not overwrite it.
+static bool isPinnedRankChangingView(Operation *op) {
+  auto reinterpret = dyn_cast<ttg::MemDescReinterpretOp>(op);
+  if (!reinterpret ||
+      !isa_and_nonnull<UserLayoutAttr>(reinterpret.getType().getEncoding()))
+    return false;
+  auto srcTy = cast<ttg::MemDescType>(reinterpret.getSrc().getType());
+  return srcTy.getRank() != reinterpret.getType().getRank();
+}
+
 static bool hasExplicitLayoutUserThroughAliases(Value root) {
   auto isAliasLike = [](Operation *op) {
     return isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp,
@@ -174,7 +187,8 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
     Operation *op, ArrayRef<LayoutEncodingLattice *> operands,
     ArrayRef<const LayoutEncodingLattice *> results) {
   LDBG("Visiting operation " << *op << "\n");
-  if (isa<tlx::ReleaseLayoutOp, tlx::LocalAliasOp>(op))
+  if (isa<tlx::ReleaseLayoutOp, tlx::LocalAliasOp>(op) ||
+      isPinnedRankChangingView(op))
     return success();
 
   if (isa<RegionBranchOpInterface, ttg::WarpSpecializePartitionsOp>(op))
@@ -639,7 +653,8 @@ LogicalResult LayoutForwardPropagation::visitOperation(
   if (!isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp,
            ttg::MemDescSubsliceOp, ttg::MemDescDynamicSubsliceOp,
            ttg::MemDescTransOp, ttg::MemDescReshapeOp, ttng::TMEMSubSliceOp,
-           ttg::LocalAllocOp, ttng::TMEMAllocOp>(op))
+           ttg::LocalAllocOp, ttng::TMEMAllocOp>(op) ||
+      isPinnedRankChangingView(op))
     return success();
 
   for (const auto [operandIdx, operandLattice] : llvm::enumerate(operands)) {
