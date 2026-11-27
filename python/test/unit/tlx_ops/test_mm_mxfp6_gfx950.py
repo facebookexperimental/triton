@@ -109,6 +109,9 @@ def test_mm_mxfp6_gfx950_rejects_invalid_split_k(split_k):
     (256, 256, 16128, 8),
     (128, 256, 640, 4),
     (256, 128, 896, 2),
+    # Enough 256x256 tiles to select the 256x256 interwave kernel.
+    (4096, 4096, 384, 1),
+    (4096, 2048, 1280, 2),
 ])
 @pytest.mark.parametrize("space", ["heuristic", "full"])
 @pytest.mark.parametrize("a_format", ["e2m3", "e3m2"])
