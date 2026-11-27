@@ -78,8 +78,9 @@ def _variant_args(args, dtype_b, out_dtype):
     fp4 = dtype_b == "float4"
     resolved.block_k = 256 if fp4 else 128
     if fp4:
-        # wave256 scales are defined for the A8W8 BK128 tile only.
+        # wave256 scales and row pairs are defined for the A8W8 BK128 tile only.
         resolved.scale_layout = "block128"
+        resolved.a_row_pairs = resolved.b_row_pairs = False
     if resolved.cross_tile_prefetch is None:
         resolved.cross_tile_prefetch = not fp4
     cluster_barriers = resolved.cluster_size > 1 and resolved.cluster_barrier_interval > 0
@@ -204,6 +205,10 @@ def _command(args, case, dtype_b):
         command.append("--early_c_stores")
     if args.enable_wmma_queuing:
         command.append("--enable_wmma_queuing")
+    if args.a_row_pairs:
+        command.append("--a_row_pairs")
+    if args.b_row_pairs:
+        command.append("--b_row_pairs")
     if not args.cluster_multicast:
         command.append("--no-cluster_multicast")
     if not args.cross_tile_prefetch:
@@ -245,6 +250,10 @@ def parse_benchmark_args(argv=None):
         "--scale-layout", choices=("block128", "wave256"), default="block128",
         help="MX8xMX8 preshuffled scale format: wave256 reads both 128-row quadrants' scales with one LDS load "
         "(MX8xMX4 keeps block128)")
+    parser.add_argument("--a-row-pairs", action="store_true",
+                        help="MX8xMX8: store A as row pairs (pack_row_pairs) so each TDM piece moves 256 bytes")
+    parser.add_argument("--b-row-pairs", action="store_true",
+                        help="MX8xMX8: store B as row pairs (pack_row_pairs) so each TDM piece moves 256 bytes")
     parser.add_argument("--cross-tile-prefetch", action=argparse.BooleanOptionalAction, default=None,
                         help="prefetch next-tile inputs during the K tail (default: MX8xMX8)")
     parser.add_argument("--split-cluster-barrier", action=argparse.BooleanOptionalAction, default=None,
@@ -349,7 +358,8 @@ def main(argv=None):
                  static_cluster_steps=run_args.static_cluster_steps, scale_layout=run_args.scale_layout,
                  cross_tile_prefetch=run_args.cross_tile_prefetch, split_cluster_barrier=run_args.split_cluster_barrier,
                  early_c_stores=run_args.early_c_stores, enable_wmma_queuing=run_args.enable_wmma_queuing,
-                 group_m=run_args.group_m, cluster_size=run_args.cluster_size, cluster_layout=run_args.cluster_layout,
+                 a_row_pairs=run_args.a_row_pairs, b_row_pairs=run_args.b_row_pairs, group_m=run_args.group_m,
+                 cluster_size=run_args.cluster_size, cluster_layout=run_args.cluster_layout,
                  cluster_barrier_interval=run_args.cluster_barrier_interval,
                  cluster_multicast=run_args.cluster_multicast, xcd_remap=run_args.xcd_remap, num_xcds=run_args.num_xcds,
                  xcd_chunk=run_args.xcd_chunk, num_programs=run_args.num_programs,
@@ -429,6 +439,10 @@ def run_single(argv=None):
                         help="interleave final quadrant dots and output stores")
     parser.add_argument("--enable_wmma_queuing", action="store_true",
                         help="set SCHED_MODE[2] so persistent-kernel WMMAs may queue behind scalar and memory work")
+    parser.add_argument("--a_row_pairs", action="store_true",
+                        help="store FP8 A as row pairs (pack_row_pairs) so each TDM piece moves 256 bytes")
+    parser.add_argument("--b_row_pairs", action="store_true",
+                        help="store transposed FP8 B as row pairs (pack_row_pairs) so each TDM piece moves 256 bytes")
     parser.add_argument("--cluster_barrier_interval", type=int, default=1,
                         help="align cluster requests every N input K blocks; 0 disables all cluster barriers")
     parser.add_argument("--cluster_multicast", action=argparse.BooleanOptionalAction, default=True,
@@ -472,6 +486,10 @@ def run_single(argv=None):
         b_d = b.data.T.contiguous().cuda() if args.transpose_b else b.data.contiguous().cuda()
     else:
         b_d = b.T.contiguous().cuda() if args.transpose_b else b.contiguous().cuda()
+    if args.a_row_pairs:
+        a_d = gfx1250.pack_row_pairs(a_d, args.BK)
+    if args.b_row_pairs:
+        b_d = gfx1250.pack_row_pairs(b_d, args.BK)
     a_scale_d = a_scale_input.cuda() if a_scale_input is not None else None
     b_scale_d = b_scale_input.cuda()
 
@@ -514,6 +532,8 @@ def run_single(argv=None):
         SPLIT_CLUSTER_BARRIER=args.split_cluster_barrier,
         EARLY_C_STORES=args.early_c_stores,
         ENABLE_WMMA_QUEUING=args.enable_wmma_queuing,
+        A_ROW_PAIRS=args.a_row_pairs,
+        B_ROW_PAIRS=args.b_row_pairs,
         STATIC_SLOT_UNROLL=args.static_slot_unroll,
         OUTPUT_C_SLOTS=args.output_c_slots,
         OVERLAP_PEEL=args.overlap_peel,
