@@ -189,9 +189,11 @@ def _store_quadrant(acc, C, rows, cols, N: tl.constexpr, SPLIT: tl.constexpr):
     acc = tlx.require_layout(acc, _MMA_LAYOUT)
     if SPLIT:
         result = tlx.require_layout(acc, _STORE_F32, late_address_compute=True)
+        tlx.buffer_store(result, C, rows[:, None] * N + cols[None, :])
     else:
+        # Streaming stores: the BF16 output is never re-read by the kernel.
         result = tlx.require_layout(acc.to(tl.bfloat16), _STORE, late_address_compute=True)
-    tlx.buffer_store(result, C, rows[:, None] * N + cols[None, :])
+        tlx.buffer_store(result, C, rows[:, None] * N + cols[None, :], cache=".cs")
 
 
 @triton.jit
