@@ -38,10 +38,24 @@ GFX950_2 = FocusSuite(
 )
 GFX950_ALL = FocusSuite(name="gfx950_all", op="moe", includes=("gfx950_1", "gfx950_2"))
 
-FOCUS_SUITES = (GFX950_1, GFX950_2, GFX950_ALL)
-DEFAULT_SUITES = {"gfx950": ("gfx950_all", )}
+
+def _muse_spark_open_tp4(tokens: int) -> MoeShape:
+    # Muse-Spark-Open-816B-A42B at TP4/EP4 (the BF16 boundary layers 0 and 61): 64 local experts of 256; rank 3.
+    return MoeShape(tokens, 4096, 4096, 4096, 64, 256, 8, 192, "bf16")
+
+
+# Decode, and the short tail chunk of a chunked prefill.
+GFX1250_1 = FocusSuite(name="gfx1250_1", op="moe", shapes=tuple(_muse_spark_open_tp4(t) for t in (4, 40)))
+# Prefill chunks, one per tile tier of gfx1250.pick_config.
+GFX1250_2 = FocusSuite(name="gfx1250_2", op="moe",
+                       shapes=tuple(_muse_spark_open_tp4(t) for t in (1024, 2048, 4096, 8192)))
+GFX1250_ALL = FocusSuite(name="gfx1250_all", op="moe", includes=("gfx1250_1", "gfx1250_2"))
+
+FOCUS_SUITES = (GFX950_1, GFX950_2, GFX950_ALL, GFX1250_1, GFX1250_2, GFX1250_ALL)
+DEFAULT_SUITES = {"gfx950": ("gfx950_all", ), "gfx1250": ("gfx1250_all", )}
 FOCUS = FocusRegistry("moe", FOCUS_SUITES, DEFAULT_SUITES)
-CORRECTNESS_SHAPES = tuple(dict.fromkeys((*SYNTHETIC, *FOCUS.all_shapes())))
+CORRECTNESS_SHAPES = tuple(dict.fromkeys((*SYNTHETIC, *FOCUS.shapes("gfx950"))))
+GFX1250_CORRECTNESS_SHAPES = FOCUS.shapes("gfx1250")
 
 
 def label(shape: MoeShape) -> str:

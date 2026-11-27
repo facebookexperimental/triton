@@ -167,26 +167,26 @@ def _word_strided(w):
     return w.storage_offset() % 4 == 0 and w.stride(0) % 4 == 0 and w.stride(1) % 4 == 0
 
 
-def _check_inputs(x, topk_weights, topk_ids, w13, w13_scale, w2, w2_scale):
+def _check_inputs(x, topk_weights, topk_ids, w13, w13_scale, w2, w2_scale, op="moe_mxfp4_a16w4"):
     if x.dtype != torch.bfloat16 or x.ndim != 2:
-        raise ValueError(f"moe_mxfp4_a16w4: x must be bf16 [T, K]; got {x.dtype} {tuple(x.shape)}")
+        raise ValueError(f"{op}: x must be bf16 [T, K]; got {x.dtype} {tuple(x.shape)}")
     T, K = x.shape
     if topk_ids.ndim != 2 or topk_ids.shape[0] != T or topk_weights.shape != topk_ids.shape:
-        raise ValueError(f"moe_mxfp4_a16w4: topk_ids {tuple(topk_ids.shape)} and topk_weights "
+        raise ValueError(f"{op}: topk_ids {tuple(topk_ids.shape)} and topk_weights "
                          f"{tuple(topk_weights.shape)} must both be [T={T}, topk]")
     for name, w in (("w13", w13), ("w13_scale", w13_scale), ("w2", w2), ("w2_scale", w2_scale)):
         if w.dtype != torch.uint8 or w.ndim != 3:
-            raise ValueError(f"moe_mxfp4_a16w4: {name} must be uint8 rank 3; got {w.dtype} {tuple(w.shape)}")
+            raise ValueError(f"{op}: {name} must be uint8 rank 3; got {w.dtype} {tuple(w.shape)}")
         if w.stride(2) != 1:
-            raise ValueError(f"moe_mxfp4_a16w4: {name} must be contiguous along its last (K) dim")
+            raise ValueError(f"{op}: {name} must be contiguous along its last (K) dim")
     E, two_i, kp = w13.shape
     if K % 32 or kp * 2 != K or w13_scale.shape != (E, two_i, K // 32):
-        raise ValueError(f"moe_mxfp4_a16w4: w13 {tuple(w13.shape)} / w13_scale {tuple(w13_scale.shape)} do not match "
+        raise ValueError(f"{op}: w13 {tuple(w13.shape)} / w13_scale {tuple(w13_scale.shape)} do not match "
                          f"K={K}; expected [E, 2I, {K // 2}] / [E, 2I, {K // 32}]")
     I = two_i // 2
     H = w2.shape[1]
     if two_i % 2 or I % 32 or w2.shape != (E, H, I // 2) or w2_scale.shape != (E, H, I // 32):
-        raise ValueError(f"moe_mxfp4_a16w4: w2 {tuple(w2.shape)} / w2_scale {tuple(w2_scale.shape)} do not match "
+        raise ValueError(f"{op}: w2 {tuple(w2.shape)} / w2_scale {tuple(w2_scale.shape)} do not match "
                          f"E={E}, I={I}; expected [E, H, {I // 2}] / [E, H, {I // 32}]")
 
 
