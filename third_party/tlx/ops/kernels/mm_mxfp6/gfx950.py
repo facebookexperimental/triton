@@ -197,17 +197,17 @@ def _store_quadrant(acc, C, rows, cols, N: tl.constexpr, SPLIT: tl.constexpr, CA
 
 
 @triton.jit
-def _finish_quadrant(acc, WS, C, rows, cols, M: tl.constexpr, N: tl.constexpr, SPLIT_K: tl.constexpr, split_id):
-    # Add the partials in split order, using this split's accumulator for its
-    # own slot, so the sum does not depend on which split arrived last.
+def _finish_quadrant(acc, WS, C, rows, cols, M: tl.constexpr, N: tl.constexpr, NPART, own):
+    # Add the NPART partials in slot order, using this program's accumulator for
+    # its own slot, so the sum does not depend on which program arrived last.
     acc = tlx.require_layout(tlx.require_layout(acc, _MMA_LAYOUT), _STORE_F32, late_address_compute=True)
     offs = tlx.require_layout(rows[:, None] * N + cols[None, :], _STORE_F32)
-    if split_id == 0:
+    if own == 0:
         total = acc
     else:
         total = tlx.buffer_load(WS, offs, cache=".cg", contiguity=4)
-    for part in tl.static_range(1, SPLIT_K):
-        if split_id == part:
+    for part in tl.range(1, NPART):
+        if part == own:
             total += acc
         else:
             total += tlx.buffer_load(WS + part * M * N, offs, cache=".cg", contiguity=4)
@@ -226,7 +226,7 @@ def _publish_partial(lock):
 
 
 @triton.jit
-def _wait_partials(lock, NPART: tl.constexpr):
+def _wait_partials(lock, NPART):
     # Only the last split to arrive waits, and only on splits that have already
     # arrived, so co-residency is not required. Spin relaxed and acquire once:
     # an acquiring poll invalidates L2 on every iteration.
@@ -255,42 +255,9 @@ def _iw_load(dst, src, data_off, sdst, ssrc, scale_off):
 
 
 @triton.jit
-def _gemm_mxfp6_interwave(A, B, C, WS, LOCKS, SA, SB, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
-                          K_TILES: tl.constexpr, SPLIT_K: tl.constexpr, FUSED_SPLIT: tl.constexpr,
-                          GROUP_M: tl.constexpr, A_FORMAT: tl.constexpr, B_FORMAT: tl.constexpr):
-    tl.static_assert(K_TILES >= 2)
-    # A 16-byte pad per 1024-byte direct-to-LDS chunk spreads the 16 rows of an
-    # MFMA tile over distinct 16-byte LDS bank offsets.
-    tile_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
-        [[1024, 16]],
-        [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [1, 0], [32, 0], [64, 0], [2, 0], [4, 0], [8, 0],
-         [16, 0]],
-        [128, 128],
-    )
-    a_top_s = tlx.local_alloc((128, 128), tl.uint8, 2, layout=tile_layout)
-    a_bot_s = tlx.local_alloc((128, 128), tl.uint8, 2, layout=tile_layout)
-    b_left_s = tlx.local_alloc((128, 128), tl.uint8, 2, layout=tile_layout)
-    b_right_s = tlx.local_alloc((128, 128), tl.uint8, 2, layout=tile_layout)
-    sa_top_s = tlx.local_alloc((128, 4), tl.uint8, 2)
-    sa_bot_s = tlx.local_alloc((128, 4), tl.uint8, 2)
-    sb_left_s = tlx.local_alloc((128, 4), tl.uint8, 2)
-    sb_right_s = tlx.local_alloc((128, 4), tl.uint8, 2)
-
-    grid_mn: tl.constexpr = M // 256 * (N // 256)
-    program = tl.program_id(0)
-    split_id = program // grid_mn
-    pid = program % grid_mn
-    if grid_mn % 8 == 0:
-        # Consecutive programs are dispatched round-robin to the eight XCDs. Give each XCD
-        # a contiguous run of tiles so the grouped order below shares panels within one L2.
-        pid = (pid % 8) * (grid_mn // 8) + pid // 8
-    first_m = pid // (GROUP_M * (N // 256)) * GROUP_M
-    group_m = tl.minimum(M // 256 - first_m, GROUP_M)
-    pm = first_m + pid % (GROUP_M * (N // 256)) % group_m
-    pn = pid % (GROUP_M * (N // 256)) // group_m
-    extra: tl.constexpr = (K // 128) % SPLIT_K
-    first_tile = split_id * K_TILES + tl.minimum(split_id, extra)
-
+def _iw256_segment(A, B, SA, SB, a_top_s, a_bot_s, b_left_s, b_right_s, sa_top_s, sa_bot_s, sb_left_s, sb_right_s, pm,
+                   pn, first_tile, n_tiles, K: tl.constexpr, A_FORMAT: tl.constexpr, B_FORMAT: tl.constexpr):
+    """One 256x256 tile over K tiles ``[first_tile, first_tile + n_tiles)``; ``n_tiles`` is even and >= 2."""
     # K-tile byte step and per-segment byte offsets within a K tile.
     TB: tl.constexpr = 96
     rows = tl.arange(0, 128)
@@ -310,7 +277,6 @@ def _gemm_mxfp6_interwave(A, B, C, WS, LOCKS, SA, SB, M: tl.constexpr, N: tl.con
     acc_bl = tl.zeros((128, 128), tl.float32)
     acc_tr = tl.zeros((128, 128), tl.float32)
     acc_br = tl.zeros((128, 128), tl.float32)
-    main_k_tiles: tl.constexpr = K_TILES - K_TILES % 2
 
     for slot in tl.static_range(2):
         _iw_load(b_left_s[slot], b_base + slot * TB, data_off, sb_left_s[slot], sb_base + slot * 4, scale_off)
@@ -333,7 +299,7 @@ def _gemm_mxfp6_interwave(A, B, C, WS, LOCKS, SA, SB, M: tl.constexpr, N: tl.con
     a_top = tlx.local_load(a_top_s[0], relaxed=True)
     sa_t = tlx.local_load(sa_top_s[0], layout=_SCALE_A, relaxed=True)
 
-    for _ in tl.range(0, main_k_tiles - 2, 2, num_stages=1):
+    for _ in tl.range(0, n_tiles - 2, 2, num_stages=1):
         for slot in tl.static_range(2):
             tlx.async_load_wait_group(5)
             with tlx.warp_pipeline_stage("mfma", priority=0):
@@ -407,6 +373,56 @@ def _gemm_mxfp6_interwave(A, B, C, WS, LOCKS, SA, SB, M: tl.constexpr, N: tl.con
     acc_tr = tlx.dot_scaled(a_top, sa_t, A_FORMAT, b_right, sb_r, B_FORMAT, acc_tr, fp6_packed=True)
     acc_br = tlx.dot_scaled(a_bot, sa_b, A_FORMAT, b_right, sb_r, B_FORMAT, acc_br, fp6_packed=True)
 
+    return acc_tl, acc_bl, acc_tr, acc_br
+
+
+@triton.jit
+def _gemm_mxfp6_interwave(A, B, C, WS, LOCKS, SA, SB, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+                          K_TILES: tl.constexpr, SPLIT_K: tl.constexpr, FUSED_SPLIT: tl.constexpr,
+                          GROUP_M: tl.constexpr, A_FORMAT: tl.constexpr, B_FORMAT: tl.constexpr):
+    tl.static_assert(K_TILES >= 2)
+    # A 16-byte pad per 1024-byte direct-to-LDS chunk spreads the 16 rows of an
+    # MFMA tile over distinct 16-byte LDS bank offsets.
+    tile_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+        [[1024, 16]],
+        [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [1, 0], [32, 0], [64, 0], [2, 0], [4, 0], [8, 0],
+         [16, 0]],
+        [128, 128],
+    )
+    a_top_s = tlx.local_alloc((128, 128), tl.uint8, 2, layout=tile_layout)
+    a_bot_s = tlx.local_alloc((128, 128), tl.uint8, 2, layout=tile_layout)
+    b_left_s = tlx.local_alloc((128, 128), tl.uint8, 2, layout=tile_layout)
+    b_right_s = tlx.local_alloc((128, 128), tl.uint8, 2, layout=tile_layout)
+    sa_top_s = tlx.local_alloc((128, 4), tl.uint8, 2)
+    sa_bot_s = tlx.local_alloc((128, 4), tl.uint8, 2)
+    sb_left_s = tlx.local_alloc((128, 4), tl.uint8, 2)
+    sb_right_s = tlx.local_alloc((128, 4), tl.uint8, 2)
+
+    grid_mn: tl.constexpr = M // 256 * (N // 256)
+    program = tl.program_id(0)
+    split_id = program // grid_mn
+    pid = program % grid_mn
+    if grid_mn % 8 == 0:
+        # Consecutive programs are dispatched round-robin to the eight XCDs. Give each XCD
+        # a contiguous run of tiles so the grouped order below shares panels within one L2.
+        pid = (pid % 8) * (grid_mn // 8) + pid // 8
+    first_m = pid // (GROUP_M * (N // 256)) * GROUP_M
+    group_m = tl.minimum(M // 256 - first_m, GROUP_M)
+    pm = first_m + pid % (GROUP_M * (N // 256)) % group_m
+    pn = pid % (GROUP_M * (N // 256)) // group_m
+    extra: tl.constexpr = (K // 128) % SPLIT_K
+    first_tile = split_id * K_TILES + tl.minimum(split_id, extra)
+
+    main_k_tiles: tl.constexpr = K_TILES - K_TILES % 2
+    acc_tl, acc_bl, acc_tr, acc_br = _iw256_segment(A, B, SA, SB, a_top_s, a_bot_s, b_left_s, b_right_s, sa_top_s,
+                                                    sa_bot_s, sb_left_s, sb_right_s, pm, pn, first_tile, main_k_tiles,
+                                                    K, A_FORMAT, B_FORMAT)
+
+    rows = tl.arange(0, 128)
+    slots = tl.arange(0, 128)
+    data_off = rows[:, None] * K + ((slots // 32) * 24 + slots % 32)[None, :]
+    scale_off = tlx.require_layout(rows[:, None] * (K // 32) + tl.arange(0, 4)[None, :], _COPY_SCALE)
+    TB: tl.constexpr = 96
     # Odd tile count, plus one extra tile for each of the first ``extra`` splits.
     tail_tiles = K_TILES % 2 + (split_id < extra).to(tl.int32)
     for t in tl.range(0, tail_tiles, num_stages=1):
@@ -461,6 +477,83 @@ def _gemm_mxfp6_interwave(A, B, C, WS, LOCKS, SA, SB, M: tl.constexpr, N: tl.con
         _store_quadrant(acc_bl, out, cm + 128, cn, N, SPLIT_K > 1)
         _store_quadrant(acc_tr, out, cm, cn + 128, N, SPLIT_K > 1)
         _store_quadrant(acc_br, out, cm + 128, cn + 128, N, SPLIT_K > 1)
+
+
+@triton.jit
+def _sk_program_of(it, UNITS: tl.constexpr, GRID: tl.constexpr):
+    # The Stream-K program whose iteration range holds K-tile iteration ``it``.
+    return ((it // 2 + 1) * GRID - 1) // UNITS
+
+
+@triton.jit
+def _gemm_mxfp6_interwave_sk(A, B, C, WS, LOCKS, SA, SB, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+                             GRID: tl.constexpr, GROUP_M: tl.constexpr, A_FORMAT: tl.constexpr, B_FORMAT: tl.constexpr):
+    # Stream-K over 256x256 tiles. Program p owns an equal contiguous range of
+    # the (tile, K tile) iterations, in 2-iteration units, and runs it as one
+    # segment per tile it touches. Tile pieces are combined by the same
+    # arrival-counter fixup as the fused split-K path, one slot per piece.
+    tile_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+        [[1024, 16]],
+        [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [1, 0], [32, 0], [64, 0], [2, 0], [4, 0], [8, 0],
+         [16, 0]],
+        [128, 128],
+    )
+    a_top_s = tlx.local_alloc((128, 128), tl.uint8, 2, layout=tile_layout)
+    a_bot_s = tlx.local_alloc((128, 128), tl.uint8, 2, layout=tile_layout)
+    b_left_s = tlx.local_alloc((128, 128), tl.uint8, 2, layout=tile_layout)
+    b_right_s = tlx.local_alloc((128, 128), tl.uint8, 2, layout=tile_layout)
+    sa_top_s = tlx.local_alloc((128, 4), tl.uint8, 2)
+    sa_bot_s = tlx.local_alloc((128, 4), tl.uint8, 2)
+    sb_left_s = tlx.local_alloc((128, 4), tl.uint8, 2)
+    sb_right_s = tlx.local_alloc((128, 4), tl.uint8, 2)
+
+    KT: tl.constexpr = K // 128
+    UNITS: tl.constexpr = M // 256 * (N // 256) * KT // 2
+    program = tl.program_id(0)
+    if GRID % 8 == 0:
+        program = (program % 8) * (GRID // 8) + program // 8
+    it = program * UNITS // GRID * 2
+    end = (program + 1) * UNITS // GRID * 2
+    while it < end:
+        tile = it // KT
+        k0 = it - tile * KT
+        n_tiles = tl.minimum(KT - k0, end - it)
+        first_m = tile // (GROUP_M * (N // 256)) * GROUP_M
+        group_m = tl.minimum(M // 256 - first_m, GROUP_M)
+        pm = first_m + tile % (GROUP_M * (N // 256)) % group_m
+        pn = tile % (GROUP_M * (N // 256)) // group_m
+        # The previous segment's last LDS reads must finish before this one refills the slots.
+        tl.debug_barrier()
+        acc_tl, acc_bl, acc_tr, acc_br = _iw256_segment(A, B, SA, SB, a_top_s, a_bot_s, b_left_s, b_right_s, sa_top_s,
+                                                        sa_bot_s, sb_left_s, sb_right_s, pm, pn, k0, n_tiles, K,
+                                                        A_FORMAT, B_FORMAT)
+        pieces = _sk_program_of(tile * KT + KT - 1, UNITS, GRID) - _sk_program_of(tile * KT, UNITS, GRID) + 1
+        cm = pm * 256 + tlx.rematerialized_range(0, 128, 10, placement=n_tiles)
+        cn = pn * 256 + tlx.rematerialized_range(0, 128, 11, placement=n_tiles)
+        if pieces == 1:
+            _store_quadrant(acc_tl, C, cm, cn, N, False)
+            _store_quadrant(acc_bl, C, cm + 128, cn, N, False)
+            _store_quadrant(acc_tr, C, cm, cn + 128, N, False)
+            _store_quadrant(acc_br, C, cm + 128, cn + 128, N, False)
+        else:
+            lock = LOCKS + 2 * tile
+            own = program - _sk_program_of(tile * KT, UNITS, GRID)
+            arrived = tl.atomic_add(lock, 1, sem="relaxed", scope="gpu")
+            if arrived < pieces - 1:
+                ws = WS + own.to(tl.int64) * M * N
+                _store_quadrant(acc_tl, ws, cm, cn, N, True, ".wt")
+                _store_quadrant(acc_bl, ws, cm + 128, cn, N, True, ".wt")
+                _store_quadrant(acc_tr, ws, cm, cn + 128, N, True, ".wt")
+                _store_quadrant(acc_br, ws, cm + 128, cn + 128, N, True, ".wt")
+                _publish_partial(lock)
+            else:
+                _wait_partials(lock, pieces - 1)
+                _finish_quadrant(acc_tl, WS, C, cm, cn, M, N, pieces, own)
+                _finish_quadrant(acc_bl, WS, C, cm + 128, cn, M, N, pieces, own)
+                _finish_quadrant(acc_tr, WS, C, cm, cn + 128, M, N, pieces, own)
+                _finish_quadrant(acc_br, WS, C, cm + 128, cn + 128, M, N, pieces, own)
+                _reset_lock(lock)
+        it += n_tiles
 
 
 @triton.jit
@@ -628,6 +721,8 @@ def _interwave_block_n(M, N, K, split_k):
 # Largest split_k whose partials the last-arriving split reduces in-kernel; wider
 # splits reduce in ``_reduce_split_k``, as one CTA summing them all is slower.
 _FUSED_SPLIT_K_MAX = 4
+# Fewest K-tile iterations per program for which split_k=1 uses Stream-K.
+_STREAM_K_MIN_ITERS = 32
 # Per-(device, stream) tile arrival counters. The reducing split zeroes its
 # tile's counters, so a buffer is reusable by every later launch on its stream.
 # A buffer only grows, keeping the largest grid seen on its stream; at 8 bytes
@@ -651,9 +746,46 @@ def _split_locks(device, tiles):
     return locks
 
 
+def _stream_k_grid(M, N, K, cu_count):
+    """Stream-K program count for split_k=1, or None to keep one CTA per tile.
+
+    Stream-K pays when 256x256 tiles leave CUs idle and every program still
+    gets enough K iterations to amortize its tile fixups.
+    """
+    if M % 256 or N % 256 or K % 256:
+        return None
+    tiles = M // 256 * (N // 256)
+    if tiles >= cu_count or tiles * (K // 128) < _STREAM_K_MIN_ITERS * cu_count:
+        return None
+    return cu_count
+
+
+def _launch_stream_k(a, a_scale, b, b_scale, out, a_format, b_format, grid, group_m=4):
+    M, K = a.shape
+    N = b.shape[0]
+    tiles, kt = M // 256 * (N // 256), K // 128
+    # Program p owns 2 * (floor((p + 1) * U / grid) - floor(p * U / grid)) >=
+    # 2 * floor(U / grid) = min_iters iterations (U = tiles * kt // 2 units), so
+    # a tile spans at most ceil(kt / min_iters) + 1 programs, each with its own
+    # partial slot. _stream_k_grid guarantees min_iters >= _STREAM_K_MIN_ITERS.
+    min_iters = tiles * kt // 2 // grid * 2
+    workspace = torch.empty((triton.cdiv(kt, min_iters) + 1, M, N), device=a.device, dtype=torch.float32)
+    _gemm_mxfp6_interwave_sk[(grid, )](a, b, out, workspace, _split_locks(a.device, tiles), a_scale.view(torch.uint8),
+                                       b_scale.view(torch.uint8), M, N, K, grid, group_m, a_format, b_format,
+                                       num_warps=8, num_stages=1, matrix_instr_nonkdim=16,
+                                       disable_unclustered_high_rp_reschedule=True, reverse_local_assignment=True,
+                                       llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ))
+
+
 def _launch_interwave(a, a_scale, b, b_scale, out, split_k, a_format, b_format, block_n, group_m=4):
     M, K = a.shape
     N = b.shape[0]
+    if split_k == 1:
+        cu_count = torch.cuda.get_device_properties(a.device).multi_processor_count
+        grid = _stream_k_grid(M, N, K, cu_count)
+        if grid is not None:
+            _launch_stream_k(a, a_scale, b, b_scale, out, a_format, b_format, grid, group_m)
+            return
     tiles = M // 256 * (N // block_n)
     fused = 1 < split_k <= _FUSED_SPLIT_K_MAX
     locks = _split_locks(a.device, tiles) if fused else out
@@ -732,7 +864,9 @@ def mm_mxfp6(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="fu
     scale layout is supported on this backend.
 
     ``split_k`` partitions whole MFMA K tiles. FP32 partials are
-    reduced before the single BF16 conversion.
+    reduced before the single BF16 conversion. With ``split_k=1``, an
+    interwave grid that would leave CUs idle may instead be balanced
+    with Stream-K, which splits K at iteration granularity internally.
     """
     if a_format not in ("e2m3", "e3m2") or b_format not in ("e2m3", "e3m2"):
         raise InvalidInput("a_format and b_format must each be 'e2m3' or 'e3m2'")
