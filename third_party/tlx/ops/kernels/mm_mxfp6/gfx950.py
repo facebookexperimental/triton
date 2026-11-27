@@ -185,11 +185,11 @@ _STORE_F32 = tlx.layout(
 
 
 @triton.jit
-def _store_quadrant(acc, C, rows, cols, N: tl.constexpr, SPLIT: tl.constexpr, CACHE: tl.constexpr = None):
+def _store_quadrant(acc, C, rows, cols, N: tl.constexpr, SPLIT: tl.constexpr):
     acc = tlx.require_layout(acc, _MMA_LAYOUT)
     if SPLIT:
         result = tlx.require_layout(acc, _STORE_F32, late_address_compute=True)
-        tlx.buffer_store(result, C, rows[:, None] * N + cols[None, :], cache=CACHE)
+        tlx.buffer_store(result, C, rows[:, None] * N + cols[None, :])
     else:
         # Streaming stores: the BF16 output is never re-read by the kernel.
         result = tlx.require_layout(acc.to(tl.bfloat16), _STORE, late_address_compute=True)
@@ -197,21 +197,47 @@ def _store_quadrant(acc, C, rows, cols, N: tl.constexpr, SPLIT: tl.constexpr, CA
 
 
 @triton.jit
-def _finish_quadrant(acc, WS, C, rows, cols, M: tl.constexpr, N: tl.constexpr, NPART, own):
-    # Add the NPART partials in slot order, using this program's accumulator for
-    # its own slot, so the sum does not depend on which program arrived last.
-    acc = tlx.require_layout(tlx.require_layout(acc, _MMA_LAYOUT), _STORE_F32, late_address_compute=True)
-    offs = tlx.require_layout(rows[:, None] * N + cols[None, :], _STORE_F32)
+def _lane_order(rows, cols):
+    """Split-K workspace offsets for a 128x128 quadrant held in ``_MMA_LAYOUT``.
+
+    The workspace is private to the fixup, so each 16x16 MFMA tile of a wave's
+    64x32 block is one contiguous 1 KiB run in which lane l (row l % 16,
+    columns 4 * (l // 16) + 0..3) owns bytes 16 * l .. 16 * l + 15. Partials
+    then move as whole 1 KiB stores and loads without a register shuffle.
+    """
+    r = rows[:, None]
+    c = cols[None, :]
+    lane = r % 16 + 16 * ((c % 16) // 4)
+    tile = ((r // 64) * 4 + c // 32) * 8 + ((r % 64) // 16) * 2 + (c % 32) // 16
+    return tlx.require_layout(tile * 256 + lane * 4 + c % 4, _MMA_LAYOUT)
+
+
+@triton.jit
+def _store_partial(acc, WSQ):
+    rows = tlx.rematerialized_range(0, 128, 12)
+    cols = tlx.rematerialized_range(0, 128, 13)
+    tlx.buffer_store(tlx.require_layout(acc, _MMA_LAYOUT), WSQ, _lane_order(rows, cols), cache=".wt", contiguity=4)
+
+
+@triton.jit
+def _finish_partials(acc, WSQ, C, rows, cols, M: tl.constexpr, N: tl.constexpr, NPART, own):
+    """Add the ``NPART`` partials of this quadrant (slot stride M * N) in slot order and store BF16.
+
+    ``acc`` stands in for slot ``own``, so the sum does not depend on which
+    program arrived last.
+    """
+    acc = tlx.require_layout(acc, _MMA_LAYOUT)
+    offs = _lane_order(tlx.rematerialized_range(0, 128, 12), tlx.rematerialized_range(0, 128, 13))
     if own == 0:
         total = acc
     else:
-        total = tlx.buffer_load(WS, offs, cache=".cg", contiguity=4)
+        total = tlx.buffer_load(WSQ, offs, cache=".cg", contiguity=4)
     for part in tl.range(1, NPART):
         if part == own:
             total += acc
         else:
-            total += tlx.buffer_load(WS + part * M * N, offs, cache=".cg", contiguity=4)
-    tlx.buffer_store(total.to(tl.bfloat16), C, offs, cache=".cs")
+            total += tlx.buffer_load(WSQ + part * M * N, offs, cache=".cg", contiguity=4)
+    _store_quadrant(total, C, rows, cols, N, False)
 
 
 @triton.jit
@@ -456,18 +482,19 @@ def _gemm_mxfp6_interwave(A, B, C, WS, LOCKS, SA, SB, M: tl.constexpr, N: tl.con
         lock = LOCKS + 2 * (pm * (N // 256) + pn)
         arrived = tl.atomic_add(lock, 1, sem="relaxed", scope="gpu")
         if arrived < SPLIT_K - 1:
-            ws = WS + split_id.to(tl.int64) * M * N
-            _store_quadrant(acc_tl, ws, cm, cn, N, True, ".wt")
-            _store_quadrant(acc_bl, ws, cm + 128, cn, N, True, ".wt")
-            _store_quadrant(acc_tr, ws, cm, cn + 128, N, True, ".wt")
-            _store_quadrant(acc_br, ws, cm + 128, cn + 128, N, True, ".wt")
+            ws = WS + split_id.to(tl.int64) * M * N + (pm * (N // 256) + pn).to(tl.int64) * 65536
+            _store_partial(acc_tl, ws)
+            _store_partial(acc_bl, ws + 16384)
+            _store_partial(acc_tr, ws + 32768)
+            _store_partial(acc_br, ws + 49152)
             _publish_partial(lock)
         else:
             _wait_partials(lock, SPLIT_K - 1)
-            _finish_quadrant(acc_tl, WS, C, cm, cn, M, N, SPLIT_K, split_id)
-            _finish_quadrant(acc_bl, WS, C, cm + 128, cn, M, N, SPLIT_K, split_id)
-            _finish_quadrant(acc_tr, WS, C, cm, cn + 128, M, N, SPLIT_K, split_id)
-            _finish_quadrant(acc_br, WS, C, cm + 128, cn + 128, M, N, SPLIT_K, split_id)
+            ws = WS + (pm * (N // 256) + pn).to(tl.int64) * 65536
+            _finish_partials(acc_tl, ws, C, cm, cn, M, N, SPLIT_K, split_id)
+            _finish_partials(acc_bl, ws + 16384, C, cm + 128, cn, M, N, SPLIT_K, split_id)
+            _finish_partials(acc_tr, ws + 32768, C, cm, cn + 128, M, N, SPLIT_K, split_id)
+            _finish_partials(acc_br, ws + 49152, C, cm + 128, cn + 128, M, N, SPLIT_K, split_id)
             _reset_lock(lock)
     else:
         out = C
@@ -540,18 +567,19 @@ def _gemm_mxfp6_interwave_sk(A, B, C, WS, LOCKS, SA, SB, M: tl.constexpr, N: tl.
             own = program - _sk_program_of(tile * KT, UNITS, GRID)
             arrived = tl.atomic_add(lock, 1, sem="relaxed", scope="gpu")
             if arrived < pieces - 1:
-                ws = WS + own.to(tl.int64) * M * N
-                _store_quadrant(acc_tl, ws, cm, cn, N, True, ".wt")
-                _store_quadrant(acc_bl, ws, cm + 128, cn, N, True, ".wt")
-                _store_quadrant(acc_tr, ws, cm, cn + 128, N, True, ".wt")
-                _store_quadrant(acc_br, ws, cm + 128, cn + 128, N, True, ".wt")
+                ws = WS + own.to(tl.int64) * M * N + tile.to(tl.int64) * 65536
+                _store_partial(acc_tl, ws)
+                _store_partial(acc_bl, ws + 16384)
+                _store_partial(acc_tr, ws + 32768)
+                _store_partial(acc_br, ws + 49152)
                 _publish_partial(lock)
             else:
                 _wait_partials(lock, pieces - 1)
-                _finish_quadrant(acc_tl, WS, C, cm, cn, M, N, pieces, own)
-                _finish_quadrant(acc_bl, WS, C, cm + 128, cn, M, N, pieces, own)
-                _finish_quadrant(acc_tr, WS, C, cm, cn + 128, M, N, pieces, own)
-                _finish_quadrant(acc_br, WS, C, cm + 128, cn + 128, M, N, pieces, own)
+                ws = WS + tile.to(tl.int64) * 65536
+                _finish_partials(acc_tl, ws, C, cm, cn, M, N, pieces, own)
+                _finish_partials(acc_bl, ws + 16384, C, cm + 128, cn, M, N, pieces, own)
+                _finish_partials(acc_tr, ws + 32768, C, cm, cn + 128, M, N, pieces, own)
+                _finish_partials(acc_br, ws + 49152, C, cm + 128, cn + 128, M, N, pieces, own)
                 _reset_lock(lock)
         it += n_tiles
 
@@ -690,14 +718,15 @@ def _gemm_mxfp6_interwave_n128(A, B, C, WS, LOCKS, SA, SB, M: tl.constexpr, N: t
         lock = LOCKS + 2 * (pm * (N // 128) + pn)
         arrived = tl.atomic_add(lock, 1, sem="relaxed", scope="gpu")
         if arrived < SPLIT_K - 1:
-            ws = WS + split_id.to(tl.int64) * M * N
-            _store_quadrant(acc_t, ws, cm, cn, N, True, ".wt")
-            _store_quadrant(acc_b, ws, cm + 128, cn, N, True, ".wt")
+            ws = WS + split_id.to(tl.int64) * M * N + (pm * (N // 128) + pn).to(tl.int64) * 32768
+            _store_partial(acc_t, ws)
+            _store_partial(acc_b, ws + 16384)
             _publish_partial(lock)
         else:
             _wait_partials(lock, SPLIT_K - 1)
-            _finish_quadrant(acc_t, WS, C, cm, cn, M, N, SPLIT_K, split_id)
-            _finish_quadrant(acc_b, WS, C, cm + 128, cn, M, N, SPLIT_K, split_id)
+            ws = WS + (pm * (N // 128) + pn).to(tl.int64) * 32768
+            _finish_partials(acc_t, ws, C, cm, cn, M, N, SPLIT_K, split_id)
+            _finish_partials(acc_b, ws + 16384, C, cm + 128, cn, M, N, SPLIT_K, split_id)
             _reset_lock(lock)
     else:
         out = C
