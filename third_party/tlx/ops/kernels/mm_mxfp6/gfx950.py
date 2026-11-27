@@ -363,48 +363,45 @@ def _iw256_segment(A, B, SA, SB, a_top_s, a_bot_s, b_left_s, b_right_s, sa_s, sb
     cur = 0
     for _ in tl.range(0, n_tiles - 2, 2, num_stages=1):
         for slot in tl.static_range(2):
+            # Each refill targets a slot both wave groups finished reading at
+            # least one stage earlier, so it is issued from the MFMA stage,
+            # whose issue slots are idle, rather than the LDS-bound mem stage.
             tlx.async_load_wait_group(5)
             with tlx.warp_pipeline_stage("mfma", priority=0):
                 acc_tl = tlx.dot_scaled(a_top, sa_t, A_FORMAT, b_left, sb_l, B_FORMAT, acc_tl, fp6_packed=True)
-            with tlx.warp_pipeline_stage("mem", priority=1):
-                a_bot = tlx.local_load(a_bot_s[slot], relaxed=True)
-                sa_b = tlx.local_load(_scales(tlx.local_view(sa_s, cur), 1, slot), layout=_SCALE_A, relaxed=True)
                 tlx.amd_sched_barrier(0)
                 if slot == 0:
                     _iw_load(b_left_s[slot], b_base, data_off, tlx.local_view(sb_s, 1 - cur), sb_base, scale_off, None)
                 else:
                     _iw_load_data(b_left_s[slot], b_base + TB, data_off)
+            with tlx.warp_pipeline_stage("mem", priority=1):
+                a_bot = tlx.local_load(a_bot_s[slot], relaxed=True)
+                sa_b = tlx.local_load(_scales(tlx.local_view(sa_s, cur), 1, slot), layout=_SCALE_A, relaxed=True)
             tlx.async_load_wait_group(5)
             with tlx.warp_pipeline_stage("mfma", priority=0):
                 acc_bl = tlx.dot_scaled(a_bot, sa_b, A_FORMAT, b_left, sb_l, B_FORMAT, acc_bl, fp6_packed=True)
-            with tlx.warp_pipeline_stage("mem", priority=1):
-                b_right = tlx.local_load(tlx.local_trans(b_right_s[slot]), relaxed=True)
-                sb_r = tlx.local_load(_scales(tlx.local_view(sb_s, cur), 1, slot), layout=_SCALE_B, relaxed=True)
                 tlx.amd_sched_barrier(0)
                 if slot == 0:
                     _iw_load(a_top_s[slot], a_base, data_off, tlx.local_view(sa_s, 1 - cur), sa_base, scale_off, None)
                 else:
                     _iw_load_data(a_top_s[slot], a_base + TB, data_off)
+            with tlx.warp_pipeline_stage("mem", priority=1):
+                b_right = tlx.local_load(tlx.local_trans(b_right_s[slot]), relaxed=True)
+                sb_r = tlx.local_load(_scales(tlx.local_view(sb_s, cur), 1, slot), layout=_SCALE_B, relaxed=True)
             tlx.async_load_wait_group(5)
             with tlx.warp_pipeline_stage("mfma", priority=0):
                 acc_tr = tlx.dot_scaled(a_top, sa_t, A_FORMAT, b_right, sb_r, B_FORMAT, acc_tr, fp6_packed=True)
+                tlx.amd_sched_barrier(0)
+                _iw_load_data(a_bot_s[slot], a_bot_base + slot * TB, data_off)
             with tlx.warp_pipeline_stage("mem", priority=1):
                 b_left = tlx.local_load(tlx.local_trans(b_left_s[1 - slot]), relaxed=True)
                 if slot == 0:
                     sb_l = tlx.local_load(_scales(tlx.local_view(sb_s, cur), 0, 1), layout=_SCALE_B, relaxed=True)
                 else:
                     sb_l = tlx.local_load(_scales(tlx.local_view(sb_s, 1 - cur), 0, 0), layout=_SCALE_B, relaxed=True)
-                tlx.amd_sched_barrier(0)
-                _iw_load_data(a_bot_s[slot], a_bot_base + slot * TB, data_off)
             tlx.async_load_wait_group(5)
             with tlx.warp_pipeline_stage("mfma", priority=0):
                 acc_br = tlx.dot_scaled(a_bot, sa_b, A_FORMAT, b_right, sb_r, B_FORMAT, acc_br, fp6_packed=True)
-            with tlx.warp_pipeline_stage("mem", priority=1):
-                a_top = tlx.local_load(a_top_s[1 - slot], relaxed=True)
-                if slot == 0:
-                    sa_t = tlx.local_load(_scales(tlx.local_view(sa_s, cur), 0, 1), layout=_SCALE_A, relaxed=True)
-                else:
-                    sa_t = tlx.local_load(_scales(tlx.local_view(sa_s, 1 - cur), 0, 0), layout=_SCALE_A, relaxed=True)
                 tlx.amd_sched_barrier(0)
                 _iw_load_data(b_right_s[slot], b_right_base + slot * TB, data_off)
                 if slot == 1:
@@ -414,6 +411,12 @@ def _iw256_segment(A, B, SA, SB, a_top_s, a_bot_s, b_left_s, b_right_s, sa_s, sb
                     b_right_base += 2 * TB
                     sa_base += 8
                     sb_base += 8
+            with tlx.warp_pipeline_stage("mem", priority=1):
+                a_top = tlx.local_load(a_top_s[1 - slot], relaxed=True)
+                if slot == 0:
+                    sa_t = tlx.local_load(_scales(tlx.local_view(sa_s, cur), 0, 1), layout=_SCALE_A, relaxed=True)
+                else:
+                    sa_t = tlx.local_load(_scales(tlx.local_view(sa_s, 1 - cur), 0, 0), layout=_SCALE_A, relaxed=True)
         cur = 1 - cur
 
     # Drain: no refills, wait(5) .. wait(0) completes the remaining groups in issue order.
