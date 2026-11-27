@@ -109,6 +109,10 @@ def test_mm_mxfp6_gfx950_rejects_invalid_split_k(split_k):
     (256, 256, 16128, 8),
     (128, 256, 640, 4),
     (256, 128, 896, 2),
+    # Enough 256x256 tiles to select the 256x256 interwave kernel.
+    (4096, 4096, 384, 1),
+    (4096, 2048, 1280, 2),
+    (4096, 2048, 1664, 4),
 ])
 @pytest.mark.parametrize("space", ["heuristic", "full"])
 @pytest.mark.parametrize("a_format", ["e2m3", "e3m2"])
@@ -137,6 +141,9 @@ def test_mm_mxfp6_gfx950_split_k_random(M, N, K, split_k, space, a_format, b_for
     tolerance = 1e-1 + 1e-2 * reference.abs() + 2**-14 * (reference_a.abs() @ reference_b.abs().T)
     error = (result.double() - reference).abs()
     assert torch.all(error <= tolerance), f"maximum error/tolerance: {(error / tolerance).max().item()}"
+    repeat = mm_mxfp6(a, sa.view(torch.float8_e8m0fnu), b, sb.view(torch.float8_e8m0fnu), space=space, split_k=split_k,
+                      a_format=a_format, b_format=b_format)
+    assert torch.equal(repeat, result)
     b.zero_()
     mm_mxfp6(a, sa.view(torch.float8_e8m0fnu), b, sb.view(torch.float8_e8m0fnu), out=out, space=space, split_k=split_k,
              a_format=a_format, b_format=b_format)

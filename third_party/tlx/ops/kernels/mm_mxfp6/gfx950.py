@@ -3,9 +3,9 @@
 ``a_format`` and ``b_format`` independently select E2M3 or E3M2.
 Both operands are dense-packed uint8 (groups of
 16 codes per 12 bytes, K padded to the unpacked width; shapes count
-logical values in multiples of 16). Shapes with M and N multiples of
-256 and at least two K tiles per split use the LDS-pipelined 256x256
-interwave kernel; other shapes use the register-staged native kernel,
+logical values in multiples of 16). Shapes with M a multiple of 256,
+N a multiple of 128 and at least two K tiles per split use the
+LDS-pipelined interwave kernels (256x256 or 256x128 tiles); other shapes use the register-staged native kernel,
 whose launch config ``space`` selects ("heuristic" single config,
 "full" autotuned). Only the "natural" scale layout is supported.
 
@@ -185,13 +185,66 @@ _STORE_F32 = tlx.layout(
 
 
 @triton.jit
-def _store_quadrant(acc, C, rows, cols, N: tl.constexpr, SPLIT: tl.constexpr):
+def _store_quadrant(acc, C, rows, cols, N: tl.constexpr, SPLIT: tl.constexpr, CACHE: tl.constexpr = None):
     acc = tlx.require_layout(acc, _MMA_LAYOUT)
     if SPLIT:
         result = tlx.require_layout(acc, _STORE_F32, late_address_compute=True)
+        tlx.buffer_store(result, C, rows[:, None] * N + cols[None, :], cache=CACHE)
     else:
+        # Streaming stores: the BF16 output is never re-read by the kernel.
         result = tlx.require_layout(acc.to(tl.bfloat16), _STORE, late_address_compute=True)
-    tlx.buffer_store(result, C, rows[:, None] * N + cols[None, :])
+        tlx.buffer_store(result, C, rows[:, None] * N + cols[None, :], cache=".cs")
+
+
+@triton.jit
+def _finish_quadrant(acc, WS, C, rows, cols, M: tl.constexpr, N: tl.constexpr, SPLIT_K: tl.constexpr, split_id):
+    # Add the partials in split order, using this split's accumulator for its
+    # own slot, so the sum does not depend on which split arrived last.
+    acc = tlx.require_layout(tlx.require_layout(acc, _MMA_LAYOUT), _STORE_F32, late_address_compute=True)
+    offs = tlx.require_layout(rows[:, None] * N + cols[None, :], _STORE_F32)
+    if split_id == 0:
+        total = acc
+    else:
+        total = tlx.buffer_load(WS, offs, cache=".cg", contiguity=4)
+    for part in tl.static_range(1, SPLIT_K):
+        if split_id == part:
+            total += acc
+        else:
+            total += tlx.buffer_load(WS + part * M * N, offs, cache=".cg", contiguity=4)
+    tlx.buffer_store(total.to(tl.bfloat16), C, offs, cache=".cs")
+
+
+@triton.jit
+def _publish_partial(lock):
+    # The release below is issued by one lane and covers only its own wave's
+    # stores, and tl.debug_barrier only synchronizes execution. Every wave
+    # first waits for its own .wt partial stores, so all of them have reached
+    # L2 before the barrier and the release writes them back.
+    tl.inline_asm_elementwise("s_waitcnt vmcnt(0)", "=s,~{memory}", [], dtype=tl.int32, is_pure=False, pack=1)
+    tl.debug_barrier()
+    tl.atomic_add(lock + 1, 1, sem="release", scope="gpu")
+
+
+@triton.jit
+def _wait_partials(lock, NPART: tl.constexpr):
+    # Only the last split to arrive waits, and only on splits that have already
+    # arrived, so co-residency is not required. Spin relaxed and acquire once:
+    # an acquiring poll invalidates L2 on every iteration.
+    while tl.atomic_add(lock + 1, 0, sem="relaxed", scope="gpu") < NPART:
+        pass
+    tl.atomic_add(lock + 1, 0, sem="acquire", scope="gpu")
+    # Order every wave's partial loads after the acquire: the atomic is
+    # not guaranteed to be executed by (or visible to) all waves, so
+    # sync the block before _finish_partials reads the workspace. The
+    # publish side drains every wave's .wt partial stores before its
+    # barrier and release atomic.
+    tl.debug_barrier()
+
+
+@triton.jit
+def _reset_lock(lock):
+    tl.atomic_xchg(lock, 0, sem="relaxed", scope="gpu")
+    tl.atomic_xchg(lock + 1, 0, sem="relaxed", scope="gpu")
 
 
 @triton.jit
@@ -202,8 +255,9 @@ def _iw_load(dst, src, data_off, sdst, ssrc, scale_off):
 
 
 @triton.jit
-def _gemm_mxfp6_interwave(A, B, C, SA, SB, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, K_TILES: tl.constexpr,
-                          SPLIT_K: tl.constexpr, GROUP_M: tl.constexpr, A_FORMAT: tl.constexpr, B_FORMAT: tl.constexpr):
+def _gemm_mxfp6_interwave(A, B, C, WS, LOCKS, SA, SB, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+                          K_TILES: tl.constexpr, SPLIT_K: tl.constexpr, FUSED_SPLIT: tl.constexpr,
+                          GROUP_M: tl.constexpr, A_FORMAT: tl.constexpr, B_FORMAT: tl.constexpr):
     tl.static_assert(K_TILES >= 2)
     # A 16-byte pad per 1024-byte direct-to-LDS chunk spreads the 16 rows of an
     # MFMA tile over distinct 16-byte LDS bank offsets.
@@ -382,29 +436,237 @@ def _gemm_mxfp6_interwave(A, B, C, SA, SB, M: tl.constexpr, N: tl.constexpr, K: 
 
     cm = pm * 256 + tlx.rematerialized_range(0, 128, 10, placement=K_TILES)
     cn = pn * 256 + tlx.rematerialized_range(0, 128, 11, placement=K_TILES)
-    out = C
-    if SPLIT_K > 1:
-        out = C + split_id.to(tl.int64) * M * N
-    _store_quadrant(acc_tl, out, cm, cn, N, SPLIT_K > 1)
-    _store_quadrant(acc_bl, out, cm + 128, cn, N, SPLIT_K > 1)
-    _store_quadrant(acc_tr, out, cm, cn + 128, N, SPLIT_K > 1)
-    _store_quadrant(acc_br, out, cm + 128, cn + 128, N, SPLIT_K > 1)
+    if FUSED_SPLIT:
+        lock = LOCKS + 2 * (pm * (N // 256) + pn)
+        arrived = tl.atomic_add(lock, 1, sem="relaxed", scope="gpu")
+        if arrived < SPLIT_K - 1:
+            ws = WS + split_id.to(tl.int64) * M * N
+            _store_quadrant(acc_tl, ws, cm, cn, N, True, ".wt")
+            _store_quadrant(acc_bl, ws, cm + 128, cn, N, True, ".wt")
+            _store_quadrant(acc_tr, ws, cm, cn + 128, N, True, ".wt")
+            _store_quadrant(acc_br, ws, cm + 128, cn + 128, N, True, ".wt")
+            _publish_partial(lock)
+        else:
+            _wait_partials(lock, SPLIT_K - 1)
+            _finish_quadrant(acc_tl, WS, C, cm, cn, M, N, SPLIT_K, split_id)
+            _finish_quadrant(acc_bl, WS, C, cm + 128, cn, M, N, SPLIT_K, split_id)
+            _finish_quadrant(acc_tr, WS, C, cm, cn + 128, M, N, SPLIT_K, split_id)
+            _finish_quadrant(acc_br, WS, C, cm + 128, cn + 128, M, N, SPLIT_K, split_id)
+            _reset_lock(lock)
+    else:
+        out = C
+        if SPLIT_K > 1:
+            out = WS + split_id.to(tl.int64) * M * N
+        _store_quadrant(acc_tl, out, cm, cn, N, SPLIT_K > 1)
+        _store_quadrant(acc_bl, out, cm + 128, cn, N, SPLIT_K > 1)
+        _store_quadrant(acc_tr, out, cm, cn + 128, N, SPLIT_K > 1)
+        _store_quadrant(acc_br, out, cm + 128, cn + 128, N, SPLIT_K > 1)
 
 
-def _interwave_eligible(M, N, K, split_k):
-    return M % 256 == 0 and N % 256 == 0 and K % 128 == 0 and K // 128 // split_k >= 2
+@triton.jit
+def _gemm_mxfp6_interwave_n128(A, B, C, WS, LOCKS, SA, SB, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+                               K_TILES: tl.constexpr, SPLIT_K: tl.constexpr, FUSED_SPLIT: tl.constexpr,
+                               GROUP_M: tl.constexpr, A_FORMAT: tl.constexpr, B_FORMAT: tl.constexpr):
+    # 256x128 variant: two 128x128 quadrants share one B tile. Per K-tile slot, B
+    # is one async group and the two A halves are another.
+    tl.static_assert(K_TILES >= 2)
+    tile_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+        [[1024, 16]],
+        [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [1, 0], [32, 0], [64, 0], [2, 0], [4, 0], [8, 0],
+         [16, 0]],
+        [128, 128],
+    )
+    a_top_s = tlx.local_alloc((128, 128), tl.uint8, 2, layout=tile_layout)
+    a_bot_s = tlx.local_alloc((128, 128), tl.uint8, 2, layout=tile_layout)
+    b_s = tlx.local_alloc((128, 128), tl.uint8, 2, layout=tile_layout)
+    sa_top_s = tlx.local_alloc((128, 4), tl.uint8, 2)
+    sa_bot_s = tlx.local_alloc((128, 4), tl.uint8, 2)
+    sb_s = tlx.local_alloc((128, 4), tl.uint8, 2)
+
+    grid_mn: tl.constexpr = M // 256 * (N // 128)
+    program = tl.program_id(0)
+    split_id = program // grid_mn
+    pid = program % grid_mn
+    if grid_mn % 8 == 0:
+        pid = (pid % 8) * (grid_mn // 8) + pid // 8
+    first_m = pid // (GROUP_M * (N // 128)) * GROUP_M
+    group_m = tl.minimum(M // 256 - first_m, GROUP_M)
+    pm = first_m + pid % (GROUP_M * (N // 128)) % group_m
+    pn = pid % (GROUP_M * (N // 128)) // group_m
+    extra: tl.constexpr = (K // 128) % SPLIT_K
+    first_tile = split_id * K_TILES + tl.minimum(split_id, extra)
+
+    TB: tl.constexpr = 96
+    rows = tl.arange(0, 128)
+    slots = tl.arange(0, 128)
+    data_off = rows[:, None] * K + ((slots // 32) * 24 + slots % 32)[None, :]
+    scale_off = tlx.require_layout(rows[:, None] * (K // 32) + tl.arange(0, 4)[None, :], _COPY_SCALE)
+    a_base = A + pm * 256 * K + first_tile * TB
+    b_base = B + pn * 128 * K + first_tile * TB
+    sa_base = SA + pm * 256 * (K // 32) + first_tile * 4
+    sb_base = SB + pn * 128 * (K // 32) + first_tile * 4
+
+    acc_t = tl.zeros((128, 128), tl.float32)
+    acc_b = tl.zeros((128, 128), tl.float32)
+    main_k_tiles: tl.constexpr = K_TILES - K_TILES % 2
+
+    for slot in tl.static_range(2):
+        _iw_load(b_s[slot], b_base + slot * TB, data_off, sb_s[slot], sb_base + slot * 4, scale_off)
+        tlx.buffer_load_to_local(a_top_s[slot], a_base + slot * TB, data_off, contiguity=16)
+        tlx.buffer_load_to_local(sa_top_s[slot], sa_base + slot * 4, scale_off)
+        _iw_load(a_bot_s[slot], a_base + 128 * K + slot * TB, data_off, sa_bot_s[slot],
+                 sa_base + 128 * (K // 32) + slot * 4, scale_off)
+    a_base += 2 * TB
+    b_base += 2 * TB
+    sa_base += 8
+    sb_base += 8
+
+    tlx.async_load_wait_group(2)
+    b_cur = tlx.local_load(tlx.local_trans(b_s[0]), relaxed=True)
+    sb_c = tlx.local_load(sb_s[0], layout=_SCALE_B, relaxed=True)
+    a_top = tlx.local_load(a_top_s[0], relaxed=True)
+    sa_t = tlx.local_load(sa_top_s[0], layout=_SCALE_A, relaxed=True)
+
+    for _ in tl.range(0, main_k_tiles - 2, 2, num_stages=1):
+        for slot in tl.static_range(2):
+            tlx.async_load_wait_group(2)
+            with tlx.warp_pipeline_stage("mfma", priority=0):
+                acc_t = tlx.dot_scaled(a_top, sa_t, A_FORMAT, b_cur, sb_c, B_FORMAT, acc_t, fp6_packed=True)
+            with tlx.warp_pipeline_stage("mem", priority=1):
+                a_bot = tlx.local_load(a_bot_s[slot], relaxed=True)
+                sa_b = tlx.local_load(sa_bot_s[slot], layout=_SCALE_A, relaxed=True)
+                tlx.amd_sched_barrier(0)
+                _iw_load(b_s[slot], b_base + slot * TB, data_off, sb_s[slot], sb_base + slot * 4, scale_off)
+            tlx.async_load_wait_group(1)
+            with tlx.warp_pipeline_stage("mfma", priority=0):
+                acc_b = tlx.dot_scaled(a_bot, sa_b, A_FORMAT, b_cur, sb_c, B_FORMAT, acc_b, fp6_packed=True)
+            with tlx.warp_pipeline_stage("mem", priority=1):
+                b_cur = tlx.local_load(tlx.local_trans(b_s[1 - slot]), relaxed=True)
+                sb_c = tlx.local_load(sb_s[1 - slot], layout=_SCALE_B, relaxed=True)
+                a_top = tlx.local_load(a_top_s[1 - slot], relaxed=True)
+                sa_t = tlx.local_load(sa_top_s[1 - slot], layout=_SCALE_A, relaxed=True)
+                tlx.amd_sched_barrier(0)
+                tlx.buffer_load_to_local(a_top_s[slot], a_base + slot * TB, data_off, contiguity=16)
+                tlx.buffer_load_to_local(sa_top_s[slot], sa_base + slot * 4, scale_off)
+                _iw_load(a_bot_s[slot], a_base + 128 * K + slot * TB, data_off, sa_bot_s[slot],
+                         sa_base + 128 * (K // 32) + slot * 4, scale_off)
+                if slot == 1:
+                    a_base += 2 * TB
+                    b_base += 2 * TB
+                    sa_base += 8
+                    sb_base += 8
+
+    # Drain the last two tiles: slot 0 is in registers except A-bottom, slot 1 is in LDS.
+    tlx.async_load_wait_group(0)
+    acc_t = tlx.dot_scaled(a_top, sa_t, A_FORMAT, b_cur, sb_c, B_FORMAT, acc_t, fp6_packed=True)
+    a_bot = tlx.local_load(a_bot_s[0], relaxed=True)
+    sa_b = tlx.local_load(sa_bot_s[0], layout=_SCALE_A, relaxed=True)
+    acc_b = tlx.dot_scaled(a_bot, sa_b, A_FORMAT, b_cur, sb_c, B_FORMAT, acc_b, fp6_packed=True)
+    b_cur = tlx.local_load(tlx.local_trans(b_s[1]), relaxed=True)
+    sb_c = tlx.local_load(sb_s[1], layout=_SCALE_B, relaxed=True)
+    a_top = tlx.local_load(a_top_s[1], relaxed=True)
+    sa_t = tlx.local_load(sa_top_s[1], layout=_SCALE_A, relaxed=True)
+    acc_t = tlx.dot_scaled(a_top, sa_t, A_FORMAT, b_cur, sb_c, B_FORMAT, acc_t, fp6_packed=True)
+    a_bot = tlx.local_load(a_bot_s[1], relaxed=True)
+    sa_b = tlx.local_load(sa_bot_s[1], layout=_SCALE_A, relaxed=True)
+    acc_b = tlx.dot_scaled(a_bot, sa_b, A_FORMAT, b_cur, sb_c, B_FORMAT, acc_b, fp6_packed=True)
+
+    tail_tiles = K_TILES % 2 + (split_id < extra).to(tl.int32)
+    for t in tl.range(0, tail_tiles, num_stages=1):
+        tl.debug_barrier()
+        tile = first_tile + main_k_tiles + t
+        a_t = A + pm * 256 * K + tile * TB
+        sa_tp = SA + pm * 256 * (K // 32) + tile * 4
+        _iw_load(b_s[0], B + pn * 128 * K + tile * TB, data_off, sb_s[0], SB + pn * 128 * (K // 32) + tile * 4,
+                 scale_off)
+        _iw_load(a_top_s[0], a_t, data_off, sa_top_s[0], sa_tp, scale_off)
+        _iw_load(a_bot_s[0], a_t + 128 * K, data_off, sa_bot_s[0], sa_tp + 128 * (K // 32), scale_off)
+        tlx.async_load_wait_group(0)
+        b_cur = tlx.local_load(tlx.local_trans(b_s[0]), relaxed=True)
+        sb_c = tlx.local_load(sb_s[0], layout=_SCALE_B, relaxed=True)
+        a_top = tlx.local_load(a_top_s[0], relaxed=True)
+        sa_t = tlx.local_load(sa_top_s[0], layout=_SCALE_A, relaxed=True)
+        a_bot = tlx.local_load(a_bot_s[0], relaxed=True)
+        sa_b = tlx.local_load(sa_bot_s[0], layout=_SCALE_A, relaxed=True)
+        acc_t = tlx.dot_scaled(a_top, sa_t, A_FORMAT, b_cur, sb_c, B_FORMAT, acc_t, fp6_packed=True)
+        acc_b = tlx.dot_scaled(a_bot, sa_b, A_FORMAT, b_cur, sb_c, B_FORMAT, acc_b, fp6_packed=True)
+
+    cm = pm * 256 + tlx.rematerialized_range(0, 128, 10, placement=K_TILES)
+    cn = pn * 128 + tlx.rematerialized_range(0, 128, 11, placement=K_TILES)
+    if FUSED_SPLIT:
+        lock = LOCKS + 2 * (pm * (N // 128) + pn)
+        arrived = tl.atomic_add(lock, 1, sem="relaxed", scope="gpu")
+        if arrived < SPLIT_K - 1:
+            ws = WS + split_id.to(tl.int64) * M * N
+            _store_quadrant(acc_t, ws, cm, cn, N, True, ".wt")
+            _store_quadrant(acc_b, ws, cm + 128, cn, N, True, ".wt")
+            _publish_partial(lock)
+        else:
+            _wait_partials(lock, SPLIT_K - 1)
+            _finish_quadrant(acc_t, WS, C, cm, cn, M, N, SPLIT_K, split_id)
+            _finish_quadrant(acc_b, WS, C, cm + 128, cn, M, N, SPLIT_K, split_id)
+            _reset_lock(lock)
+    else:
+        out = C
+        if SPLIT_K > 1:
+            out = WS + split_id.to(tl.int64) * M * N
+        _store_quadrant(acc_t, out, cm, cn, N, SPLIT_K > 1)
+        _store_quadrant(acc_b, out, cm + 128, cn, N, SPLIT_K > 1)
 
 
-def _launch_interwave(a, a_scale, b, b_scale, target, split_k, a_format, b_format, group_m=4):
+def _interwave_block_n(M, N, K, split_k):
+    """Interwave tile width for this problem, or None when only the native kernel applies."""
+    if M % 256 or N % 128 or K % 128 or K // 128 // split_k < 2:
+        return None
+    # 256x128 tiles when 256x256 tiles would occupy at most half of the CUs.
+    cu_count = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    if N % 256 or M // 256 * (N // 256) * split_k <= cu_count // 2:
+        return 128
+    return 256
+
+
+# Largest split_k whose partials the last-arriving split reduces in-kernel; wider
+# splits reduce in ``_reduce_split_k``, as one CTA summing them all is slower.
+_FUSED_SPLIT_K_MAX = 4
+# Per-(device, stream) tile arrival counters. The reducing split zeroes its
+# tile's counters, so a buffer is reusable by every later launch on its stream.
+# A buffer only grows, keeping the largest grid seen on its stream; at 8 bytes
+# per tile (8 KiB for 1024 tiles) that is cheaper than reallocating.
+_SPLIT_LOCKS = {}
+
+
+def _split_locks(device, tiles):
+    # During stream capture, torch.zeros is only recorded, not executed:
+    # caching that buffer would hand a later eager launch uninitialized
+    # counters if it runs before the graph is replayed. Captured graphs
+    # get a fresh (recorded) zeroing on every replay instead, and only
+    # eager allocations enter the reusable cache.
+    if torch.cuda.is_current_stream_capturing():
+        return torch.zeros(2 * tiles, device=device, dtype=torch.int32)
+    key = (device, torch.cuda.current_stream(device).cuda_stream)
+    locks = _SPLIT_LOCKS.get(key)
+    if locks is None or locks.numel() < 2 * tiles:
+        locks = torch.zeros(2 * tiles, device=device, dtype=torch.int32)
+        _SPLIT_LOCKS[key] = locks
+    return locks
+
+
+def _launch_interwave(a, a_scale, b, b_scale, out, split_k, a_format, b_format, block_n, group_m=4):
     M, K = a.shape
     N = b.shape[0]
-    _gemm_mxfp6_interwave[(M // 256 * (N // 256) * split_k, )](a, b, target, a_scale.view(torch.uint8),
-                                                               b_scale.view(torch.uint8), M, N, K, K // 128 // split_k,
-                                                               split_k, group_m, a_format, b_format, num_warps=8,
-                                                               num_stages=1, matrix_instr_nonkdim=16,
-                                                               disable_unclustered_high_rp_reschedule=True,
-                                                               reverse_local_assignment=True,
-                                                               llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ))
+    tiles = M // 256 * (N // block_n)
+    fused = 1 < split_k <= _FUSED_SPLIT_K_MAX
+    locks = _split_locks(a.device, tiles) if fused else out
+    workspace = out
+    if split_k > 1:
+        workspace = torch.empty((split_k, M, N), device=a.device, dtype=torch.float32)
+    kernel = _gemm_mxfp6_interwave if block_n == 256 else _gemm_mxfp6_interwave_n128
+    kernel[(tiles * split_k, )](a, b, out, workspace, locks, a_scale.view(torch.uint8), b_scale.view(torch.uint8), M, N,
+                                K, K // 128 // split_k, split_k, fused, group_m, a_format, b_format, num_warps=8,
+                                num_stages=1, matrix_instr_nonkdim=16, disable_unclustered_high_rp_reschedule=True,
+                                reverse_local_assignment=True, llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ))
+    if split_k > 1 and not fused:
+        _reduce_split_k[(triton.cdiv(M * N, 1024), )](workspace, out, M * N, split_k, 1024)
 
 
 def _full_configs():
@@ -488,10 +750,12 @@ def mm_mxfp6(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="fu
     if out is None:
         out = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
     with torch.cuda.device(a.device):
+        block_n = _interwave_block_n(M, N, K, split_k)
+        if block_n is not None:
+            _launch_interwave(a, a_scale, b, b_scale, out, split_k, a_format, b_format, block_n)
+            return out
         target = torch.empty((split_k, M, N), device=a.device, dtype=torch.float32) if split_k > 1 else out
-        if _interwave_eligible(M, N, K, split_k):
-            _launch_interwave(a, a_scale, b, b_scale, target, split_k, a_format, b_format)
-        elif space == "heuristic":
+        if space == "heuristic":
             # Default from the MI350 warp sweep: 128x128x128 at 4
             # warps spills zero and beats the 256-wide tile; K=64
             # shapes keep the 64-deep tile (whole 32x32x64 steps).
