@@ -284,13 +284,15 @@ def _softmax_lazy_pipeline_step(state, probability_carry, q, kt_dot, k_ptrs, v_p
         v_dot = tlx.local_load(tlx.local_view(v_buf, CUR_SLOT), relaxed=True)
         tok_k = tlx.async_load(k_ptrs + (block_n + 3) * BLOCK_N * stride_kn, tlx.local_view(k_buf, NEXT_SLOT))
         tlx.async_load_commit_group([tok_k])
+    # Each wave waits only for its own copies of K(block_n + 2), and the leading warp group reads the whole tile in
+    # mem2 right after the barrier where the lagging group enters dot2, so every wave must wait before dot2.
+    tlx.async_load_wait_group(2)
     # dot2: compute PV for the prior QK while starting the probability carry for qk_tile.
     with tlx.warp_pipeline_stage("dot2"):
         state, probability_carry, score_delta, max_advance = _pv_and_start_probability_fragments(
             state, probability_tile, v_dot, qk, QK_SCALE, RESCALE_THRESHOLD)
         probability_carry = _anchor_probability_carry(probability_carry)
         _schedule_softmax_mfma_valu(2, PV_MFMA_PER_WAVE)
-    tlx.async_load_wait_group(2)
     # mem2: prepare the next K/V operands and rescale the running softmax state.
     with tlx.warp_pipeline_stage("mem2"):
         kt_dot = _kt_pieces(k_buf, CUR_SLOT)
