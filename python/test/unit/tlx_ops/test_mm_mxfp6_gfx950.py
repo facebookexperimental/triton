@@ -151,6 +151,52 @@ def test_mm_mxfp6_gfx950_split_k_random(M, N, K, split_k, space, a_format, b_for
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
+@pytest.mark.parametrize("M,N,K,grid", [
+    # Uneven ranges: tiles split two or three ways at varying K offsets.
+    (512, 768, 2048, 5),
+    (256, 512, 4096, 3),
+    # Two programs per tile, with the XCD program remap.
+    (512, 512, 1024, 8),
+])
+@pytest.mark.parametrize("a_format,b_format", [("e2m3", "e3m2"), ("e3m2", "e3m2")])
+def test_mm_mxfp6_gfx950_stream_k(M, N, K, grid, a_format, b_format):
+    from triton.tlx.ops.kernels.mm_mxfp6.gfx950 import _launch_stream_k
+
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    a_codes = torch.randint(0, 64, (M, K), dtype=torch.uint8, device="cuda", generator=generator)
+    b_codes = torch.randint(0, 64, (N, K), dtype=torch.uint8, device="cuda", generator=generator)
+    a, b = _pack_fp6_dense(a_codes), _pack_fp6_dense(b_codes)
+    sa = torch.randint(124, 129, (M, K // 32), dtype=torch.uint8, device="cuda", generator=generator)
+    sb = torch.randint(124, 129, (N, K // 32), dtype=torch.uint8, device="cuda", generator=generator)
+    formats = {"e2m3": (2, 1), "e3m2": (3, 3)}
+    reference_a = _decode_fp6(a_codes, *formats[a_format]) * torch.exp2(sa.double() - 127).repeat_interleave(32, dim=1)
+    reference_b = _decode_fp6(b_codes, *formats[b_format]) * torch.exp2(sb.double() - 127).repeat_interleave(32, dim=1)
+    reference = reference_a @ reference_b.T
+    out = torch.full((M, N), float("nan"), device="cuda", dtype=torch.bfloat16)
+    sa, sb = sa.view(torch.float8_e8m0fnu), sb.view(torch.float8_e8m0fnu)
+    _launch_stream_k(a, sa, b, sb, out, a_format, b_format, grid)
+    tolerance = 1e-1 + 1e-2 * reference.abs() + 2**-14 * (reference_a.abs() @ reference_b.abs().T)
+    error = (out.double() - reference).abs()
+    assert torch.all(error <= tolerance), f"maximum error/tolerance: {(error / tolerance).max().item()}"
+    # A second launch on the same stream reuses the tile counters the first one reset.
+    b.zero_()
+    _launch_stream_k(a, sa, b, sb, out, a_format, b_format, grid)
+    assert torch.count_nonzero(out) == 0
+
+
+def test_mm_mxfp6_gfx950_stream_k_grid():
+    from triton.tlx.ops.kernels.mm_mxfp6.gfx950 import _stream_k_grid
+
+    assert _stream_k_grid(2048, 6144, 16128, 256) == 256
+    assert _stream_k_grid(2048, 4096, 8192, 256) == 256
+    # Too few K iterations per program, a full grid, or K tiles that are odd or not 256-aligned.
+    assert _stream_k_grid(2048, 6144, 4096, 256) is None
+    assert _stream_k_grid(4096, 4096, 8192, 256) is None
+    assert _stream_k_grid(2048, 6144, 16000, 256) is None
+    assert _stream_k_grid(2048, 6016, 16128, 256) is None
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
 @pytest.mark.parametrize("a_format", ["e2m3", "e3m2"])
 @pytest.mark.parametrize("b_format", ["e2m3", "e3m2"])
 @pytest.mark.parametrize("scale", [124, 127, 128])
