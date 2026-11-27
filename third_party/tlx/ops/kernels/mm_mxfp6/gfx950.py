@@ -239,7 +239,7 @@ def _finish_partials(acc, WSQ, C, rows, cols, M: tl.constexpr, N: tl.constexpr, 
         if part == own:
             total += acc
         else:
-            total += tlx.buffer_load(WSQ + part * M * N, offs, cache=".cg", contiguity=4)
+            total += tlx.buffer_load(WSQ + part.to(tl.int64) * M * N, offs, cache=".cg", contiguity=4)
     _store_quadrant(total, C, rows, cols, N, False)
 
 
@@ -327,12 +327,12 @@ def _iw256_segment(A, B, SA, SB, a_top_s, a_bot_s, b_left_s, b_right_s, sa_s, sb
     slots = tl.arange(0, 128)
     data_off = rows[:, None] * K + ((slots // 32) * 24 + slots % 32)[None, :]
     scale_off, _ = _scale_off(K)
-    a_base = A + pm * 256 * K + first_tile * TB
+    a_base = A + pm.to(tl.int64) * 256 * K + first_tile * TB
     a_bot_base = a_base + 128 * K
-    b_base = B + pn * 256 * K + first_tile * TB
+    b_base = B + pn.to(tl.int64) * 256 * K + first_tile * TB
     b_right_base = b_base + 128 * K
-    sa_base = SA + pm * 256 * (K // 32) + first_tile * 4
-    sb_base = SB + pn * 256 * (K // 32) + first_tile * 4
+    sa_base = SA + pm.to(tl.int64) * 256 * (K // 32) + first_tile * 4
+    sb_base = SB + pn.to(tl.int64) * 256 * (K // 32) + first_tile * 4
 
     acc_tl = tl.zeros((128, 128), tl.float32)
     acc_bl = tl.zeros((128, 128), tl.float32)
@@ -498,10 +498,10 @@ def _gemm_mxfp6_interwave(A, B, C, WS, LOCKS, SA, SB, M: tl.constexpr, N: tl.con
     for t in tl.range(0, tail_tiles, num_stages=1):
         tl.debug_barrier()
         tile = first_tile + main_k_tiles + t
-        a_t = A + pm * 256 * K + tile * TB
-        b_t = B + pn * 256 * K + tile * TB
-        sa_tp = SA + pm * 256 * (K // 32) + tile * 4
-        sb_tp = SB + pn * 256 * (K // 32) + tile * 4
+        a_t = A + pm.to(tl.int64) * 256 * K + tile * TB
+        b_t = B + pn.to(tl.int64) * 256 * K + tile * TB
+        sa_tp = SA + pm.to(tl.int64) * 256 * (K // 32) + tile * 4
+        sb_tp = SB + pn.to(tl.int64) * 256 * (K // 32) + tile * 4
         _iw_load(b_left_s[0], b_t, data_off, sb_s[0], sb_tp, scale_off, scale_mask)
         _iw_load(a_top_s[0], a_t, data_off, sa_s[0], sa_tp, scale_off, scale_mask)
         _iw_load_data(a_bot_s[0], a_t + 128 * K, data_off)
@@ -520,8 +520,10 @@ def _gemm_mxfp6_interwave(A, B, C, WS, LOCKS, SA, SB, M: tl.constexpr, N: tl.con
         acc_tr = tlx.dot_scaled(a_top, sa_t, A_FORMAT, b_right, sb_r, B_FORMAT, acc_tr, fp6_packed=True)
         acc_br = tlx.dot_scaled(a_bot, sa_b, A_FORMAT, b_right, sb_r, B_FORMAT, acc_br, fp6_packed=True)
 
-    cm = pm * 256 + tlx.rematerialized_range(0, 128, 10, placement=K_TILES)
-    cn = pn * 256 + tlx.rematerialized_range(0, 128, 11, placement=K_TILES)
+    # Buffer-op offsets are 32-bit, so stores are addressed from the tile origin.
+    tile_off = pm.to(tl.int64) * 256 * N + pn * 256
+    cm = tlx.rematerialized_range(0, 128, 10, placement=K_TILES)
+    cn = tlx.rematerialized_range(0, 128, 11, placement=K_TILES)
     if FUSED_SPLIT:
         lock = LOCKS + 2 * (pm * (N // 256) + pn)
         arrived = tl.atomic_add(lock, 1, sem="relaxed", scope="gpu")
@@ -535,15 +537,15 @@ def _gemm_mxfp6_interwave(A, B, C, WS, LOCKS, SA, SB, M: tl.constexpr, N: tl.con
         else:
             _wait_partials(lock, SPLIT_K - 1)
             ws = WS + (pm * (N // 256) + pn).to(tl.int64) * 65536
-            _finish_partials(acc_tl, ws, C, cm, cn, M, N, SPLIT_K, split_id)
-            _finish_partials(acc_bl, ws + 16384, C, cm + 128, cn, M, N, SPLIT_K, split_id)
-            _finish_partials(acc_tr, ws + 32768, C, cm, cn + 128, M, N, SPLIT_K, split_id)
-            _finish_partials(acc_br, ws + 49152, C, cm + 128, cn + 128, M, N, SPLIT_K, split_id)
+            _finish_partials(acc_tl, ws, C + tile_off, cm, cn, M, N, SPLIT_K, split_id)
+            _finish_partials(acc_bl, ws + 16384, C + tile_off, cm + 128, cn, M, N, SPLIT_K, split_id)
+            _finish_partials(acc_tr, ws + 32768, C + tile_off, cm, cn + 128, M, N, SPLIT_K, split_id)
+            _finish_partials(acc_br, ws + 49152, C + tile_off, cm + 128, cn + 128, M, N, SPLIT_K, split_id)
             _reset_lock(lock)
     else:
-        out = C
+        out = C + tile_off
         if SPLIT_K > 1:
-            out = WS + split_id.to(tl.int64) * M * N
+            out = WS + split_id.to(tl.int64) * M * N + tile_off
         _store_quadrant(acc_tl, out, cm, cn, N, SPLIT_K > 1)
         _store_quadrant(acc_bl, out, cm + 128, cn, N, SPLIT_K > 1)
         _store_quadrant(acc_tr, out, cm, cn + 128, N, SPLIT_K > 1)
@@ -596,13 +598,14 @@ def _gemm_mxfp6_interwave_sk(A, B, C, WS, LOCKS, SA, SB, M: tl.constexpr, N: tl.
         acc_tl, acc_bl, acc_tr, acc_br = _iw256_segment(A, B, SA, SB, a_top_s, a_bot_s, b_left_s, b_right_s, sa_s, sb_s,
                                                         pm, pn, k0, n_tiles, K, A_FORMAT, B_FORMAT)
         pieces = _sk_program_of(tile * KT + KT - 1, UNITS, GRID) - _sk_program_of(tile * KT, UNITS, GRID) + 1
-        cm = pm * 256 + tlx.rematerialized_range(0, 128, 10, placement=n_tiles)
-        cn = pn * 256 + tlx.rematerialized_range(0, 128, 11, placement=n_tiles)
+        tile_off = pm.to(tl.int64) * 256 * N + pn * 256
+        cm = tlx.rematerialized_range(0, 128, 10, placement=n_tiles)
+        cn = tlx.rematerialized_range(0, 128, 11, placement=n_tiles)
         if pieces == 1:
-            _store_quadrant(acc_tl, C, cm, cn, N, False)
-            _store_quadrant(acc_bl, C, cm + 128, cn, N, False)
-            _store_quadrant(acc_tr, C, cm, cn + 128, N, False)
-            _store_quadrant(acc_br, C, cm + 128, cn + 128, N, False)
+            _store_quadrant(acc_tl, C + tile_off, cm, cn, N, False)
+            _store_quadrant(acc_bl, C + tile_off, cm + 128, cn, N, False)
+            _store_quadrant(acc_tr, C + tile_off, cm, cn + 128, N, False)
+            _store_quadrant(acc_br, C + tile_off, cm + 128, cn + 128, N, False)
         else:
             lock = LOCKS + 2 * tile
             own = program - _sk_program_of(tile * KT, UNITS, GRID)
@@ -617,10 +620,10 @@ def _gemm_mxfp6_interwave_sk(A, B, C, WS, LOCKS, SA, SB, M: tl.constexpr, N: tl.
             else:
                 _wait_partials(lock, pieces - 1)
                 ws = WS + tile.to(tl.int64) * 65536
-                _finish_partials(acc_tl, ws, C, cm, cn, M, N, pieces, own)
-                _finish_partials(acc_bl, ws + 16384, C, cm + 128, cn, M, N, pieces, own)
-                _finish_partials(acc_tr, ws + 32768, C, cm, cn + 128, M, N, pieces, own)
-                _finish_partials(acc_br, ws + 49152, C, cm + 128, cn + 128, M, N, pieces, own)
+                _finish_partials(acc_tl, ws, C + tile_off, cm, cn, M, N, pieces, own)
+                _finish_partials(acc_bl, ws + 16384, C + tile_off, cm + 128, cn, M, N, pieces, own)
+                _finish_partials(acc_tr, ws + 32768, C + tile_off, cm, cn + 128, M, N, pieces, own)
+                _finish_partials(acc_br, ws + 49152, C + tile_off, cm + 128, cn + 128, M, N, pieces, own)
                 _reset_lock(lock)
         it += n_tiles
 
@@ -663,10 +666,10 @@ def _gemm_mxfp6_interwave_n128(A, B, C, WS, LOCKS, SA, SB, M: tl.constexpr, N: t
     data_off = rows[:, None] * K + ((slots // 32) * 24 + slots % 32)[None, :]
     sa_off, sa_mask = _scale_off(K)
     sb_off, sb_mask = _scale_off_b128(K)
-    a_base = A + pm * 256 * K + first_tile * TB
-    b_base = B + pn * 128 * K + first_tile * TB
-    sa_base = SA + pm * 256 * (K // 32) + first_tile * 4
-    sb_base = SB + pn * 128 * (K // 32) + first_tile * 4
+    a_base = A + pm.to(tl.int64) * 256 * K + first_tile * TB
+    b_base = B + pn.to(tl.int64) * 128 * K + first_tile * TB
+    sa_base = SA + pm.to(tl.int64) * 256 * (K // 32) + first_tile * 4
+    sb_base = SB + pn.to(tl.int64) * 128 * (K // 32) + first_tile * 4
 
     acc_t = tl.zeros((128, 128), tl.float32)
     acc_b = tl.zeros((128, 128), tl.float32)
@@ -748,11 +751,12 @@ def _gemm_mxfp6_interwave_n128(A, B, C, WS, LOCKS, SA, SB, M: tl.constexpr, N: t
     for t in tl.range(0, tail_tiles, num_stages=1):
         tl.debug_barrier()
         tile = first_tile + main_k_tiles + t
-        a_t = A + pm * 256 * K + tile * TB
-        _iw_load(b_s[0], B + pn * 128 * K + tile * TB, data_off, sb_s[0], SB + pn * 128 * (K // 32) + tile * 4, sb_off,
-                 sb_mask)
+        a_t = A + pm.to(tl.int64) * 256 * K + tile * TB
+        _iw_load(b_s[0], B + pn.to(tl.int64) * 128 * K + tile * TB, data_off, sb_s[0],
+                 SB + pn.to(tl.int64) * 128 * (K // 32) + tile * 4, sb_off, sb_mask)
         tlx.buffer_load_to_local(a_top_s[0], a_t, data_off, contiguity=16)
-        _iw_load(a_bot_s[0], a_t + 128 * K, data_off, sa_s[0], SA + pm * 256 * (K // 32) + tile * 4, sa_off, sa_mask)
+        _iw_load(a_bot_s[0], a_t + 128 * K, data_off, sa_s[0], SA + pm.to(tl.int64) * 256 * (K // 32) + tile * 4,
+                 sa_off, sa_mask)
         tlx.async_load_wait_group(0)
         b_cur = tlx.local_load(tlx.local_trans(b_s[0]), relaxed=True)
         sb_c = tlx.local_load(_scales(sb_s[0], 0), layout=_SCALE_B, relaxed=True)
@@ -763,8 +767,9 @@ def _gemm_mxfp6_interwave_n128(A, B, C, WS, LOCKS, SA, SB, M: tl.constexpr, N: t
         acc_t = tlx.dot_scaled(a_top, sa_t, A_FORMAT, b_cur, sb_c, B_FORMAT, acc_t, fp6_packed=True)
         acc_b = tlx.dot_scaled(a_bot, sa_b, A_FORMAT, b_cur, sb_c, B_FORMAT, acc_b, fp6_packed=True)
 
-    cm = pm * 256 + tlx.rematerialized_range(0, 128, 10, placement=K_TILES)
-    cn = pn * 128 + tlx.rematerialized_range(0, 128, 11, placement=K_TILES)
+    tile_off = pm.to(tl.int64) * 256 * N + pn * 128
+    cm = tlx.rematerialized_range(0, 128, 10, placement=K_TILES)
+    cn = tlx.rematerialized_range(0, 128, 11, placement=K_TILES)
     if FUSED_SPLIT:
         lock = LOCKS + 2 * (pm * (N // 128) + pn)
         arrived = tl.atomic_add(lock, 1, sem="relaxed", scope="gpu")
@@ -776,13 +781,13 @@ def _gemm_mxfp6_interwave_n128(A, B, C, WS, LOCKS, SA, SB, M: tl.constexpr, N: t
         else:
             _wait_partials(lock, SPLIT_K - 1)
             ws = WS + (pm * (N // 128) + pn).to(tl.int64) * 32768
-            _finish_partials(acc_t, ws, C, cm, cn, M, N, SPLIT_K, split_id)
-            _finish_partials(acc_b, ws + 16384, C, cm + 128, cn, M, N, SPLIT_K, split_id)
+            _finish_partials(acc_t, ws, C + tile_off, cm, cn, M, N, SPLIT_K, split_id)
+            _finish_partials(acc_b, ws + 16384, C + tile_off, cm + 128, cn, M, N, SPLIT_K, split_id)
             _reset_lock(lock)
     else:
-        out = C
+        out = C + tile_off
         if SPLIT_K > 1:
-            out = WS + split_id.to(tl.int64) * M * N
+            out = WS + split_id.to(tl.int64) * M * N + tile_off
         _store_quadrant(acc_t, out, cm, cn, N, SPLIT_K > 1)
         _store_quadrant(acc_b, out, cm + 128, cn, N, SPLIT_K > 1)
 

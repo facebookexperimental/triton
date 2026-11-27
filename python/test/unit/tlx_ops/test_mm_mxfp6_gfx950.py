@@ -261,6 +261,25 @@ def test_mm_mxfp6_gfx950_split_k_large_workspace():
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
+@pytest.mark.parametrize("M,N,K,split_k", [
+    # 2.1 GB BF16 output.
+    (524544, 2048, 256, 1),
+    # 2 GiB FP32 partial per split.
+    (16384, 32768, 2048, 8),
+])
+def test_mm_mxfp6_gfx950_interwave_large_output(M, N, K, split_k):
+    from triton.tlx.ops.kernels.mm_mxfp6.gfx950 import mm_mxfp6
+
+    a = _packed_ones(M, K, 8, "cuda")
+    b = _packed_ones(N, K, 12, "cuda")
+    sa = torch.full((M, K // 32), 127, dtype=torch.uint8, device="cuda").view(torch.float8_e8m0fnu)
+    sb = torch.full((N, K // 32), 127, dtype=torch.uint8, device="cuda").view(torch.float8_e8m0fnu)
+    out = torch.full((M, N), float("nan"), dtype=torch.bfloat16, device="cuda")
+    mm_mxfp6(a, sa, b, sb, out=out, space="heuristic", split_k=split_k)
+    assert torch.all(out == K).item()
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
 @pytest.mark.parametrize("M, N", [(128, 128), (128, 256), (256, 128), (256, 256), (384, 384)])
 def test_mm_mxfp6_gfx950_full_ones_preserves_output_guard(M, N):
     from triton.tlx import ops
