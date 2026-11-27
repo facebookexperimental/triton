@@ -7,6 +7,7 @@
 #include "mlir/IR/Value.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
+#include "triton/Tools/GenericSwizzling.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Debug.h"
 
@@ -77,6 +78,13 @@ triton::gpu::SharedEncodingTrait getDotOperandSharedEncoding(
 bool canLoadDirectToLdsInPipeline(RankedTensorType srcTy,
                                   triton::gpu::SharedEncodingTrait sharedEnc,
                                   const triton::AMD::TargetInfo &targetInfo);
+
+// Returns the bank conflicts of a load or store between the register layout
+// `reg` and the padded shared layout `padded`.
+int bankConflictsMemDescPadded(const triton::LinearLayout &reg,
+                               triton::gpu::PaddedSharedEncodingAttr padded,
+                               int32_t bitwidth, int32_t numBanks = 32,
+                               triton::gpu::LocalMemOpTile laneTile = {});
 
 triton::gpu::SharedEncodingTrait
 getEncodingFromDescriptor(Operation *op, RankedTensorType tensorType,
