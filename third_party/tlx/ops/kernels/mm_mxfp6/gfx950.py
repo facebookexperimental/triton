@@ -165,7 +165,10 @@ def _reduce_split_k(partials_ptr, out_ptr, MN, SPLIT_K: tl.constexpr, BLOCK_SIZE
 # per-segment packed form consumed by ``fp6_packed``: 24 data bytes plus the 8
 # bytes that follow them for each 32-code segment.
 _MMA_LAYOUT = tlx.amd_mfma_layout(4, [16, 16, 128], True, [2, 4])
-_COPY_SCALE = tlx.layout(shape=((128, 4), (4, )), stride=((4, 0), (1, )))
+# Scale copies carry two K tiles (8 bytes) per row: 256 rows over all 512 lanes,
+# or 128 rows with the upper half of the lanes repeating the lower half.
+_COPY_SCALE = tlx.layout(shape=((2, 256), (4, )), stride=((4, 8), (1, )))
+_COPY_SCALE_B128 = tlx.layout(shape=((2, 128, 2), (4, )), stride=((4, 8, 0), (1, )))
 _SCALE_A = tlx.layout(
     shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2)),
     stride=((4, 8, 16, 32, 1, 2, 0, 0, 64), (128, 256)),
@@ -274,57 +277,90 @@ def _reset_lock(lock):
 
 
 @triton.jit
-def _iw_load(dst, src, data_off, sdst, ssrc, scale_off):
+def _scale_off(K: tl.constexpr):
+    """Offsets of two K tiles' scales for 256 rows, in a (256, 8) buffer, and the mask for the first tile only."""
+    rows = tl.arange(0, 256)[:, None]
+    off = tlx.require_layout(rows * (K // 32) + tl.arange(0, 8)[None, :], _COPY_SCALE)
+    return off, off - rows * (K // 32) < 4
+
+
+@triton.jit
+def _scale_off_b128(K: tl.constexpr):
+    """``_scale_off`` for the 128 B rows of the 256x128 kernel: a (128, 8) buffer, copied by half the lanes."""
+    rows = tl.arange(0, 128)[:, None]
+    off = tlx.require_layout(rows * (K // 32) + tl.arange(0, 8)[None, :], _COPY_SCALE_B128)
+    return off, off - rows * (K // 32) < 4
+
+
+@triton.jit
+def _iw_load(dst, src, data_off, sdst, ssrc, scale_off, scale_mask):
     tlx.buffer_load_to_local(dst, src, data_off, contiguity=16)
-    tlx.buffer_load_to_local(sdst, ssrc, scale_off)
+    tlx.buffer_load_to_local(sdst, ssrc, scale_off, mask=scale_mask)
     tlx.async_load_commit_group()
 
 
 @triton.jit
-def _iw256_segment(A, B, SA, SB, a_top_s, a_bot_s, b_left_s, b_right_s, sa_top_s, sa_bot_s, sb_left_s, sb_right_s, pm,
-                   pn, first_tile, n_tiles, K: tl.constexpr, A_FORMAT: tl.constexpr, B_FORMAT: tl.constexpr):
-    """One 256x256 tile over K tiles ``[first_tile, first_tile + n_tiles)``; ``n_tiles`` is even and >= 2."""
+def _iw_load_data(dst, src, data_off):
+    tlx.buffer_load_to_local(dst, src, data_off, contiguity=16)
+    tlx.async_load_commit_group()
+
+
+@triton.jit
+def _scales(buf, half: tl.constexpr, tile: tl.constexpr = 0):
+    """The (128, 4) scales of row half ``half`` and K tile ``tile`` of a scale pair buffer."""
+    return tlx.local_slice(buf, [128 * half, 4 * tile], [128, 4])
+
+
+@triton.jit
+def _iw256_segment(A, B, SA, SB, a_top_s, a_bot_s, b_left_s, b_right_s, sa_s, sb_s, pm, pn, first_tile, n_tiles,
+                   K: tl.constexpr, A_FORMAT: tl.constexpr, B_FORMAT: tl.constexpr):
+    """One 256x256 tile over K tiles ``[first_tile, first_tile + n_tiles)``; ``n_tiles`` is even and >= 2.
+
+    Scales move in K-tile pairs: one 8-byte row copy holds both 128-row halves'
+    scales for two K tiles, so a scale row costs one cache-line request per pair
+    instead of one per tile. Pair g lands in buffer g % 2 with the even tile's
+    B-left (B scales) or A-top (A scales) copy, and is read through tile 2g + 1.
+    """
     # K-tile byte step and per-segment byte offsets within a K tile.
     TB: tl.constexpr = 96
     rows = tl.arange(0, 128)
     slots = tl.arange(0, 128)
     data_off = rows[:, None] * K + ((slots // 32) * 24 + slots % 32)[None, :]
-    scale_off = tlx.require_layout(rows[:, None] * (K // 32) + tl.arange(0, 4)[None, :], _COPY_SCALE)
+    scale_off, _ = _scale_off(K)
     a_base = A + pm * 256 * K + first_tile * TB
     a_bot_base = a_base + 128 * K
     b_base = B + pn * 256 * K + first_tile * TB
     b_right_base = b_base + 128 * K
     sa_base = SA + pm * 256 * (K // 32) + first_tile * 4
-    sa_bot_base = sa_base + 128 * (K // 32)
     sb_base = SB + pn * 256 * (K // 32) + first_tile * 4
-    sb_right_base = sb_base + 128 * (K // 32)
 
     acc_tl = tl.zeros((128, 128), tl.float32)
     acc_bl = tl.zeros((128, 128), tl.float32)
     acc_tr = tl.zeros((128, 128), tl.float32)
     acc_br = tl.zeros((128, 128), tl.float32)
 
-    for slot in tl.static_range(2):
-        _iw_load(b_left_s[slot], b_base + slot * TB, data_off, sb_left_s[slot], sb_base + slot * 4, scale_off)
-        _iw_load(a_top_s[slot], a_base + slot * TB, data_off, sa_top_s[slot], sa_base + slot * 4, scale_off)
-        _iw_load(a_bot_s[slot], a_bot_base + slot * TB, data_off, sa_bot_s[slot], sa_bot_base + slot * 4, scale_off)
-        _iw_load(b_right_s[slot], b_right_base + slot * TB, data_off, sb_right_s[slot], sb_right_base + slot * 4,
-                 scale_off)
+    _iw_load(b_left_s[0], b_base, data_off, sb_s[0], sb_base, scale_off, None)
+    _iw_load(a_top_s[0], a_base, data_off, sa_s[0], sa_base, scale_off, None)
+    _iw_load_data(a_bot_s[0], a_bot_base, data_off)
+    _iw_load_data(b_right_s[0], b_right_base, data_off)
+    _iw_load_data(b_left_s[1], b_base + TB, data_off)
+    _iw_load_data(a_top_s[1], a_base + TB, data_off)
+    _iw_load_data(a_bot_s[1], a_bot_base + TB, data_off)
+    _iw_load_data(b_right_s[1], b_right_base + TB, data_off)
     a_base += 2 * TB
     a_bot_base += 2 * TB
     b_base += 2 * TB
     b_right_base += 2 * TB
     sa_base += 8
-    sa_bot_base += 8
     sb_base += 8
-    sb_right_base += 8
 
     tlx.async_load_wait_group(6)
     b_left = tlx.local_load(tlx.local_trans(b_left_s[0]), relaxed=True)
-    sb_l = tlx.local_load(sb_left_s[0], layout=_SCALE_B, relaxed=True)
+    sb_l = tlx.local_load(_scales(sb_s[0], 0, 0), layout=_SCALE_B, relaxed=True)
     a_top = tlx.local_load(a_top_s[0], relaxed=True)
-    sa_t = tlx.local_load(sa_top_s[0], layout=_SCALE_A, relaxed=True)
+    sa_t = tlx.local_load(_scales(sa_s[0], 0, 0), layout=_SCALE_A, relaxed=True)
 
+    cur = 0
     for _ in tl.range(0, n_tiles - 2, 2, num_stages=1):
         for slot in tl.static_range(2):
             tlx.async_load_wait_group(5)
@@ -332,70 +368,81 @@ def _iw256_segment(A, B, SA, SB, a_top_s, a_bot_s, b_left_s, b_right_s, sa_top_s
                 acc_tl = tlx.dot_scaled(a_top, sa_t, A_FORMAT, b_left, sb_l, B_FORMAT, acc_tl, fp6_packed=True)
             with tlx.warp_pipeline_stage("mem", priority=1):
                 a_bot = tlx.local_load(a_bot_s[slot], relaxed=True)
-                sa_b = tlx.local_load(sa_bot_s[slot], layout=_SCALE_A, relaxed=True)
+                sa_b = tlx.local_load(_scales(tlx.local_view(sa_s, cur), 1, slot), layout=_SCALE_A, relaxed=True)
                 tlx.amd_sched_barrier(0)
-                _iw_load(b_left_s[slot], b_base + slot * TB, data_off, sb_left_s[slot], sb_base + slot * 4, scale_off)
+                if slot == 0:
+                    _iw_load(b_left_s[slot], b_base, data_off, tlx.local_view(sb_s, 1 - cur), sb_base, scale_off, None)
+                else:
+                    _iw_load_data(b_left_s[slot], b_base + TB, data_off)
             tlx.async_load_wait_group(5)
             with tlx.warp_pipeline_stage("mfma", priority=0):
                 acc_bl = tlx.dot_scaled(a_bot, sa_b, A_FORMAT, b_left, sb_l, B_FORMAT, acc_bl, fp6_packed=True)
             with tlx.warp_pipeline_stage("mem", priority=1):
                 b_right = tlx.local_load(tlx.local_trans(b_right_s[slot]), relaxed=True)
-                sb_r = tlx.local_load(sb_right_s[slot], layout=_SCALE_B, relaxed=True)
+                sb_r = tlx.local_load(_scales(tlx.local_view(sb_s, cur), 1, slot), layout=_SCALE_B, relaxed=True)
                 tlx.amd_sched_barrier(0)
-                _iw_load(a_top_s[slot], a_base + slot * TB, data_off, sa_top_s[slot], sa_base + slot * 4, scale_off)
+                if slot == 0:
+                    _iw_load(a_top_s[slot], a_base, data_off, tlx.local_view(sa_s, 1 - cur), sa_base, scale_off, None)
+                else:
+                    _iw_load_data(a_top_s[slot], a_base + TB, data_off)
             tlx.async_load_wait_group(5)
             with tlx.warp_pipeline_stage("mfma", priority=0):
                 acc_tr = tlx.dot_scaled(a_top, sa_t, A_FORMAT, b_right, sb_r, B_FORMAT, acc_tr, fp6_packed=True)
             with tlx.warp_pipeline_stage("mem", priority=1):
                 b_left = tlx.local_load(tlx.local_trans(b_left_s[1 - slot]), relaxed=True)
-                sb_l = tlx.local_load(sb_left_s[1 - slot], layout=_SCALE_B, relaxed=True)
+                if slot == 0:
+                    sb_l = tlx.local_load(_scales(tlx.local_view(sb_s, cur), 0, 1), layout=_SCALE_B, relaxed=True)
+                else:
+                    sb_l = tlx.local_load(_scales(tlx.local_view(sb_s, 1 - cur), 0, 0), layout=_SCALE_B, relaxed=True)
                 tlx.amd_sched_barrier(0)
-                _iw_load(a_bot_s[slot], a_bot_base + slot * TB, data_off, sa_bot_s[slot], sa_bot_base + slot * 4,
-                         scale_off)
+                _iw_load_data(a_bot_s[slot], a_bot_base + slot * TB, data_off)
             tlx.async_load_wait_group(5)
             with tlx.warp_pipeline_stage("mfma", priority=0):
                 acc_br = tlx.dot_scaled(a_bot, sa_b, A_FORMAT, b_right, sb_r, B_FORMAT, acc_br, fp6_packed=True)
             with tlx.warp_pipeline_stage("mem", priority=1):
                 a_top = tlx.local_load(a_top_s[1 - slot], relaxed=True)
-                sa_t = tlx.local_load(sa_top_s[1 - slot], layout=_SCALE_A, relaxed=True)
+                if slot == 0:
+                    sa_t = tlx.local_load(_scales(tlx.local_view(sa_s, cur), 0, 1), layout=_SCALE_A, relaxed=True)
+                else:
+                    sa_t = tlx.local_load(_scales(tlx.local_view(sa_s, 1 - cur), 0, 0), layout=_SCALE_A, relaxed=True)
                 tlx.amd_sched_barrier(0)
-                _iw_load(b_right_s[slot], b_right_base + slot * TB, data_off, sb_right_s[slot],
-                         sb_right_base + slot * 4, scale_off)
+                _iw_load_data(b_right_s[slot], b_right_base + slot * TB, data_off)
                 if slot == 1:
                     a_base += 2 * TB
                     a_bot_base += 2 * TB
                     b_base += 2 * TB
                     b_right_base += 2 * TB
                     sa_base += 8
-                    sa_bot_base += 8
                     sb_base += 8
-                    sb_right_base += 8
+        cur = 1 - cur
 
     # Drain: no refills, wait(5) .. wait(0) completes the remaining groups in issue order.
+    sa_cur = tlx.local_view(sa_s, cur)
+    sb_cur = tlx.local_view(sb_s, cur)
     acc_tl = tlx.dot_scaled(a_top, sa_t, A_FORMAT, b_left, sb_l, B_FORMAT, acc_tl, fp6_packed=True)
     tlx.async_load_wait_group(5)
     a_bot = tlx.local_load(a_bot_s[0], relaxed=True)
-    sa_b = tlx.local_load(sa_bot_s[0], layout=_SCALE_A, relaxed=True)
+    sa_b = tlx.local_load(_scales(sa_cur, 1, 0), layout=_SCALE_A, relaxed=True)
     acc_bl = tlx.dot_scaled(a_bot, sa_b, A_FORMAT, b_left, sb_l, B_FORMAT, acc_bl, fp6_packed=True)
     tlx.async_load_wait_group(4)
     b_right = tlx.local_load(tlx.local_trans(b_right_s[0]), relaxed=True)
-    sb_r = tlx.local_load(sb_right_s[0], layout=_SCALE_B, relaxed=True)
+    sb_r = tlx.local_load(_scales(sb_cur, 1, 0), layout=_SCALE_B, relaxed=True)
     acc_tr = tlx.dot_scaled(a_top, sa_t, A_FORMAT, b_right, sb_r, B_FORMAT, acc_tr, fp6_packed=True)
     tlx.async_load_wait_group(3)
     b_left = tlx.local_load(tlx.local_trans(b_left_s[1]), relaxed=True)
-    sb_l = tlx.local_load(sb_left_s[1], layout=_SCALE_B, relaxed=True)
+    sb_l = tlx.local_load(_scales(sb_cur, 0, 1), layout=_SCALE_B, relaxed=True)
     acc_br = tlx.dot_scaled(a_bot, sa_b, A_FORMAT, b_right, sb_r, B_FORMAT, acc_br, fp6_packed=True)
     tlx.async_load_wait_group(2)
     a_top = tlx.local_load(a_top_s[1], relaxed=True)
-    sa_t = tlx.local_load(sa_top_s[1], layout=_SCALE_A, relaxed=True)
+    sa_t = tlx.local_load(_scales(sa_cur, 0, 1), layout=_SCALE_A, relaxed=True)
     acc_tl = tlx.dot_scaled(a_top, sa_t, A_FORMAT, b_left, sb_l, B_FORMAT, acc_tl, fp6_packed=True)
     tlx.async_load_wait_group(1)
     a_bot = tlx.local_load(a_bot_s[1], relaxed=True)
-    sa_b = tlx.local_load(sa_bot_s[1], layout=_SCALE_A, relaxed=True)
+    sa_b = tlx.local_load(_scales(sa_cur, 1, 1), layout=_SCALE_A, relaxed=True)
     acc_bl = tlx.dot_scaled(a_bot, sa_b, A_FORMAT, b_left, sb_l, B_FORMAT, acc_bl, fp6_packed=True)
     tlx.async_load_wait_group(0)
     b_right = tlx.local_load(tlx.local_trans(b_right_s[1]), relaxed=True)
-    sb_r = tlx.local_load(sb_right_s[1], layout=_SCALE_B, relaxed=True)
+    sb_r = tlx.local_load(_scales(sb_cur, 1, 1), layout=_SCALE_B, relaxed=True)
     acc_tr = tlx.dot_scaled(a_top, sa_t, A_FORMAT, b_right, sb_r, B_FORMAT, acc_tr, fp6_packed=True)
     acc_br = tlx.dot_scaled(a_bot, sa_b, A_FORMAT, b_right, sb_r, B_FORMAT, acc_br, fp6_packed=True)
 
@@ -419,10 +466,8 @@ def _gemm_mxfp6_interwave(A, B, C, WS, LOCKS, SA, SB, M: tl.constexpr, N: tl.con
     a_bot_s = tlx.local_alloc((128, 128), tl.uint8, 2, layout=tile_layout)
     b_left_s = tlx.local_alloc((128, 128), tl.uint8, 2, layout=tile_layout)
     b_right_s = tlx.local_alloc((128, 128), tl.uint8, 2, layout=tile_layout)
-    sa_top_s = tlx.local_alloc((128, 4), tl.uint8, 2)
-    sa_bot_s = tlx.local_alloc((128, 4), tl.uint8, 2)
-    sb_left_s = tlx.local_alloc((128, 4), tl.uint8, 2)
-    sb_right_s = tlx.local_alloc((128, 4), tl.uint8, 2)
+    sa_s = tlx.local_alloc((256, 8), tl.uint8, 2)
+    sb_s = tlx.local_alloc((256, 8), tl.uint8, 2)
 
     grid_mn: tl.constexpr = M // 256 * (N // 256)
     program = tl.program_id(0)
@@ -440,14 +485,13 @@ def _gemm_mxfp6_interwave(A, B, C, WS, LOCKS, SA, SB, M: tl.constexpr, N: tl.con
     first_tile = split_id * K_TILES + tl.minimum(split_id, extra)
 
     main_k_tiles: tl.constexpr = K_TILES - K_TILES % 2
-    acc_tl, acc_bl, acc_tr, acc_br = _iw256_segment(A, B, SA, SB, a_top_s, a_bot_s, b_left_s, b_right_s, sa_top_s,
-                                                    sa_bot_s, sb_left_s, sb_right_s, pm, pn, first_tile, main_k_tiles,
-                                                    K, A_FORMAT, B_FORMAT)
+    acc_tl, acc_bl, acc_tr, acc_br = _iw256_segment(A, B, SA, SB, a_top_s, a_bot_s, b_left_s, b_right_s, sa_s, sb_s, pm,
+                                                    pn, first_tile, main_k_tiles, K, A_FORMAT, B_FORMAT)
 
     rows = tl.arange(0, 128)
     slots = tl.arange(0, 128)
     data_off = rows[:, None] * K + ((slots // 32) * 24 + slots % 32)[None, :]
-    scale_off = tlx.require_layout(rows[:, None] * (K // 32) + tl.arange(0, 4)[None, :], _COPY_SCALE)
+    scale_off, scale_mask = _scale_off(K)
     TB: tl.constexpr = 96
     # Odd tile count, plus one extra tile for each of the first ``extra`` splits.
     tail_tiles = K_TILES % 2 + (split_id < extra).to(tl.int32)
@@ -458,19 +502,19 @@ def _gemm_mxfp6_interwave(A, B, C, WS, LOCKS, SA, SB, M: tl.constexpr, N: tl.con
         b_t = B + pn * 256 * K + tile * TB
         sa_tp = SA + pm * 256 * (K // 32) + tile * 4
         sb_tp = SB + pn * 256 * (K // 32) + tile * 4
-        _iw_load(b_left_s[0], b_t, data_off, sb_left_s[0], sb_tp, scale_off)
-        _iw_load(a_top_s[0], a_t, data_off, sa_top_s[0], sa_tp, scale_off)
-        _iw_load(a_bot_s[0], a_t + 128 * K, data_off, sa_bot_s[0], sa_tp + 128 * (K // 32), scale_off)
-        _iw_load(b_right_s[0], b_t + 128 * K, data_off, sb_right_s[0], sb_tp + 128 * (K // 32), scale_off)
+        _iw_load(b_left_s[0], b_t, data_off, sb_s[0], sb_tp, scale_off, scale_mask)
+        _iw_load(a_top_s[0], a_t, data_off, sa_s[0], sa_tp, scale_off, scale_mask)
+        _iw_load_data(a_bot_s[0], a_t + 128 * K, data_off)
+        _iw_load_data(b_right_s[0], b_t + 128 * K, data_off)
         tlx.async_load_wait_group(0)
         b_left = tlx.local_load(tlx.local_trans(b_left_s[0]), relaxed=True)
-        sb_l = tlx.local_load(sb_left_s[0], layout=_SCALE_B, relaxed=True)
+        sb_l = tlx.local_load(_scales(sb_s[0], 0), layout=_SCALE_B, relaxed=True)
         a_top = tlx.local_load(a_top_s[0], relaxed=True)
-        sa_t = tlx.local_load(sa_top_s[0], layout=_SCALE_A, relaxed=True)
+        sa_t = tlx.local_load(_scales(sa_s[0], 0), layout=_SCALE_A, relaxed=True)
         a_bot = tlx.local_load(a_bot_s[0], relaxed=True)
-        sa_b = tlx.local_load(sa_bot_s[0], layout=_SCALE_A, relaxed=True)
+        sa_b = tlx.local_load(_scales(sa_s[0], 1), layout=_SCALE_A, relaxed=True)
         b_right = tlx.local_load(tlx.local_trans(b_right_s[0]), relaxed=True)
-        sb_r = tlx.local_load(sb_right_s[0], layout=_SCALE_B, relaxed=True)
+        sb_r = tlx.local_load(_scales(sb_s[0], 1), layout=_SCALE_B, relaxed=True)
         acc_tl = tlx.dot_scaled(a_top, sa_t, A_FORMAT, b_left, sb_l, B_FORMAT, acc_tl, fp6_packed=True)
         acc_bl = tlx.dot_scaled(a_bot, sa_b, A_FORMAT, b_left, sb_l, B_FORMAT, acc_bl, fp6_packed=True)
         acc_tr = tlx.dot_scaled(a_top, sa_t, A_FORMAT, b_right, sb_r, B_FORMAT, acc_tr, fp6_packed=True)
@@ -529,10 +573,8 @@ def _gemm_mxfp6_interwave_sk(A, B, C, WS, LOCKS, SA, SB, M: tl.constexpr, N: tl.
     a_bot_s = tlx.local_alloc((128, 128), tl.uint8, 2, layout=tile_layout)
     b_left_s = tlx.local_alloc((128, 128), tl.uint8, 2, layout=tile_layout)
     b_right_s = tlx.local_alloc((128, 128), tl.uint8, 2, layout=tile_layout)
-    sa_top_s = tlx.local_alloc((128, 4), tl.uint8, 2)
-    sa_bot_s = tlx.local_alloc((128, 4), tl.uint8, 2)
-    sb_left_s = tlx.local_alloc((128, 4), tl.uint8, 2)
-    sb_right_s = tlx.local_alloc((128, 4), tl.uint8, 2)
+    sa_s = tlx.local_alloc((256, 8), tl.uint8, 2)
+    sb_s = tlx.local_alloc((256, 8), tl.uint8, 2)
 
     KT: tl.constexpr = K // 128
     UNITS: tl.constexpr = M // 256 * (N // 256) * KT // 2
@@ -551,9 +593,8 @@ def _gemm_mxfp6_interwave_sk(A, B, C, WS, LOCKS, SA, SB, M: tl.constexpr, N: tl.
         pn = tile % (GROUP_M * (N // 256)) // group_m
         # The previous segment's last LDS reads must finish before this one refills the slots.
         tl.debug_barrier()
-        acc_tl, acc_bl, acc_tr, acc_br = _iw256_segment(A, B, SA, SB, a_top_s, a_bot_s, b_left_s, b_right_s, sa_top_s,
-                                                        sa_bot_s, sb_left_s, sb_right_s, pm, pn, k0, n_tiles, K,
-                                                        A_FORMAT, B_FORMAT)
+        acc_tl, acc_bl, acc_tr, acc_br = _iw256_segment(A, B, SA, SB, a_top_s, a_bot_s, b_left_s, b_right_s, sa_s, sb_s,
+                                                        pm, pn, k0, n_tiles, K, A_FORMAT, B_FORMAT)
         pieces = _sk_program_of(tile * KT + KT - 1, UNITS, GRID) - _sk_program_of(tile * KT, UNITS, GRID) + 1
         cm = pm * 256 + tlx.rematerialized_range(0, 128, 10, placement=n_tiles)
         cn = pn * 256 + tlx.rematerialized_range(0, 128, 11, placement=n_tiles)
@@ -600,9 +641,8 @@ def _gemm_mxfp6_interwave_n128(A, B, C, WS, LOCKS, SA, SB, M: tl.constexpr, N: t
     a_top_s = tlx.local_alloc((128, 128), tl.uint8, 2, layout=tile_layout)
     a_bot_s = tlx.local_alloc((128, 128), tl.uint8, 2, layout=tile_layout)
     b_s = tlx.local_alloc((128, 128), tl.uint8, 2, layout=tile_layout)
-    sa_top_s = tlx.local_alloc((128, 4), tl.uint8, 2)
-    sa_bot_s = tlx.local_alloc((128, 4), tl.uint8, 2)
-    sb_s = tlx.local_alloc((128, 4), tl.uint8, 2)
+    sa_s = tlx.local_alloc((256, 8), tl.uint8, 2)
+    sb_s = tlx.local_alloc((128, 8), tl.uint8, 2)
 
     grid_mn: tl.constexpr = M // 256 * (N // 128)
     program = tl.program_id(0)
@@ -621,7 +661,8 @@ def _gemm_mxfp6_interwave_n128(A, B, C, WS, LOCKS, SA, SB, M: tl.constexpr, N: t
     rows = tl.arange(0, 128)
     slots = tl.arange(0, 128)
     data_off = rows[:, None] * K + ((slots // 32) * 24 + slots % 32)[None, :]
-    scale_off = tlx.require_layout(rows[:, None] * (K // 32) + tl.arange(0, 4)[None, :], _COPY_SCALE)
+    sa_off, sa_mask = _scale_off(K)
+    sb_off, sb_mask = _scale_off_b128(K)
     a_base = A + pm * 256 * K + first_tile * TB
     b_base = B + pn * 128 * K + first_tile * TB
     sa_base = SA + pm * 256 * (K // 32) + first_tile * 4
@@ -631,12 +672,13 @@ def _gemm_mxfp6_interwave_n128(A, B, C, WS, LOCKS, SA, SB, M: tl.constexpr, N: t
     acc_b = tl.zeros((128, 128), tl.float32)
     main_k_tiles: tl.constexpr = K_TILES - K_TILES % 2
 
-    for slot in tl.static_range(2):
-        _iw_load(b_s[slot], b_base + slot * TB, data_off, sb_s[slot], sb_base + slot * 4, scale_off)
-        tlx.buffer_load_to_local(a_top_s[slot], a_base + slot * TB, data_off, contiguity=16)
-        tlx.buffer_load_to_local(sa_top_s[slot], sa_base + slot * 4, scale_off)
-        _iw_load(a_bot_s[slot], a_base + 128 * K + slot * TB, data_off, sa_bot_s[slot],
-                 sa_base + 128 * (K // 32) + slot * 4, scale_off)
+    # Scales move in K-tile pairs as in ``_iw256_segment``; pair g lands in buffer g % 2 with the even tile.
+    _iw_load(b_s[0], b_base, data_off, sb_s[0], sb_base, sb_off, None)
+    tlx.buffer_load_to_local(a_top_s[0], a_base, data_off, contiguity=16)
+    _iw_load(a_bot_s[0], a_base + 128 * K, data_off, sa_s[0], sa_base, sa_off, None)
+    _iw_load_data(b_s[1], b_base + TB, data_off)
+    tlx.buffer_load_to_local(a_top_s[1], a_base + TB, data_off, contiguity=16)
+    _iw_load_data(a_bot_s[1], a_base + 128 * K + TB, data_off)
     a_base += 2 * TB
     b_base += 2 * TB
     sa_base += 8
@@ -644,10 +686,11 @@ def _gemm_mxfp6_interwave_n128(A, B, C, WS, LOCKS, SA, SB, M: tl.constexpr, N: t
 
     tlx.async_load_wait_group(2)
     b_cur = tlx.local_load(tlx.local_trans(b_s[0]), relaxed=True)
-    sb_c = tlx.local_load(sb_s[0], layout=_SCALE_B, relaxed=True)
+    sb_c = tlx.local_load(_scales(sb_s[0], 0, 0), layout=_SCALE_B, relaxed=True)
     a_top = tlx.local_load(a_top_s[0], relaxed=True)
-    sa_t = tlx.local_load(sa_top_s[0], layout=_SCALE_A, relaxed=True)
+    sa_t = tlx.local_load(_scales(sa_s[0], 0, 0), layout=_SCALE_A, relaxed=True)
 
+    cur = 0
     for _ in tl.range(0, main_k_tiles - 2, 2, num_stages=1):
         for slot in tl.static_range(2):
             tlx.async_load_wait_group(2)
@@ -655,41 +698,50 @@ def _gemm_mxfp6_interwave_n128(A, B, C, WS, LOCKS, SA, SB, M: tl.constexpr, N: t
                 acc_t = tlx.dot_scaled(a_top, sa_t, A_FORMAT, b_cur, sb_c, B_FORMAT, acc_t, fp6_packed=True)
             with tlx.warp_pipeline_stage("mem", priority=1):
                 a_bot = tlx.local_load(a_bot_s[slot], relaxed=True)
-                sa_b = tlx.local_load(sa_bot_s[slot], layout=_SCALE_A, relaxed=True)
+                sa_b = tlx.local_load(_scales(tlx.local_view(sa_s, cur), 1, slot), layout=_SCALE_A, relaxed=True)
                 tlx.amd_sched_barrier(0)
-                _iw_load(b_s[slot], b_base + slot * TB, data_off, sb_s[slot], sb_base + slot * 4, scale_off)
+                if slot == 0:
+                    _iw_load(b_s[slot], b_base, data_off, tlx.local_view(sb_s, 1 - cur), sb_base, sb_off, None)
+                else:
+                    _iw_load_data(b_s[slot], b_base + TB, data_off)
             tlx.async_load_wait_group(1)
             with tlx.warp_pipeline_stage("mfma", priority=0):
                 acc_b = tlx.dot_scaled(a_bot, sa_b, A_FORMAT, b_cur, sb_c, B_FORMAT, acc_b, fp6_packed=True)
             with tlx.warp_pipeline_stage("mem", priority=1):
                 b_cur = tlx.local_load(tlx.local_trans(b_s[1 - slot]), relaxed=True)
-                sb_c = tlx.local_load(sb_s[1 - slot], layout=_SCALE_B, relaxed=True)
                 a_top = tlx.local_load(a_top_s[1 - slot], relaxed=True)
-                sa_t = tlx.local_load(sa_top_s[1 - slot], layout=_SCALE_A, relaxed=True)
+                if slot == 0:
+                    sb_c = tlx.local_load(_scales(tlx.local_view(sb_s, cur), 0, 1), layout=_SCALE_B, relaxed=True)
+                    sa_t = tlx.local_load(_scales(tlx.local_view(sa_s, cur), 0, 1), layout=_SCALE_A, relaxed=True)
+                else:
+                    sb_c = tlx.local_load(_scales(tlx.local_view(sb_s, 1 - cur), 0, 0), layout=_SCALE_B, relaxed=True)
+                    sa_t = tlx.local_load(_scales(tlx.local_view(sa_s, 1 - cur), 0, 0), layout=_SCALE_A, relaxed=True)
                 tlx.amd_sched_barrier(0)
                 tlx.buffer_load_to_local(a_top_s[slot], a_base + slot * TB, data_off, contiguity=16)
-                tlx.buffer_load_to_local(sa_top_s[slot], sa_base + slot * 4, scale_off)
-                _iw_load(a_bot_s[slot], a_base + 128 * K + slot * TB, data_off, sa_bot_s[slot],
-                         sa_base + 128 * (K // 32) + slot * 4, scale_off)
-                if slot == 1:
+                if slot == 0:
+                    _iw_load(a_bot_s[slot], a_base + 128 * K, data_off, tlx.local_view(sa_s, 1 - cur), sa_base, sa_off,
+                             None)
+                else:
+                    _iw_load_data(a_bot_s[slot], a_base + 128 * K + TB, data_off)
                     a_base += 2 * TB
                     b_base += 2 * TB
                     sa_base += 8
                     sb_base += 8
+        cur = 1 - cur
 
     # Drain the last two tiles: slot 0 is in registers except A-bottom, slot 1 is in LDS.
     tlx.async_load_wait_group(0)
     acc_t = tlx.dot_scaled(a_top, sa_t, A_FORMAT, b_cur, sb_c, B_FORMAT, acc_t, fp6_packed=True)
     a_bot = tlx.local_load(a_bot_s[0], relaxed=True)
-    sa_b = tlx.local_load(sa_bot_s[0], layout=_SCALE_A, relaxed=True)
+    sa_b = tlx.local_load(_scales(tlx.local_view(sa_s, cur), 1, 0), layout=_SCALE_A, relaxed=True)
     acc_b = tlx.dot_scaled(a_bot, sa_b, A_FORMAT, b_cur, sb_c, B_FORMAT, acc_b, fp6_packed=True)
     b_cur = tlx.local_load(tlx.local_trans(b_s[1]), relaxed=True)
-    sb_c = tlx.local_load(sb_s[1], layout=_SCALE_B, relaxed=True)
+    sb_c = tlx.local_load(_scales(tlx.local_view(sb_s, cur), 0, 1), layout=_SCALE_B, relaxed=True)
     a_top = tlx.local_load(a_top_s[1], relaxed=True)
-    sa_t = tlx.local_load(sa_top_s[1], layout=_SCALE_A, relaxed=True)
+    sa_t = tlx.local_load(_scales(tlx.local_view(sa_s, cur), 0, 1), layout=_SCALE_A, relaxed=True)
     acc_t = tlx.dot_scaled(a_top, sa_t, A_FORMAT, b_cur, sb_c, B_FORMAT, acc_t, fp6_packed=True)
     a_bot = tlx.local_load(a_bot_s[1], relaxed=True)
-    sa_b = tlx.local_load(sa_bot_s[1], layout=_SCALE_A, relaxed=True)
+    sa_b = tlx.local_load(_scales(tlx.local_view(sa_s, cur), 1, 1), layout=_SCALE_A, relaxed=True)
     acc_b = tlx.dot_scaled(a_bot, sa_b, A_FORMAT, b_cur, sb_c, B_FORMAT, acc_b, fp6_packed=True)
 
     tail_tiles = K_TILES % 2 + (split_id < extra).to(tl.int32)
@@ -697,18 +749,17 @@ def _gemm_mxfp6_interwave_n128(A, B, C, WS, LOCKS, SA, SB, M: tl.constexpr, N: t
         tl.debug_barrier()
         tile = first_tile + main_k_tiles + t
         a_t = A + pm * 256 * K + tile * TB
-        sa_tp = SA + pm * 256 * (K // 32) + tile * 4
-        _iw_load(b_s[0], B + pn * 128 * K + tile * TB, data_off, sb_s[0], SB + pn * 128 * (K // 32) + tile * 4,
-                 scale_off)
-        _iw_load(a_top_s[0], a_t, data_off, sa_top_s[0], sa_tp, scale_off)
-        _iw_load(a_bot_s[0], a_t + 128 * K, data_off, sa_bot_s[0], sa_tp + 128 * (K // 32), scale_off)
+        _iw_load(b_s[0], B + pn * 128 * K + tile * TB, data_off, sb_s[0], SB + pn * 128 * (K // 32) + tile * 4, sb_off,
+                 sb_mask)
+        tlx.buffer_load_to_local(a_top_s[0], a_t, data_off, contiguity=16)
+        _iw_load(a_bot_s[0], a_t + 128 * K, data_off, sa_s[0], SA + pm * 256 * (K // 32) + tile * 4, sa_off, sa_mask)
         tlx.async_load_wait_group(0)
         b_cur = tlx.local_load(tlx.local_trans(b_s[0]), relaxed=True)
-        sb_c = tlx.local_load(sb_s[0], layout=_SCALE_B, relaxed=True)
+        sb_c = tlx.local_load(_scales(sb_s[0], 0), layout=_SCALE_B, relaxed=True)
         a_top = tlx.local_load(a_top_s[0], relaxed=True)
-        sa_t = tlx.local_load(sa_top_s[0], layout=_SCALE_A, relaxed=True)
+        sa_t = tlx.local_load(_scales(sa_s[0], 0), layout=_SCALE_A, relaxed=True)
         a_bot = tlx.local_load(a_bot_s[0], relaxed=True)
-        sa_b = tlx.local_load(sa_bot_s[0], layout=_SCALE_A, relaxed=True)
+        sa_b = tlx.local_load(_scales(sa_s[0], 1), layout=_SCALE_A, relaxed=True)
         acc_t = tlx.dot_scaled(a_top, sa_t, A_FORMAT, b_cur, sb_c, B_FORMAT, acc_t, fp6_packed=True)
         acc_b = tlx.dot_scaled(a_bot, sa_b, A_FORMAT, b_cur, sb_c, B_FORMAT, acc_b, fp6_packed=True)
 
