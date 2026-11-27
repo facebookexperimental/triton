@@ -1644,6 +1644,34 @@ please share the reproducer above with Triton project.
                 os.remove(fbin)
         return cubin
 
+    def compile_iq_acf_cubin(self, ptx, metadata):
+        """The ACF cubin for `ptx`, or None when the ACF store has no ACF for it. `metadata` is the
+        kernel's metadata (it carries the options _ptxas_compile reads). Shared by apply_compile_iq_acf
+        and launchers that bypass CompiledKernel (magnon.static). May raise; callers fail open."""
+        from triton.magnon import store
+        from triton.magnon.consume import acf_args_for
+        arch = sm_arch_from_capability(self.target.arch)
+        ver = get_ptxas(self.target.arch).version
+        sha = store.ptx_sha256(ptx)
+        # Reuse the assembled ACF cubin from the (separate) ACF store if present -- skips re-running
+        # ptxas --apply-controls on every process. Version-tagged: the cached cubin is only valid for
+        # the ptxas that produced it. Only the assembly is reused cross-process; the launch-time
+        # plain-vs-ACF A/B still re-runs per process (the win decision stays in-memory). This never
+        # touches Triton's compile cache (which stays plain) -- only the compile_iq ACF store.
+        cubin = store.read_acf_cubin(sha, arch, ver)
+        if cubin is None:
+            controls = acf_args_for(ptx, arch, ver)  # ACF-store hit + ptxas version gate
+            if not controls:
+                return None
+            # opt fields used by _ptxas_compile (enable_fp_fusion, ptx_options) live on the metadata
+            # (it is built from {**options.__dict__}); capability matches make_cubin (self.target.arch).
+            cubin = self._ptxas_compile(ptx, metadata, self.target.arch, apply_controls=controls)
+            store.write_acf_cubin(sha, arch, ver, cubin)  # persist assembly -> skip ptxas next time
+            store.dlog("consume", f"assembled+cached ACF cubin {sha[:16]} {arch} ptxas={ver}")
+        else:
+            store.dlog("consume", f"loaded ACF cubin from store {sha[:16]} {arch} ptxas={ver}")
+        return cubin
+
     def apply_compile_iq_acf(self, ck):
         """compile_iq consumption (gated by TRITON_COMPILE_IQ_APPLY).
 
@@ -1658,29 +1686,9 @@ please share the reproducer above with Triton project.
             ptx = ck.asm.get("ptx")
             if not ptx:
                 return
-            from triton.magnon import store
-            from triton.magnon.consume import acf_args_for
-            arch = sm_arch_from_capability(self.target.arch)
-            ver = get_ptxas(self.target.arch).version
-            sha = store.ptx_sha256(ptx)
-            # Reuse the assembled ACF cubin from the (separate) ACF store if present -- skips re-running
-            # ptxas --apply-controls on every process. Version-tagged: the cached cubin is only valid for
-            # the ptxas that produced it. Only the assembly is reused cross-process; the launch-time
-            # plain-vs-ACF A/B still re-runs per process (the win decision stays in-memory). This never
-            # touches Triton's compile cache (which stays plain) -- only the compile_iq ACF store.
-            cubin = store.read_acf_cubin(sha, arch, ver)
-            if cubin is None:
-                controls = acf_args_for(ptx, arch, ver)  # ACF-store hit + ptxas version gate
-                if not controls:
-                    return
-                # opt fields used by _ptxas_compile (enable_fp_fusion, ptx_options) live on ck.metadata
-                # (it is built from {**options.__dict__}); capability matches make_cubin (self.target.arch).
-                cubin = self._ptxas_compile(ptx, ck.metadata, self.target.arch, apply_controls=controls)
-                store.write_acf_cubin(sha, arch, ver, cubin)  # persist assembly -> skip ptxas next time
-                store.dlog("consume", f"assembled+cached ACF cubin {sha[:16]} {arch} ptxas={ver}")
-            else:
-                store.dlog("consume", f"loaded ACF cubin from store {sha[:16]} {arch} ptxas={ver}")
-            ck._compile_iq_acf_cubin = cubin  # pending candidate; the launch-time A/B decides
+            cubin = self.compile_iq_acf_cubin(ptx, ck.metadata)
+            if cubin is not None:
+                ck._compile_iq_acf_cubin = cubin  # pending candidate; the launch-time A/B decides
         except Exception as e:
             # Fail-open: APPLY never breaks compilation. Warn ONCE under DEBUG so the common
             # "APPLY set but the optional compile_iq package is stripped/missing" case (e.g. an OSS
