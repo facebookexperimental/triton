@@ -289,19 +289,6 @@ class SoftmaxState:
         return SoftmaxState(acc, l_i, self.m_i), p_cast
 
     @triton.jit
-    def vec2_split_acc(self, acc_sub1, p, alpha, out_dtype: tl.constexpr):
-        """Apply VEC2 while keeping a D128 accumulator as two D64 tiles."""
-        tl.static_assert(self.acc.shape[1] == 64)
-        tl.static_assert(acc_sub1.shape[0] == self.acc.shape[0])
-        tl.static_assert(acc_sub1.shape[1] == self.acc.shape[1])
-        acc_sub0 = self.acc * alpha[:, None]
-        acc_sub1 = acc_sub1 * alpha[:, None]
-        l_ij = tl.sum(p, 1)
-        l_i = self.l_i * alpha + l_ij
-        p_cast = p.to(out_dtype)
-        return SoftmaxState(acc_sub0, l_i, self.m_i), acc_sub1, p_cast
-
-    @triton.jit
     def vec1_lazy(self, qk, QK_SCALE: tl.constexpr):
         """Form probabilities in a lazily advanced base-2 softmax frame."""
         state, score_delta, advance = self.vec1_lazy_max(qk, QK_SCALE)
@@ -579,30 +566,6 @@ def _attn_dot_pv_mfma(acc, p_dot, v_dot):
     tl.static_assert(v_dot.shape[0] == 64)
     tl.static_assert(v_dot.shape[1] == 128)
     tl.static_assert(tlx.num_warps() == acc.shape[0] // 32)
-    mma: tl.constexpr = tlx.amd_mfma_layout(
-        version=4,
-        instr_shape=[32, 32, 16],
-        transposed=True,
-        warps_per_cta=[tlx.num_warps(), 1],
-    )
-    p_layout: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=4)
-    v_layout: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=4)
-    p_dot = tlx.require_layout(p_dot, p_layout, pin=False)
-    v_dot = tlx.require_layout(v_dot, v_layout, pin=False)
-    acc = tlx.require_layout(acc, mma, pin=False)
-    return tl.dot(p_dot, v_dot, acc)
-
-
-@triton.jit
-def _attn_dot_pv_mfma_split(acc, p_dot, v_dot):
-    """Accumulate one D64 half of the BM256/BN64/D128 P-by-V dot."""
-    tl.static_assert(acc.shape[0] == 256)
-    tl.static_assert(acc.shape[1] == 64)
-    tl.static_assert(p_dot.shape[0] == acc.shape[0])
-    tl.static_assert(p_dot.shape[1] == 64)
-    tl.static_assert(v_dot.shape[0] == 64)
-    tl.static_assert(v_dot.shape[1] == acc.shape[1])
-    tl.static_assert(tlx.num_warps() == 8)
     mma: tl.constexpr = tlx.amd_mfma_layout(
         version=4,
         instr_shape=[32, 32, 16],
@@ -978,10 +941,6 @@ def _attn_inner_pipelined(
     # illegal blocked-to-MFMA loop-carried conversion.
     EXPLICIT_PV_LAYOUT: tl.constexpr = (BLOCK_N == 64 and (q.shape[0] == 128 or q.shape[0] == 256) and q.shape[1] == 128
                                         and tlx.num_warps() == q.shape[0] // 32)
-    # Match the Gluon fallback schedule: two persistent D64 accumulator tiles
-    # expose VEC1 between independent PV MFMA chains in the unmasked hot loop.
-    SPLIT_PV: tl.constexpr = (not MASK_STEPS and not USE_LAZY_RESCALE and BLOCK_N == 64 and q.shape[0] == 256
-                              and q.shape[1] == 128 and tlx.num_warps() == 8)
     # BN32 has no lazy-rescale path. Explicit K16 operand layouts reduce the
     # generic blocked-to-MFMA handoff on medium BM256 rows, but increase live
     # state on the long rows, so keep the measured crossover local to N<=4096.
@@ -1056,10 +1015,6 @@ def _attn_inner_pipelined(
     else:
         tok_v1 = tlx.async_load(v_ptrs + n1 * stride_vn, tlx.local_view(v_buf, 1))
     tlx.async_load_commit_group([tok_v1])
-
-    if SPLIT_PV:
-        acc_sub0, acc_sub1 = _split_cols(state.acc)
-        state = SoftmaxState(acc_sub0, state.l_i, state.m_i)
 
     if USE_LAZY_RESCALE:
         # Pair adjacent iterations so both ping-pong slots are compile-time
@@ -1160,10 +1115,7 @@ def _attn_inner_pipelined(
 
             with tlx.warp_pipeline_stage("dot1", priority=0):
                 qk = tl.dot(q, kt_dot)
-                if SPLIT_PV:
-                    state, acc_sub1, p_dot = state.vec2_split_acc(acc_sub1, p_c, alpha_c, q.dtype)
-                else:
-                    state, p_dot = state.vec2(p_c, alpha_c, q.dtype)
+                state, p_dot = state.vec2(p_c, alpha_c, q.dtype)
 
             tlx.async_load_wait_group(1)
 
@@ -1180,49 +1132,24 @@ def _attn_inner_pipelined(
                 tlx.async_load_commit_group([tok_k])
 
             with tlx.warp_pipeline_stage("dot2", priority=0):
-                if SPLIT_PV:
-                    split_mma: tl.constexpr = tlx.amd_mfma_layout(
-                        version=4,
-                        instr_shape=[32, 32, 16],
-                        transposed=True,
-                        warps_per_cta=[tlx.num_warps(), 1],
-                    )
-                    split_v_layout: tl.constexpr = tlx.dot_operand_layout(1, split_mma, k_width=4)
-                    v_dot = tlx.require_layout(v_dot, split_v_layout, pin=False)
-                    v_sub0, v_sub1 = tl.split(v_dot.reshape([64, 2, 64]).permute(0, 2, 1))
-                    acc_sub0 = _attn_dot_pv_mfma_split(state.acc, p_dot, v_sub0)
-                    state = SoftmaxState(acc_sub0, state.l_i, state.m_i)
-                    state, p_c, alpha_c = state.vec1(
-                        qk,
-                        ahead_n,
-                        offs_m,
-                        offs_n,
-                        N_CTX,
-                        QK_SCALE,
-                        DIAG_OFFSET,
-                        MASK_STEPS,
-                        IS_CAUSAL,
-                    )
-                    acc_sub1 = _attn_dot_pv_mfma_split(acc_sub1, p_dot, v_sub1)
-                elif EXPLICIT_PV_LAYOUT32:
+                if EXPLICIT_PV_LAYOUT32:
                     acc = _attn_dot_pv_mfma32(state.acc, p_dot, v_dot)
                 elif EXPLICIT_PV_LAYOUT:
                     acc = _attn_dot_pv_mfma(state.acc, p_dot, v_dot)
                 else:
                     acc = tl.dot(p_dot, v_dot, state.acc)
-                if not SPLIT_PV:
-                    state = SoftmaxState(acc, state.l_i, state.m_i)
-                    state, p_c, alpha_c = state.vec1(
-                        qk,
-                        ahead_n,
-                        offs_m,
-                        offs_n,
-                        N_CTX,
-                        QK_SCALE,
-                        DIAG_OFFSET,
-                        MASK_STEPS,
-                        IS_CAUSAL,
-                    )
+                state = SoftmaxState(acc, state.l_i, state.m_i)
+                state, p_c, alpha_c = state.vec1(
+                    qk,
+                    ahead_n,
+                    offs_m,
+                    offs_n,
+                    N_CTX,
+                    QK_SCALE,
+                    DIAG_OFFSET,
+                    MASK_STEPS,
+                    IS_CAUSAL,
+                )
 
             tlx.async_load_wait_group(1)
 
@@ -1249,17 +1176,6 @@ def _attn_inner_pipelined(
                     else:
                         tok_v = tlx.async_load(v_ptrs + acv_n * stride_vn, tlx.local_view(v_buf, cur_slot))
                     tlx.async_load_commit_group([tok_v])
-
-        if SPLIT_PV:
-            split_pv_layout: tl.constexpr = tlx.amd_mfma_layout(
-                version=4,
-                instr_shape=[32, 32, 16],
-                transposed=True,
-                warps_per_cta=[tlx.num_warps(), 1],
-            )
-            acc = tl.join(state.acc, acc_sub1).permute(0, 2, 1).reshape([state.acc.shape[0], 128])
-            acc = tlx.require_layout(acc, split_pv_layout, pin=False)
-            state = SoftmaxState(acc, state.l_i, state.m_i)
 
     if USE_ONE_TILE_PREFIX_DRAIN:
         # The extended odd tail completed every prefix tile except n-1.  Its
