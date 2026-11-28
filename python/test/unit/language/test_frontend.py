@@ -2196,6 +2196,34 @@ def test_cache_policy_ir_attrs():
     run_filecheck_test(kernel, args=(MockTensor(tl.float32), MockTensor(tl.float32), 128))
 
 
+@filecheck_test
+@triton.jit
+def test_debug_barrier_scope():
+    # CHECK-LABEL: test_debug_barrier_scope
+    # CHECK: ttg.barrier all
+    tl.debug_barrier()
+    # CHECK-NEXT: ttg.barrier all
+    tl.debug_barrier(scope="cta")
+    # CHECK-NEXT: ttg.barrier gpu all
+    tl.debug_barrier(scope="gpu")
+
+
+@pytest.mark.parametrize("scope", ["sys", "warp", "block"])
+def test_debug_barrier_invalid_scope(scope):
+
+    @triton.jit
+    def kernel(SCOPE: tl.constexpr):
+        tl.debug_barrier(scope=SCOPE)
+
+    with pytest.raises(CompilationError) as exc_info:
+        run_parser(kernel, args=(scope, ))
+    error = exc_info.value
+    while error.__cause__ is not None:
+        error = error.__cause__
+    assert isinstance(error, ValueError)
+    assert str(error) == f"debug_barrier scope must be 'cta' or 'gpu', got {scope!r}"
+
+
 def test_amd_partitioned_layout_constexpr_cache_identity():
     import triton.language.extra.tlx as tlx
     from triton.compiler import ASTSource

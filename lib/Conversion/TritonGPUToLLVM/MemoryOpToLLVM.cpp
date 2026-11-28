@@ -378,6 +378,23 @@ public:
       rewriter.eraseOp(op);
       return success();
     }
+    if (op.isGPU()) {
+      // Both fences are needed. With one thread publishing a flag after the
+      // barrier, the fence after it orders every thread's earlier writes
+      // before the flag. With one thread observing a flag before the barrier,
+      // the fence before it orders the flag before every thread's later
+      // reads.
+      Location loc = op.getLoc();
+      StringRef syncScope =
+          targetInfo.getAtomicSyncScope(triton::MemSyncScope::GPU);
+      LLVM::FenceOp::create(rewriter, loc, LLVM::AtomicOrdering::acq_rel,
+                            syncScope);
+      mlir::gpu::BarrierOp::create(rewriter, loc);
+      LLVM::FenceOp::create(rewriter, loc, LLVM::AtomicOrdering::acq_rel,
+                            syncScope);
+      rewriter.eraseOp(op);
+      return success();
+    }
     rewriter.replaceOpWithNewOp<mlir::gpu::BarrierOp>(op);
     return success();
   }

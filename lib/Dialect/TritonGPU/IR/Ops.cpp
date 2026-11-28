@@ -2264,8 +2264,9 @@ LogicalResult WarpVoteOp::verify() {
 //===----------------------------------------------------------------------===//
 
 void BarrierOp::print(OpAsmPrinter &p) {
-  if (isWarp())
-    p << " warp";
+  // CTA is the default scope and is left implicit.
+  if (getScope() != BarrierScope::CTA)
+    p << ' ' << stringifyBarrierScope(getScope());
   // print "all" instead of  "local|global_read|global_write|tensor|all"
   if (getAddrSpace() == AddrSpace::All) {
     p << " all";
@@ -2275,9 +2276,13 @@ void BarrierOp::print(OpAsmPrinter &p) {
 }
 
 ParseResult BarrierOp::parse(OpAsmParser &parser, OperationState &result) {
-  auto scope = succeeded(parser.parseOptionalKeyword("warp"))
-                   ? BarrierScope::Warp
-                   : BarrierScope::CTA;
+  // The scope keyword is optional and defaults to CTA, which may also be
+  // spelled explicitly.
+  auto scope = BarrierScope::CTA;
+  StringRef scopeKeyword;
+  if (succeeded(
+          parser.parseOptionalKeyword(&scopeKeyword, {"cta", "warp", "gpu"})))
+    scope = *symbolizeBarrierScope(scopeKeyword);
   auto parseAddrSpace = [&]() -> FailureOr<AddrSpace> {
     std::string keyword;
     if (parser.parseKeywordOrString(&keyword))
@@ -2316,6 +2321,11 @@ ParseResult BarrierOp::parse(OpAsmParser &parser, OperationState &result) {
 LogicalResult BarrierOp::verify() {
   if (isWarp() && getAddrSpace() != AddrSpace::Local)
     return emitOpError("warp scope supports only the local address space");
+  // Shared and tensor memory are CTA-local, so a GPU-scope barrier must order
+  // some global memory to mean anything beyond a CTA barrier.
+  if (isGPU() && !hasGlobalRead() && !hasGlobalWrite())
+    return emitOpError(
+        "gpu scope requires the global_read or global_write address space");
   return success();
 }
 

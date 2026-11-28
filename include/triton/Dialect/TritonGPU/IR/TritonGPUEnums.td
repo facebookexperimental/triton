@@ -27,7 +27,8 @@ def TTG_BarrierScope : I32EnumAttr<
     "BarrierScope", "barrier synchronization scope",
     [
       I32EnumAttrCase<"CTA", 0, "cta">,
-      I32EnumAttrCase<"Warp", 1, "warp">
+      I32EnumAttrCase<"Warp", 1, "warp">,
+      I32EnumAttrCase<"GPU", 2, "gpu">
     ]> {
   let cppNamespace = "::mlir::triton::gpu";
 }

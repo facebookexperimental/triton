@@ -95,6 +95,22 @@ static bool isWarpPipelineIgnorableBarrier(Operation *op) {
              triton::amdgpu::AsyncTDMIntrinsicWait>(op);
 }
 
+// A GPU-scope barrier orders global memory device-wide for the whole CTA. The
+// two warp groups of a warp pipeline reach any barrier between its stages one
+// stage apart, so such a barrier there would not order the memory operations
+// of the whole CTA. It is rejected between stages instead.
+static bool isGPUScopeBarrier(Operation *op) {
+  auto barrier = dyn_cast<triton::gpu::BarrierOp>(op);
+  return barrier && barrier.isGPU();
+}
+
+static InFlightDiagnostic emitGPUScopeBarrierBetweenStagesError(Operation *op) {
+  return op->emitError(
+      "gpu-scope barrier cannot appear between warp-pipeline stages: the warp "
+      "groups reach it one stage apart, so it would not order the memory "
+      "operations of the whole CTA; place it before or after the pipeline");
+}
+
 // True if `op` reads or writes memory (a load / store / async-copy).
 static bool readsOrWritesMemory(Operation *op) {
   auto mei = dyn_cast<MemoryEffectOpInterface>(op);
@@ -134,6 +150,8 @@ static LogicalResult validatePipelinedForBody(scf::ForOp forOp) {
         return op.emitError(
             "non-warp-pipeline scf.execute_region inside pipelined_for body");
       ++numClusters;
+    } else if (isGPUScopeBarrier(&op)) {
+      return emitGPUScopeBarrierBetweenStagesError(&op);
     } else if (isWarpPipelineIgnorableBarrier(&op)) {
       if (existingBarrierMap.contains(numClusters))
         return op.emitError("multiple pre-existing barriers between pipeline "
@@ -666,10 +684,12 @@ static void emitPipelinedFlat(SmallVector<scf::ExecuteRegionOp> &clusterOps,
 
 // Walk the module for flat warp-pipeline execute_region sequences
 // (produced by WarpPipeliner::createFlatPipeline) and emit phase-shift
-// barriers around them.
-static void processUnrolledPipelineRegions(ModuleOp m,
-                                           ModuleAllocation &moduleAllocation,
-                                           int threadsPerPipelineGroup) {
+// barriers around them. Fails if a GPU-scope barrier sits between two stages
+// of a sequence.
+static LogicalResult
+processUnrolledPipelineRegions(ModuleOp m, ModuleAllocation &moduleAllocation,
+                               int threadsPerPipelineGroup) {
+  bool malformed = false;
   m.walk([&](triton::FuncOp funcOp) {
     Allocation *allocation = moduleAllocation.getFuncData(funcOp);
     if (!allocation)
@@ -685,6 +705,10 @@ static void processUnrolledPipelineRegions(ModuleOp m,
       // splitting at any non-ignorable, non-pipeline op.
       SmallVector<SmallVector<scf::ExecuteRegionOp>> sequences;
       SmallVector<scf::ExecuteRegionOp> current;
+      // A GPU-scope barrier after a stage of the current sequence. It is an
+      // error if another stage of the same sequence follows it.
+      Operation *gpuScopeBarrier = nullptr;
+      bool blockMalformed = false;
 
       bool isFunctionBody = block->getParentOp() == funcOp;
       for (auto &op : *block) {
@@ -694,11 +718,20 @@ static void processUnrolledPipelineRegions(ModuleOp m,
         // form there; nested stages must carry the flat tag so stages owned
         // by pipelined_for are not converted twice.
         if (exec && (isFunctionBody || getFlatPipelineStage(&op))) {
+          if (gpuScopeBarrier) {
+            emitGPUScopeBarrierBetweenStagesError(gpuScopeBarrier);
+            blockMalformed = true;
+            gpuScopeBarrier = nullptr;
+          }
           current.push_back(exec);
           continue;
         }
-        if (isWarpPipelineIgnorableBarrier(&op))
+        if (isWarpPipelineIgnorableBarrier(&op)) {
+          if (!current.empty() && isGPUScopeBarrier(&op))
+            gpuScopeBarrier = &op;
           continue;
+        }
+        gpuScopeBarrier = nullptr;
         if (!current.empty()) {
           sequences.push_back(std::move(current));
           current.clear();
@@ -707,6 +740,10 @@ static void processUnrolledPipelineRegions(ModuleOp m,
       if (!current.empty())
         sequences.push_back(std::move(current));
 
+      if (blockMalformed) {
+        malformed = true;
+        continue;
+      }
       for (auto &seq : sequences) {
         if (seq.size() < 2)
           continue;
@@ -715,6 +752,7 @@ static void processUnrolledPipelineRegions(ModuleOp m,
       }
     }
   });
+  return failure(malformed);
 }
 
 // Return true if `op` is intra-pipeline glue between two clusters — the
@@ -1002,6 +1040,21 @@ static void eliminateRedundantCondBarriers(ModuleOp m,
                "ttg.barrier local; skipping");
           continue;
         }
+        // A GPU-scope barrier between the two pipelines, right after the
+        // post-loop cond_barrier or anywhere later, is a user barrier that
+        // orders global memory device-wide, so it must not be erased. Erasing
+        // only the cond_barriers around it would let the two warp groups pass
+        // it at different stages, so keep the whole boundary.
+        bool hasGPUScopeBarrier = false;
+        for (Operation *op = postLoopCB->getNextNode(); op != preLoopCB;
+             op = op->getNextNode())
+          op->walk([&](triton::gpu::BarrierOp barrier) {
+            hasGPUScopeBarrier |= barrier.isGPU();
+          });
+        if (hasGPUScopeBarrier) {
+          LDBG("GPU-scope barrier between back-to-back pipelines; skipping");
+          continue;
+        }
 
         // Cross-pipeline LDS dependency analysis.  When the phase carries
         // over, stages from different pipelines execute concurrently at the
@@ -1094,8 +1147,9 @@ public:
 
     // Flat (unrolled) pipeline regions are still wrapped in execute_regions
     // with no_inline=true from WarpPipeliner.  Process them before inlining.
-    processUnrolledPipelineRegions(m, moduleAllocation,
-                                   threadsPerPipelineGroup);
+    if (failed(processUnrolledPipelineRegions(m, moduleAllocation,
+                                              threadsPerPipelineGroup)))
+      return signalPassFailure();
 
     // Must run after patternFor and flat processing (all regions converted,
     // barriers inserted) but before patternInline (inlining execute_regions

@@ -3924,11 +3924,67 @@ def map_elementwise(
 
 
 @builtin
-def debug_barrier(_semantic=None):
+def debug_barrier(scope="cta", _semantic=None):
     """
     Insert a barrier to synchronize all threads in a block.
+
+    Every thread of the block (CTA) waits at the barrier until all threads of
+    the block have reached it. It never waits for other blocks: it is not a
+    grid-wide barrier, and with ``num_ctas > 1`` it does not cover the other
+    CTAs of the same program. Inside a warp-specialized partition, only the
+    warps of that partition meet at the barrier.
+
+    ``scope="gpu"`` is for a block that hands data to other blocks through
+    global memory. Use it before one thread publishes a flag or ticket that
+    other programs poll for data the whole block wrote, and between one thread
+    observing such a flag and the whole block reading that data. Access the
+    flag itself with atomics, for example
+    ``tl.atomic_xchg(flag, 1, sem="release", scope="gpu")`` to publish it and
+    an atomic with ``sem="acquire"`` to poll it: release and acquire flag
+    atomics give this ordering under the memory model of every target. Polling
+    with ``tl.load(flag, volatile=True)`` also works with the current
+    lowerings, but a plain ``tl.store`` of the flag is not enough: it may stay
+    in a cache that the polling program does not read. Asynchronous copies
+    (for example TMA or TDM stores) are covered only once their completion has
+    been waited for before the barrier.
+
+    ``scope="gpu"`` costs more than ``"cta"``. How much depends on the target:
+
+    - AMD CDNA3 and CDNA4 (MI300, MI350) in their default mode, where one
+      device spans several XCDs and each XCD has its own L2 cache that is not
+      coherent with the others: every wave waits for its outstanding memory
+      operations, the L2 is written back before the barrier, and it is
+      invalidated after it. This can add tens of microseconds per barrier, and
+      the invalidate also drops data that other blocks on the same XCD are
+      still reading. Avoid it in loops; in a short kernel this cost can be a
+      large fraction of the run time.
+    - AMD gfx1250: the barrier only adds a cache invalidate after it.
+    - NVIDIA: the barrier adds a ``fence.acq_rel.gpu`` before and after it.
+
+    On CDNA3 and CDNA4, a protocol that never leaves the shared data in an L2
+    needs much less. If every store of the shared data and of the flag is
+    write-through (``cache_modifier=".wt"``) and every load of them bypasses
+    the caches (``cache_modifier=".cv"``), each wave only has to wait for its
+    own stores to complete (``s_waitcnt vmcnt(0)``, for example through
+    ``tl.inline_asm_elementwise``) before a ``"cta"`` barrier. That protocol
+    depends on every access using those cache modifiers and on AMD-specific
+    code, so prefer ``"gpu"`` unless profiling shows that the barrier matters.
+
+    :param scope: The memory scope at which the barrier orders memory
+        operations. Acceptable values are:
+
+        - ``"cta"`` (default): memory operations that the block's threads
+          performed before the barrier are visible to all threads of the
+          block after it.
+        - ``"gpu"``: in addition, global memory operations that any thread of
+          the block performed before the barrier become visible to the whole
+          device before any thread of the block continues past it, and global
+          memory accesses after the barrier observe writes that were visible
+          device-wide before it.
+    :type scope: str, optional
     """
-    return _semantic.debug_barrier()
+    scope = _unwrap_if_constexpr(scope)
+    return _semantic.debug_barrier(scope)
 
 
 @builtin

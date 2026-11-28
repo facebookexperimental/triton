@@ -1565,6 +1565,36 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+// A GPU-scope barrier keeps its scope on every target. tl.debug_barrier fences
+// every address space, so it covers any subset the barrier selects.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: def gpu_barrier_on_amd(
+  // CHECK-NOT: tlx.workgroup_barrier()
+  // CHECK: tl.debug_barrier(scope="gpu")
+  tt.func public @gpu_barrier_on_amd(%x: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    ttg.barrier gpu all
+    %m = arith.mulf %x, %x : tensor<256xf32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: def gpu_barrier_off_amd(
+  // CHECK: tl.debug_barrier(scope="gpu")
+  tt.func public @gpu_barrier_off_amd(%x: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    ttg.barrier gpu global_read|global_write
+    %m = arith.mulf %x, %x : tensor<256xf32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
 // Elementwise ops that already have an exact TLX spelling. The NaN-quieting
 // arith.maximumf/minimumf were missing alongside their maxnumf/minnumf peers.
 
