@@ -75,4 +75,19 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     %v = ttg.local_load %slot : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked2>
     tt.return %v : tensor<128x64xf16, #blocked2>
   }
+
+  // An initialized allocation (the TMA-store staging buffer for a tile computed
+  // in registers) is an allocation followed by a store of its source; dropping
+  // the source would TMA-store uninitialized shared memory.
+  // CHECK-LABEL: def initialized_staging(
+  // CHECK: [[S:[a-zA-Z_0-9]+]] = tlx.local_view(tlx.local_alloc((128, 64), tl.float16, 1), 0)
+  // CHECK-NEXT: tlx.local_store([[S]], [[SRC:[a-zA-Z_0-9]+]])
+  // CHECK: tlx.async_descriptor_store({{[a-zA-Z_0-9]+}}, [[S]], [{{[a-zA-Z_0-9]+}}, {{[a-zA-Z_0-9]+}}])
+  tt.func public @initialized_staging(%desc: !tt.tensordesc<128x64xf16, #shared>, %v: tensor<128x64xf16, #blocked2>, %y: i32) {
+    %c0 = arith.constant 0 : i32
+    %staging = ttg.local_alloc %v : (tensor<128x64xf16, #blocked2>) -> !ttg.memdesc<128x64xf16, #shared, #smem>
+    ttng.fence_async_shared {bCluster = false}
+    ttng.async_tma_copy_local_to_global %desc[%y, %c0] %staging : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem>
+    tt.return
+  }
 }
