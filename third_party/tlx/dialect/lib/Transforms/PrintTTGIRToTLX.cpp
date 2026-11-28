@@ -697,6 +697,21 @@ getValueName(Value v,
       // Otherwise the cast is erased: fall through to the transparent list.
     }
 
+    // A widened i1 is the one width cast Triton does not leave implicit: a
+    // bool stays a bool in Python, so where it seeds a loop-carried integer
+    // the loop's type check rejects it, and arithmetic on it changes meaning.
+    if (auto ext = dyn_cast<arith::ExtUIOp>(defOp);
+        ext && getElementType(ext.getIn().getType()).isInteger(1)) {
+      std::string operand =
+          getValueName(ext.getIn(), argSubstitutionMap, inlineConstants);
+      std::string dtype = getElementTypeName(getElementType(v.getType()));
+      if (operand == "None")
+        return operand;
+      if (!isPythonIdentifier(operand))
+        return "tl.cast(" + operand + ", " + dtype + ")";
+      return operand + ".to(" + dtype + ")";
+    }
+
     // Layout- and shape-only ops, plus the width/index casts Triton leaves
     // implicit. The float element-type casts are still listed: the block above
     // intercepts them whenever their dtype is nameable, so reaching one here
@@ -2118,6 +2133,16 @@ void printSimplifiedOp(
         if (info.singleBuffer)
           os << ", 0)";
         printLocComment(op, os);
+        // An initialized allocation (Triton's TMA-store staging buffer) has no
+        // TLX spelling; it is an allocation followed by a store into it.
+        if (op->getNumOperands() == 1 && op->getNumResults() == 1) {
+          for (unsigned i = 0; i < indent; ++i)
+            os << "  ";
+          os << "tlx.local_store("
+             << getValueName(op->getResult(0), argSubstitutionMap) << ", "
+             << getValueName(op->getOperand(0), argSubstitutionMap) << ")";
+          printLocComment(op, os);
+        }
         return;
       }
     }
@@ -3698,10 +3723,13 @@ void printBlock(Block &block, llvm::raw_ostream &os,
             // Strip trailing newline and print as comment
             while (!line.empty() && (line.back() == '\n' || line.back() == ' '))
               line.pop_back();
-            if (!line.empty()) {
+            // An op may print more than one line; comment out each.
+            SmallVector<StringRef> lines;
+            StringRef(line).split(lines, '\n', -1, /*KeepEmpty=*/false);
+            for (StringRef l : lines) {
               for (unsigned i = 0; i < indent; ++i)
                 os << "  ";
-              os << "  # " << line << "\n";
+              os << "  # " << l << "\n";
             }
           }
         }
@@ -3876,10 +3904,13 @@ void printBlockOps(Block &block, llvm::raw_ostream &os,
             lineOs.flush();
             while (!line.empty() && (line.back() == '\n' || line.back() == ' '))
               line.pop_back();
-            if (!line.empty()) {
+            // An op may print more than one line; comment out each.
+            SmallVector<StringRef> lines;
+            StringRef(line).split(lines, '\n', -1, /*KeepEmpty=*/false);
+            for (StringRef l : lines) {
               for (unsigned i = 0; i < indent; ++i)
                 os << "  ";
-              os << "  # " << line << "\n";
+              os << "  # " << l << "\n";
             }
           }
         }
