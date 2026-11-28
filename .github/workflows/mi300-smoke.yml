@@ -1,0 +1,86 @@
+name: MI300 runner smoke
+# Trial workflow for the AMD-hosted MI300 runner (linux-fb-triton-mi300-1).
+# Validates the runner end to end (GPU health, ROCm env, prebuilt wheel
+# install, one gfx942-gated GEMM) before MI300 joins the GPU test matrix.
+# Runs when this file changes, plus manual dispatch; nothing else triggers it.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to build and test (blank builds this run's commit)
+        type: string
+        required: false
+        default: ''
+  pull_request:
+    paths:
+      - .github/workflows/mi300-smoke.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mi300-smoke
+  cancel-in-progress: true
+
+jobs:
+  build:
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ inputs.ref || github.sha }}
+
+  smoke:
+    needs: build
+    runs-on: linux-fb-triton-mi300-1
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      # Same import mode as the GPU test workflows: same-named test modules in
+      # different directories must not collide.
+      PYTEST_ADDOPTS: --import-mode=importlib
+      # run-selected-tests.py extends the path the same way so the tlx_ops
+      # helper module resolves under importlib mode.
+      PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/python/test/unit/tlx_ops
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - name: Inspect AMD runner
+        env:
+          CI_RUNNER_LABELS: linux-fb-triton-mi300-1
+        run: bash .github/amd-ci/runner-diagnostics.sh
+      - name: Set up test environment
+        timeout-minutes: 30
+        uses: ./.github/actions/setup-test-env
+        with:
+          backend: rocm
+          arch: gfx942
+      - name: Check AMD GPU
+        # A runner whose GPU stopped responding fails here instead of hanging a later step.
+        timeout-minutes: 4
+        run: timeout 180 python -c 'import torch; torch.zeros(1, device="cuda"); torch.cuda.synchronize()'
+      - name: Install prebuilt Triton
+        uses: ./.github/actions/install-prebuilt-triton
+        with:
+          wheel-url: ${{ needs.build.outputs.wheel_url }}
+          wheel-filename: ${{ needs.build.outputs.wheel_filename }}
+          wheel-sha256: ${{ needs.build.outputs.wheel_sha256 }}
+      - name: Run smoke tests
+        timeout-minutes: 30
+        run: |
+          python -m pytest -v -s --tb=short --durations=10 \
+            python/test/unit/tlx_ops/test_mm_gfx942.py \
+            -k "stream_k" \
+            --junitxml=/tmp/mi300-smoke.xml
+      - name: Upload smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mi300-smoke-test-results
+          path: /tmp/mi300-smoke.xml
+          if-no-files-found: ignore
