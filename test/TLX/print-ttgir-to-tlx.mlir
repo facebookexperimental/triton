@@ -1381,6 +1381,26 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 
+  // Integer widening is otherwise left implicit, but a bool stays a bool in
+  // Python: seeding a loop-carried i32 with it fails the loop's type check
+  // (the flattened persistent matmul's K-tile counter starts as `k_tiles != 1`).
+  // CHECK-LABEL: def widened_bool(
+  // CHECK: [[B:[a-zA-Z_0-9]+]] = {{.*}} != 0
+  // CHECK: [[B]].to(tl.int32) * 64
+  // CHECK: tl.cast(True, tl.int32) + 1
+  tt.func public @widened_bool(%n: i32) attributes {noinline = false} {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c64 = arith.constant 64 : i32
+    %true = arith.constant true
+    %b = arith.cmpi ne, %n, %c0 : i32
+    %w = arith.extui %b : i1 to i32
+    %m = arith.muli %w, %c64 : i32
+    %t = arith.extui %true : i1 to i32
+    %a = arith.addi %t, %c1 : i32
+    tt.return
+  }
+
   // A float type TLX cannot name still falls back to erasing the cast, rather
   // than emitting a dtype that will not compile.
   // CHECK-LABEL: def cast_to_unnameable_dtype(
